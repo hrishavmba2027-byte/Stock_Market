@@ -1,0 +1,2 @@
+"""Stock market automation package."""
+

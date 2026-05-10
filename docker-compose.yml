@@ -1,0 +1,63 @@
+x-common-env: &common-env
+  PYTHONPATH: /app
+  BASE_DIR: /app
+  SHEET_ID: 1uekPHyvJj4p6YjxNwlBBIAI71SWRye-xxFu47Kgpf9o
+  GOOGLE_CREDENTIALS: /app/credentials/stock-prices-495408-aa549faac3c5.json
+  GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/stock-prices-495408-aa549faac3c5.json
+  WORKFLOW_STATE_PATH: /app/state/workflow_state.json
+  LOGS_DIR: /app/logs
+  OUTPUTS_DIR: /app/outputs
+  OUTPUT_DIR: /app/outputs/main_inference
+  MODEL_DIR: /app/outputs/Saved_Models
+  METADATA_PATH: /app/outputs/pipeline_metadata.json
+  DEVICE: auto
+  WATCHER_POLL_SECONDS: "90"
+  LANGCHAIN_MODE: deterministic
+  API_BASE_URL: http://api:8000
+
+services:
+  api:
+    build: .
+    image: stock-market-automation:local
+    container_name: stock_market_api
+    command: uvicorn app_data:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+      - ./outputs:/app/outputs
+      - ./state:/app/state
+      - ./credentials/stock-prices-495408-aa549faac3c5.json:/app/credentials/stock-prices-495408-aa549faac3c5.json:ro
+    working_dir: /app
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  watcher:
+    image: stock-market-automation:local
+    container_name: stock_market_watcher
+    command: python -m app.watcher.service
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - ./outputs:/app/outputs
+      - ./state:/app/state
+      - ./credentials/stock-prices-495408-aa549faac3c5.json:/app/credentials/stock-prices-495408-aa549faac3c5.json:ro
+    working_dir: /app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; data=open('/proc/1/cmdline','rb').read(); sys.exit(0 if b'app.watcher.service' in data else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    environment:
+      <<: *common-env

@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local environment files
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Secrets and service account credentials
+credentials/*.json
+stock-prices-495408-aa549faac3c5.json
+stock-prices-*.json
+*.pem
+*.key
+
+# Runtime state, logs, caches, and temporary files
+logs/*
+!logs/.gitkeep
+cache/*
+!cache/.gitkeep
+temp/*
+!temp/.gitkeep
+state/*.json
+!state/.gitkeep
+
+# Generated prediction outputs
+outputs/main_inference/*
+!outputs/main_inference/.gitkeep
+
+# OS and editor files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

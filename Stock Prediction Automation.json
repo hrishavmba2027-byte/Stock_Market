@@ -1,0 +1,373 @@
+{
+  "name": "Stock Prediction Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyHour"
+            }
+          ]
+        },
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1uekPHyvJj4p6YjxNwlBBIAI71SWRye-xxFu47Kgpf9o"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 593190866,
+          "mode": "list",
+          "cachedResultName": "RELIANCE",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1uekPHyvJj4p6YjxNwlBBIAI71SWRye-xxFu47Kgpf9o/edit#gid=593190866"
+        },
+        "event": "rowAdded",
+        "options": {}
+      },
+      "id": "c6790ad3-72ce-4c53-b6a0-e4c151c27db2",
+      "name": "New Row Added",
+      "type": "n8n-nodes-base.googleSheetsTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        448
+      ],
+      "credentials": {
+        "googleSheetsTriggerOAuth2Api": {
+          "id": "GPCdjisZYtKztTbY",
+          "name": "Google Sheets Trigger account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "1",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "ok",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          }
+        },
+        "options": {}
+      },
+      "id": "49ed7145-133a-4d71-a5eb-6c99bea4add0",
+      "name": "Check Execution Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        688,
+        448
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1",
+              "name": "status",
+              "value": "success",
+              "type": "string"
+            },
+            {
+              "id": "2",
+              "name": "execution_output",
+              "value": "={{ $json.message }}",
+              "type": "string"
+            },
+            {
+              "id": "3",
+              "name": "timestamp",
+              "value": "={{ $now.toISO() }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "89a78a20-3036-4227-a967-9e76db31879d",
+      "name": "Log Success",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        912,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1",
+              "name": "status",
+              "value": "error",
+              "type": "string"
+            },
+            {
+              "id": "2",
+              "name": "error_message",
+              "value": "={{ $json.error || $json.error_message || $json.message || \"Unknown error occurred\" }}",
+              "type": "string"
+            },
+            {
+              "id": "3",
+              "name": "http_status",
+              "value": "={{ $json.status }}",
+              "type": "string"
+            },
+            {
+              "id": "4",
+              "name": "timestamp",
+              "value": "={{ $now.toISO() }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "c4cd4f63-f27d-4d0f-8d95-7e5e20b972f5",
+      "name": "Handle Error",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1136,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0B0FEC35EK",
+          "mode": "list",
+          "cachedResultName": "all-stockmarket"
+        },
+        "text": "=🚨 Stock Prediction Failed\n\n*Error:* {{ $json.error_message }}\n*HTTP Status:* {{ $json.http_status }}\n*Time:* {{ $json.timestamp }}\n\nPlease check the workflow execution logs for details.",
+        "otherOptions": {}
+      },
+      "id": "14cf5d88-1ced-4718-8385-2ca537585899",
+      "name": "Notify Slack on Error",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        1360,
+        520
+      ],
+      "webhookId": "80c67da3-1050-478f-bf66-549a20c75867",
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "WOZdiH8PFT7XApwA",
+          "name": "Slack OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Setup Instructions\n\n**1. Google Sheets Credentials:**\n- Create OAuth2 credentials in Google Cloud Console\n- Enable Google Sheets API\n- Configure in n8n credentials\n\n**2. HTTP API Setup:**\n- Ensure HTTP server is running\n- Endpoint: GET https://lina-iconological-nathaniel.ngrok-free.dev/run\n- Expected response: { \"status\": \"ok\", \"message\": \"...\" }\n- API reads entire Google Sheet internally\n\n**3. Slack Credentials (Optional):**\n- Create Slack OAuth2 app\n- Configure in n8n credentials for error notifications",
+        "height": 200,
+        "width": 900,
+        "color": 4
+      },
+      "id": "c6af7901-4b88-4dd2-8eb1-7a0906300643",
+      "name": "Sticky Note 075b2680",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -128,
+        48
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Optimized Workflow\n\n**Single API Call:**\n- Trigger fires when new row is added\n- HTTP Request executes ONCE (executeOnce: true)\n- API processes entire sheet internally\n- No per-row iteration needed\n\n**Python Script:**\n- Reads all data from Google Sheets\n- Performs feature engineering\n- Runs Dense, LSTM, and Transformer models\n- Writes predictions back to sheet\n\n**Output Column:** Predicted_Close_Price",
+        "height": 200,
+        "width": 600,
+        "color": 5
+      },
+      "id": "a2f319db-9148-409c-94e9-d1224df90b2e",
+      "name": "Sticky Note d39d31a2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        784,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Unified Error Handling\n\n**Two error sources, one handling path:**\n\n1. HTTP-level errors (network/API unreachable):\n   - HTTP Request Error output → HTTP Error Handler → Handle Error → Notify Slack\n\n2. Business logic errors (API returns error status):\n   - HTTP Request Success → IF node checks status\n   - If status ≠ \"ok\" → Handle Error → Notify Slack\n\n**Both paths converge at \"Handle Error\" node for consistent error processing.**\n\n**Optional:** Add email notifications or log to database for audit trail.",
+        "height": 300,
+        "width": 900,
+        "color": 6
+      },
+      "id": "7b1cd127-1e4a-46f4-aafa-f3c21157c15c",
+      "name": "Sticky Note 7f01742e",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://lina-iconological-nathaniel.ngrok-free.dev/run",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "c99df84a-5719-4b89-bb96-a3902c760049",
+      "name": "Execute Python Script",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        464,
+        448
+      ],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "executeOnce": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1",
+              "name": "status",
+              "value": "error",
+              "type": "string"
+            },
+            {
+              "id": "2",
+              "name": "error_message",
+              "value": "HTTP request failed or API unreachable",
+              "type": "string"
+            },
+            {
+              "id": "3",
+              "name": "timestamp",
+              "value": "={{ $now.toISO() }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "0971dc52-d1c2-4615-b56e-1b1f2b42eb82",
+      "name": "HTTP Error Handler",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        912,
+        592
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "New Row Added": {
+      "main": [
+        [
+          {
+            "node": "Execute Python Script",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Execution Success": {
+      "main": [
+        [
+          {
+            "node": "Log Success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle Error": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack on Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Python Script": {
+      "main": [
+        [
+          {
+            "node": "Check Execution Success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HTTP Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "572ea45a-e7d1-48ab-8b34-2750f84f7b11",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "604c25bbe0ce25b812e4a4001552bd94566dfb77aa371c7b0c2edb61df284e65"
+  },
+  "id": "VZLQlqgjYNkCNOGJ",
+  "tags": []
+}
