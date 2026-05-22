@@ -17,8 +17,23 @@ pandas>=2.0,<3.0
 openpyxl>=3.1
 scikit-learn>=1.3,<2.0
 
-torch @ https://download.pytorch.org/whl/cpu/torch-2.5.1%2Bcpu-cp310-cp310-linux_x86_64.whl ; platform_machine == "x86_64"
-torch==2.5.1 ; platform_machine == "aarch64"
+# torch is version-pinned in a range so it resolves against whichever index
+# the caller configures: pytorch.org's /whl/cpu for x86_64 Linux (CI + Docker),
+# default PyPI for macOS ARM / CUDA hosts. The Dockerfile + GH Actions
+# workflows pass `--extra-index-url https://download.pytorch.org/whl/cpu` to
+# pull the CPU wheel; everyone else gets the default torch build.
+torch>=2.6,<3.0
 
 yfinance>=0.2.38
 plotly>=5.20
+
+# P1 data ingestion + sentiment
+pyarrow>=14.0
+snscrape>=0.7
+beautifulsoup4>=4.12
+# Article body extraction for news_ingest. Purpose-built for arbitrary news
+# sites; falls back across multiple extraction strategies.
+trafilatura>=1.12
+transformers>=4.36
+sentencepiece>=0.1.99
+google-cloud-firestore>=2.16

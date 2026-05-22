@@ -1,0 +1,143 @@
+name: daily-prediction
+
+# Daily after-market workflow:
+#   1. Pull latest model weights from the 'models-current' GitHub Release
+#   2. Run Data_update.py to append latest NSE bars to the Google Sheet
+#   3. Refresh cross-sectional / regime features (NIFTY + VIX)
+#   4. Run main.py inference using the existing PyTorch ensemble
+#   5. Upload predictions + metrics as a GitHub Actions artifact (7d retention)
+#
+# Runs at 11:00 UTC = 16:30 IST (NSE closes 15:30; data settled by 16:00 IST).
+# Manual trigger is available via the "Run workflow" button in the Actions tab.
+
+on:
+  schedule:
+    - cron: "0 11 * * 1-5"  # weekdays only
+  workflow_dispatch:
+
+concurrency:
+  group: daily-prediction
+  cancel-in-progress: false
+
+permissions:
+  contents: read  # release downloads only need read access
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install runtime deps (CPU torch)
+        run: |
+          pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            "torch==2.6.0+cpu"
+          pip install \
+            "pandas>=2.0,<3.0" \
+            "numpy>=1.24,<2.0" \
+            "pyarrow>=14.0" \
+            "scikit-learn>=1.3,<2.0" \
+            "openpyxl>=3.1" \
+            "yfinance>=0.2.38" \
+            "gspread>=6.0" \
+            "oauth2client>=4.1" \
+            "google-auth>=2.28" \
+            "pydantic>=1.10,<3" \
+            "python-dotenv>=1.0" \
+            "requests>=2.31" \
+            "plotly>=5.20"
+
+      - name: Restore Google credentials
+        env:
+          GCP_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          mkdir -p credentials
+          printf '%s' "$GCP_JSON" > credentials/service-account.json
+          chmod 600 credentials/service-account.json
+
+      - name: Download model artifacts from 'models-current' release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p outputs/Saved_Models outputs
+          if gh release view models-current >/dev/null 2>&1; then
+            # Place the .pt files where main.py expects them, and the metadata
+            # at outputs/pipeline_metadata.json.
+            gh release download models-current \
+              --pattern "*.pt" \
+              --dir outputs/Saved_Models \
+              --clobber
+            gh release download models-current \
+              --pattern "pipeline_metadata.json" \
+              --dir outputs \
+              --clobber
+            echo "restored model artifacts from models-current"
+          else
+            echo "::warning::models-current release not found — falling back to whatever is checked into the repo"
+          fi
+
+      - name: Update OHLCV data (Data_update.py)
+        env:
+          GOOGLE_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python Data_update.py \
+            --sheet-id "$SHEET_ID" \
+            --google-credentials "$GOOGLE_CREDENTIALS"
+
+      - name: Refresh NIFTY / VIX index cache
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m features.cross_sectional
+
+      - name: Run prediction (main.py)
+        env:
+          GOOGLE_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          DEVICE: cpu
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python main.py \
+            --source google \
+            --sheet-id "$SHEET_ID" \
+            --google-credentials "$GOOGLE_CREDENTIALS" \
+            --model-dir outputs/Saved_Models \
+            --metadata outputs/pipeline_metadata.json \
+            --output-dir outputs/main_inference \
+            --device cpu
+
+      - name: Archive predictions as workflow artifact (7-day retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: predictions-${{ github.run_id }}
+          path: |
+            outputs/main_inference/predictions.csv
+            outputs/main_inference/metrics.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Slack summary
+        if: always() && env.SLACK_WEBHOOK != ''
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          STATUS: ${{ job.status }}
+        run: |
+          if [ "$STATUS" = "success" ]; then
+            emoji=":white_check_mark:"
+          else
+            emoji=":warning:"
+          fi
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"${emoji} daily-prediction ${STATUS} on ${GITHUB_REPOSITORY} (run ${GITHUB_RUN_ID})\"}" \
+            "$SLACK_WEBHOOK"
