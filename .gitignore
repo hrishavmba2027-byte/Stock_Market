@@ -28,6 +28,9 @@ stock-prices-*.json
 .tool-versions
 .python-version
 
+outputs/*
+
+
 # ---------------------------------------------------------------------------
 # Python: bytecode, build, packaging
 # ---------------------------------------------------------------------------
@@ -52,6 +55,7 @@ MANIFEST
 # ---------------------------------------------------------------------------
 .venv/
 venv/
+venv_*/
 env/
 ENV/
 twitter_env/
@@ -80,7 +84,7 @@ htmlcov/
 nosetests.xml
 *.cover
 *.py,cover
-
+app/bookkeeping/*
 # ---------------------------------------------------------------------------
 # Jupyter / IPython
 # ---------------------------------------------------------------------------
@@ -112,6 +116,7 @@ tmp/
 
 state/*.json
 !state/.gitkeep
+workflow_state.json
 
 # ---------------------------------------------------------------------------
 # Ingestion data: generated parquet/csv files (keep archive folder shape)
@@ -123,6 +128,9 @@ Data/*.csv
 !Data/archive/.gitkeep
 *.parquet
 *.feather
+Data/nse_stock_data_train.xlsx
+
+
 
 # Project-local stray data files
 todo.txt
@@ -211,6 +219,15 @@ $RECYCLE.BIN/
 .directory
 .fuse_hidden*
 .Trash-*
+
+# ---------------------------------------------------------------------------
+# Local diagnostic / debug artifacts (never commit)
+# ---------------------------------------------------------------------------
+DIAGNOSTIC_REPORT.md
+ENVIRONMENT_REPAIR_GUIDE.md
+fix_environment.sh
+Scripts/debug_auth.py
+Scripts/setup_venv.sh
 
 # ---------------------------------------------------------------------------
 # Claude / agent local state

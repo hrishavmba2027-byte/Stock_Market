@@ -4,7 +4,7 @@ import logging
 import time
 from typing import Any, Callable, List, TypeVar
 
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials as GoogleCredentials
 
 from app.config.settings import Settings, get_settings
 from app.utils.logging import get_logger, log_event
@@ -28,17 +28,20 @@ class GoogleSheetsService:
         if self._client is None:
             import gspread
 
-            credentials = ServiceAccountCredentials.from_json_keyfile_name(
-                str(self.settings.google_credentials),
-                GOOGLE_SCOPES,
+            creds_path = str(self.settings.google_credentials)
+            print(f"[google_auth] Using credentials : {creds_path}", flush=True)
+            credentials = GoogleCredentials.from_service_account_file(
+                creds_path,
+                scopes=GOOGLE_SCOPES,
             )
+            print("[google_auth] Service Account Loaded Successfully", flush=True)
             self._client = gspread.authorize(credentials)
             log_event(
                 self.logger,
                 logging.INFO,
                 "google_auth_success",
                 "Authorized Google Sheets service account",
-                credentials_path=str(self.settings.google_credentials),
+                credentials_path=creds_path,
             )
         return self._client
 

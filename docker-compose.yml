@@ -58,6 +58,12 @@ services:
     command: uvicorn app_data:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+      - ./outputs:/app/outputs
+      - ./state:/app/state
+      - ./credentials/Credentials_New.json:/app/credentials/Credentials_New.json:ro
+    working_dir: /app
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -73,6 +79,12 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - ./outputs:/app/outputs
+      - ./state:/app/state
+      - ./credentials/Credentials_New.json:/app/credentials/Credentials_New.json:ro
+    working_dir: /app
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; data=open('/proc/1/cmdline','rb').read(); sys.exit(0 if b'app.watcher.service' in data else 1)"]

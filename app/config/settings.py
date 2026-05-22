@@ -19,9 +19,9 @@ load_dotenv()
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
-DOCKER_CREDENTIALS = Path("/app/credentials/stock-prices-495408-aa549faac3c5.json")
-LOCAL_CREDENTIALS = BASE_DIR / "stock-prices-495408-aa549faac3c5.json"
-LOCAL_CREDENTIALS_DIR = BASE_DIR / "credentials" / "stock-prices-495408-aa549faac3c5.json"
+DOCKER_CREDENTIALS = Path("/app/credentials/Credentials_New.json")
+LOCAL_CREDENTIALS = BASE_DIR / "credentials" / "Credentials_New.json"
+LOCAL_CREDENTIALS_DIR = BASE_DIR / "credentials" / "Credentials_New.json"
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -31,11 +31,17 @@ def _bool_env(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _int_env(name: str, default: int) -> int:
+def _int_env(name: str, default: int, *, minimum: int | None = None) -> int:
     value = os.getenv(name)
     if value is None or not value.strip():
         return default
-    return int(value)
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {parsed}")
+    return parsed
 
 
 def _float_env(name: str, default: float) -> float:
@@ -46,6 +52,10 @@ def _float_env(name: str, default: float) -> float:
 
 
 def _default_credentials_path() -> Path:
+    # GOOGLE_APPLICATION_CREDENTIALS is the primary standard env var.
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        return Path(os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
+    # GOOGLE_CREDENTIALS is the legacy fallback kept for backward compatibility.
     if os.getenv("GOOGLE_CREDENTIALS"):
         return Path(os.environ["GOOGLE_CREDENTIALS"])
     if DOCKER_CREDENTIALS.exists():
@@ -106,8 +116,12 @@ class Settings(BaseModel):
         return cls(
             base_dir=base_dir,
             sheet_id=os.getenv("SHEET_ID", "1uekPHyvJj4p6YjxNwlBBIAI71SWRye-xxFu47Kgpf9o"),
-            google_credentials=Path(os.getenv("GOOGLE_CREDENTIALS", str(_default_credentials_path()))),
-            watcher_poll_seconds=_int_env("WATCHER_POLL_SECONDS", 10),
+            google_credentials=Path(
+                os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+                or os.getenv("GOOGLE_CREDENTIALS")
+                or str(_default_credentials_path())
+            ),
+            watcher_poll_seconds=_int_env("WATCHER_POLL_SECONDS", 10, minimum=1),
             workflow_state_path=Path(os.getenv("WORKFLOW_STATE_PATH", str(base_dir / "workflow_state.json"))),
             logs_dir=logs_dir,
             app_log_path=Path(os.getenv("APP_LOG_PATH", str(logs_dir / "app.log"))),
@@ -118,10 +132,10 @@ class Settings(BaseModel):
             metadata_path=Path(os.getenv("METADATA_PATH", str(outputs_dir / "pipeline_metadata.json"))),
             workbook_path=Path(os.getenv("WORKBOOK", str(base_dir / "Data" / "nse_stock_data.xlsx"))),
             api_base_url=os.getenv("API_BASE_URL", "http://api:8000"),
-            api_timeout_seconds=_int_env("API_TIMEOUT_SECONDS", 30),
-            subprocess_timeout_seconds=_int_env("SUBPROCESS_TIMEOUT_SECONDS", 1800),
-            subprocess_retries=_int_env("SUBPROCESS_RETRIES", 2),
-            google_retries=_int_env("GOOGLE_RETRIES", 3),
+            api_timeout_seconds=_int_env("API_TIMEOUT_SECONDS", 30, minimum=1),
+            subprocess_timeout_seconds=_int_env("SUBPROCESS_TIMEOUT_SECONDS", 1800, minimum=1),
+            subprocess_retries=_int_env("SUBPROCESS_RETRIES", 2, minimum=0),
+            google_retries=_int_env("GOOGLE_RETRIES", 3, minimum=0),
             retry_backoff_seconds=_float_env("RETRY_BACKOFF_SECONDS", 2.0),
             update_start_date=os.getenv("UPDATE_START_DATE", "2015-01-01"),
             update_interval=os.getenv("UPDATE_INTERVAL", "1d"),
