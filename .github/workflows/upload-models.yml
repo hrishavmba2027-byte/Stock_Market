@@ -1,0 +1,98 @@
+name: upload-models
+
+# Manual-only workflow: take the model files currently checked into the repo
+# (outputs/Saved_Models/*.pt + outputs/pipeline_metadata.json) and replace
+# the assets attached to the 'models-current' GitHub Release. Use this for
+# the initial bootstrap, or any time you've trained a model locally and want
+# the daily-prediction workflow to pick it up immediately without waiting
+# for the monthly cron.
+#
+# This workflow is **never scheduled** — it only runs when you click
+# "Run workflow" from the Actions tab.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to write to (default: models-current — daily-prediction reads this)."
+        required: false
+        type: string
+        default: "models-current"
+      confirm:
+        description: "Type 'replace' to confirm overwrite of the existing release assets."
+        required: true
+        type: string
+
+concurrency:
+  group: upload-models
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # required to create / update a release
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.confirm == 'replace' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify required artifacts exist in the repo
+        run: |
+          set -euo pipefail
+          FILES=(
+            outputs/Saved_Models/Dense.pt
+            outputs/Saved_Models/LSTM.pt
+            outputs/Saved_Models/Transformer.pt
+            outputs/pipeline_metadata.json
+          )
+          for f in "${FILES[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::missing required artifact $f (commit it before running this workflow)"
+              exit 1
+            fi
+            echo "  ✓ $f ($(stat -c%s "$f" 2>/dev/null || stat -f%z "$f") bytes)"
+          done
+
+      - name: Replace release assets (or create the release if missing)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          FILES=(
+            outputs/Saved_Models/Dense.pt
+            outputs/Saved_Models/LSTM.pt
+            outputs/Saved_Models/Transformer.pt
+            outputs/pipeline_metadata.json
+          )
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release '$TAG' exists — replacing assets via --clobber"
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+          else
+            echo "release '$TAG' missing — creating it"
+            gh release create "$TAG" "${FILES[@]}" \
+              --title "Current model weights" \
+              --notes "Manually uploaded via the upload-models workflow on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+          fi
+
+      - name: Summary
+        env:
+          TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          echo "### upload-models result" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release **$TAG** now points at the four artifacts from this commit." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The next daily-prediction run will download these weights." >> "$GITHUB_STEP_SUMMARY"
+
+  rejected:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.confirm != 'replace' }}
+    steps:
+      - name: Confirmation phrase missing
+        run: |
+          echo "::error::You must type 'replace' in the 'confirm' input to authorize this overwrite."
+          exit 1

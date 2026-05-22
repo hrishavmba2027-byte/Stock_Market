@@ -82,6 +82,18 @@ class Settings(BaseModel):
     slack_webhook_url: str = ""
     slack_notify_success: bool = False
     slack_notify_failures: bool = True
+    # P1 data ingestion + sentiment
+    reddit_user_agent: str = "stock-market-automation/0.1"
+    fundamentals_path: Path = BASE_DIR / "Data" / "archive" / "fundamentals.parquet"
+    news_path: Path = BASE_DIR / "Data" / "archive" / "news.parquet"
+    reddit_path: Path = BASE_DIR / "Data" / "archive" / "reddit_posts.parquet"
+    x_path: Path = BASE_DIR / "Data" / "archive" / "x_posts.parquet"
+    sentiment_path: Path = BASE_DIR / "Data" / "archive" / "sentiment_features.parquet"
+    indices_path: Path = BASE_DIR / "Data" / "archive" / "indices.parquet"
+    sentiment_model: str = "ProsusAI/finbert"
+    sentiment_backfill_days: int = 90
+    firestore_project: str = ""
+    firestore_fundamentals_collection: str = "fundamentals"
 
     class Config:
         arbitrary_types_allowed = True
@@ -118,6 +130,17 @@ class Settings(BaseModel):
             slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL", ""),
             slack_notify_success=_bool_env("SLACK_NOTIFY_SUCCESS", False),
             slack_notify_failures=_bool_env("SLACK_NOTIFY_FAILURES", True),
+            reddit_user_agent=os.getenv("REDDIT_USER_AGENT", "stock-market-automation/0.1"),
+            fundamentals_path=Path(os.getenv("FUNDAMENTALS_PATH", str(base_dir / "Data" / "archive" / "fundamentals.parquet"))),
+            news_path=Path(os.getenv("NEWS_PATH", str(base_dir / "Data" / "archive" / "news.parquet"))),
+            reddit_path=Path(os.getenv("REDDIT_PATH", str(base_dir / "Data" / "archive" / "reddit_posts.parquet"))),
+            x_path=Path(os.getenv("X_PATH", str(base_dir / "Data" / "archive" / "x_posts.parquet"))),
+            sentiment_path=Path(os.getenv("SENTIMENT_PATH", str(base_dir / "Data" / "archive" / "sentiment_features.parquet"))),
+            indices_path=Path(os.getenv("INDICES_PATH", str(base_dir / "Data" / "archive" / "indices.parquet"))),
+            sentiment_model=os.getenv("SENTIMENT_MODEL", "ProsusAI/finbert"),
+            sentiment_backfill_days=_int_env("SENTIMENT_BACKFILL_DAYS", 90),
+            firestore_project=os.getenv("FIRESTORE_PROJECT", ""),
+            firestore_fundamentals_collection=os.getenv("FIRESTORE_FUNDAMENTALS_COLLECTION", "fundamentals"),
         )
 
     def ensure_runtime_dirs(self) -> None:

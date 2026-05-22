@@ -1,37 +1,64 @@
-x-common-env: &common-env
-  PYTHONPATH: /app
-  BASE_DIR: /app
-  SHEET_ID: 1uekPHyvJj4p6YjxNwlBBIAI71SWRye-xxFu47Kgpf9o
-  GOOGLE_CREDENTIALS: /app/credentials/stock-prices-495408-aa549faac3c5.json
-  GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/stock-prices-495408-aa549faac3c5.json
-  WORKFLOW_STATE_PATH: /app/state/workflow_state.json
-  LOGS_DIR: /app/logs
-  OUTPUTS_DIR: /app/outputs
-  OUTPUT_DIR: /app/outputs/main_inference
-  MODEL_DIR: /app/outputs/Saved_Models
-  METADATA_PATH: /app/outputs/pipeline_metadata.json
-  DEVICE: auto
-  WATCHER_POLL_SECONDS: "90"
-  LANGCHAIN_MODE: deterministic
-  API_BASE_URL: http://api:8000
+# Docker Compose for local development.
+#
+# Two long-running services (api + watcher) come up with `docker compose up`.
+# A third service, `pipeline`, is **opt-in** via the `tools` profile — use it
+# for one-shot ingestion / sentiment runs without touching the long-running
+# containers. See README/DEPLOYMENT.md for usage recipes.
+#
+# All three services share the same image — built once, reused — so
+# `requirements.txt` is installed exactly once at build time.
+
+x-app-shared: &app-shared
+  # Only the `api` service overrides this with a real `build:` block. Every
+  # other service inherits the same image tag and skips the build step —
+  # otherwise BuildKit's parallel builder races to tag the same image twice
+  # and fails the second one with "image already exists".
+  image: stock-market-automation:local
+  working_dir: /app
+  # .env is the single source of truth for secrets and config. Container-path
+  # overrides live in `environment:` below.
+  env_file:
+    - .env
+  environment:
+    # These override anything in .env so the container always sees container
+    # paths regardless of what the host .env contains.
+    PYTHONPATH: /app
+    BASE_DIR: /app
+    GOOGLE_CREDENTIALS: /app/credentials/service-account.json
+    GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/service-account.json
+    WORKFLOW_STATE_PATH: /app/state/workflow_state.json
+    LOGS_DIR: /app/logs
+    OUTPUTS_DIR: /app/outputs
+    OUTPUT_DIR: /app/outputs/main_inference
+    MODEL_DIR: /app/outputs/Saved_Models
+    METADATA_PATH: /app/outputs/pipeline_metadata.json
+    HF_HOME: /app/.cache/huggingface
+    DEVICE: auto
+  volumes:
+    # Code/data persistence:
+    - ./logs:/app/logs
+    - ./outputs:/app/outputs
+    - ./state:/app/state
+    - ./Data:/app/Data
+    # Caches kept outside the image so reinstalls don't redownload FinBERT:
+    - hf-cache:/app/.cache/huggingface
+    # Service-account JSON, mounted read-only at the path the env vars expect.
+    # The host filename is whatever GCP gave you; set CREDENTIALS_FILE in .env
+    # to point at it (defaults to "service-account.json" if unset).
+    - ./credentials/${CREDENTIALS_FILE:-service-account.json}:/app/credentials/service-account.json:ro
 
 services:
   api:
-    build: .
-    image: stock-market-automation:local
+    <<: *app-shared
+    # Only the api service builds the image; watcher + pipeline reuse the tag.
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: stock_market_api
     command: uvicorn app_data:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
-    volumes:
-      - ./logs:/app/logs
-      - ./outputs:/app/outputs
-      - ./state:/app/state
-      - ./credentials/stock-prices-495408-aa549faac3c5.json:/app/credentials/stock-prices-495408-aa549faac3c5.json:ro
-    working_dir: /app
     restart: unless-stopped
-    environment:
-      <<: *common-env
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -40,18 +67,12 @@ services:
       start_period: 30s
 
   watcher:
-    image: stock-market-automation:local
+    <<: *app-shared
     container_name: stock_market_watcher
     command: python -m app.watcher.service
     depends_on:
       api:
         condition: service_healthy
-    volumes:
-      - ./logs:/app/logs
-      - ./outputs:/app/outputs
-      - ./state:/app/state
-      - ./credentials/stock-prices-495408-aa549faac3c5.json:/app/credentials/stock-prices-495408-aa549faac3c5.json:ro
-    working_dir: /app
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; data=open('/proc/1/cmdline','rb').read(); sys.exit(0 if b'app.watcher.service' in data else 1)"]
@@ -59,5 +80,21 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
-    environment:
-      <<: *common-env
+
+  # One-shot runner for ingestion / sentiment / fundamentals. Not started by
+  # `docker compose up`; opt-in with `docker compose --profile tools run --rm pipeline <cmd>`.
+  # Example invocations:
+  #   docker compose --profile tools run --rm pipeline python -m ingestion.news_ingest
+  #   docker compose --profile tools run --rm pipeline python -m ingestion.reddit_ingest
+  #   docker compose --profile tools run --rm pipeline python -m features.sentiment
+  #   docker compose --profile tools run --rm pipeline pytest -q
+  pipeline:
+    <<: *app-shared
+    container_name: stock_market_pipeline
+    profiles: ["tools"]
+    entrypoint: ["python"]
+    # No `restart:` — this service is meant to be invoked ad-hoc and exit.
+
+volumes:
+  hf-cache:
+    name: stock-market-hf-cache
