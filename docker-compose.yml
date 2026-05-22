@@ -46,6 +46,22 @@ x-app-shared: &app-shared
     # The host filename is whatever GCP gave you; set CREDENTIALS_FILE in .env
     # to point at it (defaults to "service-account.json" if unset).
     - ./credentials/${CREDENTIALS_FILE:-service-account.json}:/app/credentials/service-account.json:ro
+x-common-env: &common-env
+  PYTHONPATH: /app
+  BASE_DIR: /app
+  SHEET_ID: 1uekPHyvJj4p6YjxNwlBBIAI71SWRye-xxFu47Kgpf9o
+  GOOGLE_CREDENTIALS: /app/credentials/Credentials_New.json
+  GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/Credentials_New.json
+  WORKFLOW_STATE_PATH: /app/state/workflow_state.json
+  LOGS_DIR: /app/logs
+  OUTPUTS_DIR: /app/outputs
+  OUTPUT_DIR: /app/outputs/main_inference
+  MODEL_DIR: /app/outputs/Saved_Models
+  METADATA_PATH: /app/outputs/pipeline_metadata.json
+  DEVICE: auto
+  WATCHER_POLL_SECONDS: "90"
+  LANGCHAIN_MODE: deterministic
+  API_BASE_URL: http://api:8000
 
 services:
   api:
@@ -58,6 +74,12 @@ services:
     command: uvicorn app_data:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+      - ./outputs:/app/outputs
+      - ./state:/app/state
+      - ./credentials/Credentials_New.json:/app/credentials/Credentials_New.json:ro
+    working_dir: /app
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -73,6 +95,12 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - ./outputs:/app/outputs
+      - ./state:/app/state
+      - ./credentials/Credentials_New.json:/app/credentials/Credentials_New.json:ro
+    working_dir: /app
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; data=open('/proc/1/cmdline','rb').read(); sys.exit(0 if b'app.watcher.service' in data else 1)"]

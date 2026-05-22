@@ -1,0 +1,85 @@
+# requirements-lock.txt — exact versions currently installed in venv
+# Generated: 2026-05-22  (macOS, Python 3.9.6, Apple Silicon)
+#
+# Packages still needed (install via ./Scripts/setup_venv.sh):
+#   torch>=2.2.0  torchvision>=0.17.0  torchaudio>=2.2.0
+#   pandas-ta>=0.3.14b0  matplotlib>=3.7.0  seaborn>=0.13.0
+#   statsmodels>=0.14.0  optuna>=3.5.0  pytest>=8.0.0
+
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.12.1
+beautifulsoup4==4.14.3
+certifi==2026.5.20
+cffi==2.0.0
+charset-normalizer==3.4.7
+click==8.1.8
+cryptography==48.0.0
+curl-cffi==0.13.0
+et-xmlfile==2.0.0
+exceptiongroup==1.3.1
+fastapi==0.128.8
+frozendict==2.4.7
+google-auth==2.50.0
+google-auth-httplib2==0.3.1
+google-auth-oauthlib==1.3.1
+gspread==6.2.1
+h11==0.16.0
+httpcore==1.0.9
+httplib2==0.31.2
+httptools==0.7.1
+httpx==0.28.1
+idna==3.16
+joblib==1.5.3
+jsonpatch==1.33
+jsonpointer==3.0.0
+langchain-core==0.3.86
+langsmith==0.4.37
+multitasking==0.0.13
+narwhals==2.21.0
+numpy==1.26.4
+oauth2client==4.1.3  # REMOVE — causes invalid_grant JWT error
+oauthlib==3.3.1
+openpyxl==3.1.5
+orjson==3.11.5
+packaging==25.0
+pandas==2.3.3
+peewee==4.0.6
+pip==26.0.1
+platformdirs==4.4.0
+plotly==6.7.0
+protobuf==6.33.6
+pyasn1==0.6.3
+pyasn1-modules==0.4.2
+pycparser==2.23
+pydantic==2.13.4
+pydantic-core==2.46.4
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.1
+pytz==2026.2
+pyyaml==6.0.3
+requests==2.32.5
+requests-oauthlib==2.0.0
+requests-toolbelt==1.0.0
+rsa==4.9.1
+scikit-learn==1.6.1
+scipy==1.13.1
+setuptools==82.0.1
+six==1.17.0
+soupsieve==2.8.3
+starlette==0.49.3
+tenacity==9.1.2
+threadpoolctl==3.6.0
+typing-extensions==4.15.0
+typing-inspection==0.4.2
+tzdata==2026.2
+urllib3==2.6.3
+uuid-utils==0.15.0
+uvicorn==0.39.0
+uvloop==0.22.1
+watchfiles==1.1.1
+websockets==15.0.1
+wheel==0.47.0
+yfinance==1.2.0
+zstandard==0.25.0
