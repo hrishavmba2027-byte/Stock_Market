@@ -29,6 +29,7 @@ stock-prices-*.json
 .python-version
 
 outputs/*
+!outputs/pipeline_metadata.json
 
 
 # ---------------------------------------------------------------------------

@@ -1,333 +1,352 @@
-import pandas as pd
-import numpy as np
-from openpyxl import load_workbook
+"""Feature Engineering for NSE Stock Data.
+
+This module provides two distinct modes of operation:
+
+1.  **Inline import (production workflow)**
+    ``compute_indicators(df)`` is imported directly by ``main.py``,
+    ``monthly_finetune.py``, and other modules.  The function receives a
+    single-symbol DataFrame already loaded from Google Sheets (or another
+    source), computes 29 technical indicators, attaches 30 forward-return
+    labels, and returns the enriched DataFrame.  It never touches the
+    filesystem.
+
+2.  **Standalone batch script (offline / training data refresh)**
+    ``python Feature_Engineering.py`` reads
+    ``Data/nse_stock_data_train.xlsx`` (the 51 MB training corpus), runs
+    ``compute_indicators`` on every sheet, and writes the enriched workbook
+    back to the same file.  This is a manual, offline step — it is NOT
+    invoked by the Docker workflow.
+
+Design invariants
+-----------------
+* ``compute_indicators`` MUST NOT import from ``main.py`` or any app module
+  (to avoid circular imports).
+* Indicator columns are lagged by one step (``shift(1)``) to prevent
+  look-ahead bias: the feature row at time *t* reflects information up to
+  *t-1*.
+* Forward-return labels (``y_logret_h1`` … ``y_logret_h30``) and the
+  ``has_labels`` flag are targets, NOT model features.  They are stripped by
+  callers before building the feature matrix.
+* A ``FeatureEngineeringError`` is raised instead of silently returning the
+  unmodified DataFrame when OHLCV columns cannot be located.  Callers are
+  expected to catch this and surface it as a skipped-symbol warning.
+"""
+
+from __future__ import annotations
+
+import logging
 import sys
+import time
 from pathlib import Path
-import warnings
-warnings.filterwarnings('ignore')
+from typing import Dict, List, Optional, Tuple
 
-# Try to import TA-Lib equivalent (optional)
+import numpy as np
+import pandas as pd
+from openpyxl import load_workbook
+
+warnings_module_available = False
 try:
-    import pandas_ta as ta
-    HAS_TA = True
-except ImportError:
-    HAS_TA = False
+    import warnings
+    warnings.filterwarnings("ignore")
+    warnings_module_available = True
+except Exception:
+    pass
 
+_log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Public error type
+# ---------------------------------------------------------------------------
+
+class FeatureEngineeringError(ValueError):
+    """Raised when feature engineering cannot proceed for a symbol.
+
+    Replaces the old silent-return path so callers get an explicit signal
+    instead of an unmodified DataFrame that looks valid but has no indicators.
+    """
+
+
+# ---------------------------------------------------------------------------
 # Constants
-REQUIRED_COLUMNS = {'open', 'high', 'low', 'close', 'volume'}
-DATE_COLUMN_VARIANTS = ['date', 'Date', 'DATE', 'datetime', 'Datetime', 'time', 'Time']
+# ---------------------------------------------------------------------------
+
+REQUIRED_COLUMNS = {"open", "high", "low", "close", "volume"}
+DATE_COLUMN_VARIANTS = ["date", "Date", "DATE", "datetime", "Datetime", "time", "Time"]
+
+# Forward-return label settings (P0.1)
+FORWARD_HORIZONS: Tuple[int, ...] = tuple(range(1, 31))   # h = 1, 2, …, 30
+FORWARD_LABEL_PREFIX = "y_logret_h"
+HAS_LABELS_COL = "has_labels"
+
+# Columns produced by compute_indicators that the model uses (29 total).
+# MFI_14 is intentionally excluded — it was computed historically but was never
+# added to pipeline_metadata.json feature_columns, so including it here
+# prevents a silent divergence between what FE produces and what the model reads.
+INDICATOR_COLUMNS: Tuple[str, ...] = (
+    "RSI_14",
+    "MACD_12_26", "MACD_Signal_9", "MACD_Histogram",
+    "Stochastic_%K", "Stochastic_%D",
+    "SMA_5", "SMA_20", "SMA_50",
+    "EMA_12", "EMA_26", "EMA_50",
+    "ADX_14",
+    "BB_Upper_20", "BB_Middle_20", "BB_Lower_20",
+    "ATR_14",
+    "OBV", "VWAP",
+    "Daily_Return_%", "Log_Return_%",
+    "ROC_12", "CCI_20", "Williams_%R",
+)  # len = 24; plus 5 OHLCV = 29 total
+
+# Decision-layer categorical features (Google Sheets only — never model inputs)
+DECISION_FEATURE_COLUMNS = [
+    "RSI_7", "SMA_5_20", "SMA_20_50", "EMA_12_26", "EMA_26_50",
+    "BB_indicator", "BB_trend_state", "BB_volatility_state",
+    "BB_overbought_oversold", "RSI_indicator_7", "RSI_indicator_14",
+]
+
+RSI_BIN_MIN_HISTORY = 30
+_RSI_FALLBACK_THRESHOLDS = (30.0, 50.0, 70.0)
 
 
-def load_workbook_sheets(filepath):
-    """
-    Load all sheets from the workbook into a dictionary of DataFrames.
-    
-    Args:
-        filepath: Path to the Excel workbook
-        
-    Returns:
-        Dictionary mapping sheet names to DataFrames
-    """
-    try:
-        sheets = pd.read_excel(filepath, sheet_name=None)
-        print(f"Loaded {len(sheets)} sheets from {filepath}")
-        return sheets
-    except FileNotFoundError:
-        print(f"Error: File '{filepath}' not found.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error loading workbook: {e}")
-        sys.exit(1)
+# ===========================================================================
+# Date / OHLCV detection helpers
+# ===========================================================================
 
-
-def detect_date_column(df):
-    """
-    Automatically detect the date column in the DataFrame.
-    
-    Args:
-        df: Input DataFrame
-        
-    Returns:
-        Column name if found, None otherwise
-    """
-    # Check for exact matches first
+def detect_date_column(df: pd.DataFrame) -> Optional[str]:
+    """Return the name of the date column, or None if not detected."""
     for col in DATE_COLUMN_VARIANTS:
         if col in df.columns:
             return col
-    
-    # Check for columns containing 'date' or 'time'
     for col in df.columns:
-        if 'date' in col.lower() or 'time' in col.lower():
+        if "date" in str(col).lower() or "time" in str(col).lower():
             return col
-    
-    # Check first column if it looks like dates
-    if len(df.columns) > 0:
+    if df.columns.size > 0:
         first_col = df.columns[0]
         try:
             pd.to_datetime(df[first_col])
             return first_col
-        except:
+        except Exception:
             pass
-    
     return None
 
 
-def ensure_date_column(df, date_col):
-    """
-    Ensure the date column is in datetime format and sort by date.
-    
-    Args:
-        df: Input DataFrame
-        date_col: Name of the date column
-        
-    Returns:
-        DataFrame with date column as datetime and sorted
-    """
-    if date_col:
-        try:
-            df[date_col] = pd.to_datetime(df[date_col], errors='coerce', format='mixed')
-        except TypeError:
-            df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-        # Remove rows with invalid dates
-        df = df.dropna(subset=[date_col])
-        # Sort by date
-        df = df.sort_values(by=date_col).reset_index(drop=True)
+def ensure_date_column(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
+    """Parse *date_col* to datetime, drop invalid rows, sort chronologically."""
+    if not date_col:
+        return df
+    try:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce", format="mixed")
+    except TypeError:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.dropna(subset=[date_col])
+    df = df.sort_values(by=date_col).reset_index(drop=True)
     return df
 
 
-def find_ohlcv_columns(df):
+def find_ohlcv_columns(df: pd.DataFrame) -> Optional[Dict[str, str]]:
+    """Locate OHLCV columns using case-insensitive matching.
+
+    Returns a dict ``{"open": col, "high": col, …}`` with all five keys,
+    or ``None`` if any of the five cannot be found.
     """
-    Dynamically find OHLCV columns in the DataFrame.
-    Handles patterns like: Open_SYMBOL, High_SYMBOL, etc.
-    
-    Args:
-        df: Input DataFrame
-        
-    Returns:
-        Dictionary mapping OHLCV names to actual column names, or None if not found
-    """
-    # Normalize column names to lowercase for matching
-    col_lower = {col: col.lower() for col in df.columns}
-    
-    # Try exact matches first
-    ohlcv_map = {}
-    for ohlc_name in ['open', 'high', 'low', 'close', 'volume']:
-        if ohlc_name in col_lower.values():
-            ohlcv_map[ohlc_name] = [col for col, lower_col in col_lower.items() if lower_col == ohlc_name][0]
-    
-    # If we found all 5, return
+    col_lower = {col: str(col).lower() for col in df.columns}
+
+    # Pass 1 — exact lowercase match
+    ohlcv_map: Dict[str, str] = {}
+    for name in ("open", "high", "low", "close", "volume"):
+        matches = [col for col, lc in col_lower.items() if lc == name]
+        if matches:
+            ohlcv_map[name] = matches[0]
     if len(ohlcv_map) == 5:
         return ohlcv_map
-    
-    # Otherwise, try pattern matching (e.g., Open_SYMBOL, High_SYMBOL)
+
+    # Pass 2 — prefix pattern (e.g. Open_RELIANCE)
     ohlcv_map = {}
-    for col_name, col_lower_name in col_lower.items():
-        if col_lower_name.startswith('open_'):
-            ohlcv_map['open'] = col_name
-        elif col_lower_name.startswith('high_'):
-            ohlcv_map['high'] = col_name
-        elif col_lower_name.startswith('low_'):
-            ohlcv_map['low'] = col_name
-        elif col_lower_name.startswith('close_'):
-            ohlcv_map['close'] = col_name
-        elif col_lower_name.startswith('volume_'):
-            ohlcv_map['volume'] = col_name
-    
-    # Check if all OHLCV were found
+    for col, lc in col_lower.items():
+        for prefix, key in (
+            ("open_", "open"), ("high_", "high"), ("low_", "low"),
+            ("close_", "close"), ("volume_", "volume"),
+        ):
+            if lc.startswith(prefix):
+                ohlcv_map.setdefault(key, col)
     if len(ohlcv_map) == 5:
         return ohlcv_map
-    
+
     return None
 
 
-def compute_rsi(close, period=14):
-    """Compute Relative Strength Index (RSI)"""
+def find_close_column(df: pd.DataFrame) -> Optional[str]:
+    """Locate the Close column leniently (exact, then Close_SYMBOL pattern)."""
+    for col in df.columns:
+        if str(col).strip().lower() == "close":
+            return col
+    for col in df.columns:
+        if str(col).strip().lower().startswith("close_"):
+            return col
+    return None
+
+
+# ===========================================================================
+# Core technical indicator implementations
+# ===========================================================================
+
+def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    
-    # Avoid division by zero
+    gain = delta.where(delta > 0, 0.0).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean()
     rs = np.where(loss != 0, gain / loss, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return pd.Series(rsi, index=close.index)
+    return pd.Series(100.0 - (100.0 / (1.0 + rs)), index=close.index)
 
 
-def compute_macd(close, fast=12, slow=26, signal=9):
-    """
-    Compute MACD, Signal Line, and Histogram.
-    
-    Returns:
-        Tuple of (MACD line, Signal line, Histogram)
-    """
+def compute_macd(
+    close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
+) -> Tuple[pd.Series, pd.Series, pd.Series]:
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
+    macd = ema_fast - ema_slow
+    sig = macd.ewm(span=signal, adjust=False).mean()
+    return macd, sig, macd - sig
 
 
-def compute_stochastic(high, low, close, k_period=14, d_period=3):
-    """
-    Compute Stochastic Oscillator (%K and %D).
-    
-    Returns:
-        Tuple of (%K, %D)
-    """
-    lowest_low = low.rolling(window=k_period).min()
-    highest_high = high.rolling(window=k_period).max()
-    
-    denominator = highest_high - lowest_low
-    k_percent = 100 * ((close - lowest_low) / denominator)
-    d_percent = k_percent.rolling(window=d_period).mean()
-    
-    return k_percent, d_percent
+def compute_stochastic(
+    high: pd.Series, low: pd.Series, close: pd.Series,
+    k_period: int = 14, d_period: int = 3
+) -> Tuple[pd.Series, pd.Series]:
+    lo = low.rolling(k_period).min()
+    hi = high.rolling(k_period).max()
+    denom = hi - lo
+    k = 100.0 * ((close - lo) / denom)
+    return k, k.rolling(d_period).mean()
 
 
-def compute_sma(close, period):
-    """Compute Simple Moving Average (SMA)"""
-    return close.rolling(window=period).mean()
+def compute_sma(close: pd.Series, period: int) -> pd.Series:
+    return close.rolling(period).mean()
 
 
-def compute_ema(close, period):
-    """Compute Exponential Moving Average (EMA)"""
+def compute_ema(close: pd.Series, period: int) -> pd.Series:
     return close.ewm(span=period, adjust=False).mean()
 
 
-def compute_adx(high, low, close, period=14):
-    """Compute Average Directional Index (ADX)"""
+def compute_adx(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> pd.Series:
     try:
-        plus_dm = high.diff()
-        plus_dm = plus_dm.where((plus_dm > 0) & (plus_dm > (low.diff() * -1)), 0)
-        
-        minus_dm = low.diff() * -1
-        minus_dm = minus_dm.where((minus_dm > 0) & (minus_dm > high.diff()), 0)
-        
+        plus_dm = high.diff().clip(lower=0.0)
+        minus_dm = (-low.diff()).clip(lower=0.0)
+        # Keep only directional moves (not both sides simultaneously)
+        plus_dm = plus_dm.where(plus_dm > (-low.diff()).clip(lower=0.0), 0.0)
+        minus_dm = minus_dm.where(minus_dm > high.diff().clip(lower=0.0), 0.0)
+
         tr = pd.concat([
             high - low,
             (high - close.shift(1)).abs(),
-            (low - close.shift(1)).abs()
+            (low - close.shift(1)).abs(),
         ], axis=1).max(axis=1)
-        
-        tr_sum = tr.rolling(window=period).sum()
-        
-        plus_di = 100 * (plus_dm.rolling(window=period).sum() / tr_sum)
-        minus_di = 100 * (minus_dm.rolling(window=period).sum() / tr_sum)
-        
+
+        tr_s = tr.rolling(period).sum()
+        plus_di = 100.0 * (plus_dm.rolling(period).sum() / tr_s)
+        minus_di = 100.0 * (minus_dm.rolling(period).sum() / tr_s)
         di_sum = (plus_di + minus_di).abs()
-        di_diff = (plus_di - minus_di).abs()
-        
-        dx = 100 * (di_diff / di_sum)
-        adx = dx.rolling(window=period).mean()
-        
-        return adx
-    except Exception as e:
-        print(f"      Warning: ADX calculation failed: {e}")
+        dx = 100.0 * ((plus_di - minus_di).abs() / di_sum.replace(0, np.nan))
+        return dx.rolling(period).mean()
+    except Exception as exc:
+        _log.warning("ADX calculation failed: %s", exc)
         return pd.Series(np.nan, index=close.index)
 
 
-def compute_bollinger_bands(close, period=20, std_dev=2):
-    """
-    Compute Bollinger Bands (Upper, Middle, Lower).
-    
-    Returns:
-        Tuple of (Upper band, Middle band, Lower band)
-    """
-    sma = close.rolling(window=period).mean()
-    std = close.rolling(window=period).std()
-    upper_band = sma + (std_dev * std)
-    lower_band = sma - (std_dev * std)
-    return upper_band, sma, lower_band
+def compute_bollinger_bands(
+    close: pd.Series, period: int = 20, std_dev: float = 2.0
+) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    mid = close.rolling(period).mean()
+    std = close.rolling(period).std()
+    return mid + std_dev * std, mid, mid - std_dev * std
 
 
-def compute_atr(high, low, close, period=14):
-    """Compute Average True Range (ATR)"""
+def compute_atr(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> pd.Series:
     tr = pd.concat([
         high - low,
         (high - close.shift(1)).abs(),
-        (low - close.shift(1)).abs()
+        (low - close.shift(1)).abs(),
     ], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean()
-    return atr
+    return tr.rolling(period).mean()
 
 
-def compute_obv(close, volume):
-    """Compute On-Balance Volume (OBV)"""
-    price_diff = close.diff()
-    price_diff[0] = 0  # First value is NaN
-    obv = (np.sign(price_diff) * volume).fillna(0).cumsum()
-    return obv
+def compute_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    price_diff = close.diff().fillna(0.0)
+    return (np.sign(price_diff) * volume).cumsum()
 
 
-def compute_vwap(high, low, close, volume):
-    """Compute Volume Weighted Average Price (VWAP)"""
+def compute_vwap(
+    high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series
+) -> pd.Series:
     try:
-        typical_price = (high + low + close) / 3
-        cum_vol = volume.cumsum()
-        cum_tp_vol = (typical_price * volume).cumsum()
-        vwap = cum_tp_vol / cum_vol
-        return vwap
-    except Exception as e:
-        print(f"      Warning: VWAP calculation failed: {e}")
+        tp = (high + low + close) / 3.0
+        return (tp * volume).cumsum() / volume.cumsum()
+    except Exception as exc:
+        _log.warning("VWAP calculation failed: %s", exc)
         return pd.Series(np.nan, index=close.index)
 
 
-def compute_daily_return(close):
-    """Compute Daily Return (percentage change)"""
-    return close.pct_change() * 100
+def compute_daily_return(close: pd.Series) -> pd.Series:
+    return close.pct_change() * 100.0
 
 
-def compute_log_return(close):
-    """Compute Log Return"""
-    return np.log(close / close.shift(1)) * 100
+def compute_log_return(close: pd.Series) -> pd.Series:
+    return np.log(close / close.shift(1)) * 100.0
 
 
-# ============================================================================
-# P0.1 — Forward-return label construction
-# ============================================================================
-# These labels look INTO THE FUTURE — they must never be used as model inputs.
-# They are the targets for the multi-horizon quantile forecaster (P0.2).
-# ============================================================================
-
-FORWARD_HORIZONS = tuple(range(1, 31))  # h = 1, 2, ..., 30
-FORWARD_LABEL_PREFIX = "y_logret_h"
-HAS_LABELS_COL = "has_labels"
+def compute_roc(close: pd.Series, period: int = 12) -> pd.Series:
+    return ((close - close.shift(period)) / close.shift(period)) * 100.0
 
 
-def forward_label_columns(horizons=FORWARD_HORIZONS):
-    """Canonical names for the forward-return label columns."""
+def compute_cci(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 20
+) -> pd.Series:
+    try:
+        tp = (high + low + close) / 3.0
+        sma = tp.rolling(period).mean()
+        mad = tp.rolling(period).apply(lambda x: np.abs(x - x.mean()).mean(), raw=False)
+        return (tp - sma) / (0.015 * mad)
+    except Exception as exc:
+        _log.warning("CCI calculation failed: %s", exc)
+        return pd.Series(np.nan, index=close.index)
+
+
+def compute_williams_r(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> pd.Series:
+    hh = high.rolling(period).max()
+    ll = low.rolling(period).min()
+    return -100.0 * ((hh - close) / (hh - ll))
+
+
+# ===========================================================================
+# Forward-return label helpers (P0.1)
+# ===========================================================================
+
+def forward_label_columns(horizons: Tuple[int, ...] = FORWARD_HORIZONS) -> List[str]:
     return [f"{FORWARD_LABEL_PREFIX}{h}" for h in horizons]
 
 
-def compute_forward_log_returns(close, horizons=FORWARD_HORIZONS):
-    """
-    For each row at time t, compute y_h = log(Close[t+h] / Close[t]) for h in horizons.
-
-    Implemented via close.shift(-h) so y_h at row t is undefined for the last h rows
-    of the series — that's intentional. Those rows are NOT training-eligible and
-    are flagged via `has_labels=False`.
-
-    Returns:
-        Dict[str, pd.Series] keyed by forward_label_columns(horizons).
-    """
-    labels = {}
+def compute_forward_log_returns(
+    close: pd.Series, horizons: Tuple[int, ...] = FORWARD_HORIZONS
+) -> Dict[str, pd.Series]:
+    """Compute log(Close[t+h] / Close[t]) for each horizon h."""
     log_close = np.log(close)
-    for h in horizons:
-        labels[f"{FORWARD_LABEL_PREFIX}{h}"] = log_close.shift(-h) - log_close
-    return labels
+    return {
+        f"{FORWARD_LABEL_PREFIX}{h}": log_close.shift(-h) - log_close
+        for h in horizons
+    }
 
 
-def attach_forward_labels(df, close_col="close", horizons=FORWARD_HORIZONS):
-    """
-    Attach 30 forward-return label columns plus a `has_labels` boolean flag to df.
-
-    `has_labels=True` iff every forward label at that row is finite (i.e. the row
-    has at least `max(horizons)` future bars available in the same frame).
-
-    The flag is deliberately surfaced as a column so any downstream train/test
-    code can `assert df.loc[train_mask, 'has_labels'].all()` and any leakage bug
-    becomes visible in code review (per ROADMAP P0.1).
-    """
+def attach_forward_labels(
+    df: pd.DataFrame,
+    close_col: str = "close",
+    horizons: Tuple[int, ...] = FORWARD_HORIZONS,
+) -> pd.DataFrame:
+    """Attach label columns + ``has_labels`` to *df*.  Does not shift."""
     df_out = df.copy()
     labels = compute_forward_log_returns(df_out[close_col], horizons=horizons)
     label_cols = list(labels.keys())
@@ -337,128 +356,51 @@ def attach_forward_labels(df, close_col="close", horizons=FORWARD_HORIZONS):
     return df_out
 
 
-def compute_roc(close, period=12):
-    """Compute Rate of Change (ROC)"""
-    roc = ((close - close.shift(period)) / close.shift(period)) * 100
-    return roc
+# ===========================================================================
+# Decision-layer categorical features (Sheets-only, never model inputs)
+# ===========================================================================
+
+def _finite(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(pd.Series(series), errors="coerce").replace(
+        [np.inf, -np.inf], np.nan
+    )
 
 
-def compute_cci(high, low, close, period=20):
-    """Compute Commodity Channel Index (CCI)"""
-    try:
-        typical_price = (high + low + close) / 3
-        sma = typical_price.rolling(window=period).mean()
-        mad = typical_price.rolling(window=period).apply(
-            lambda x: np.abs(x - x.mean()).mean(), raw=False
-        )
-        cci = (typical_price - sma) / (0.015 * mad)
-        return cci
-    except Exception as e:
-        print(f"      Warning: CCI calculation failed: {e}")
-        return pd.Series(np.nan, index=close.index)
-
-
-def compute_williams_r(high, low, close, period=14):
-    """Compute Williams %R"""
-    highest_high = high.rolling(window=period).max()
-    lowest_low = low.rolling(window=period).min()
-    williams_r = -100 * ((highest_high - close) / (highest_high - lowest_low))
-    return williams_r
-
-
-def compute_mfi(high, low, close, volume, period=14):
-    """Compute Money Flow Index (MFI)"""
-    try:
-        typical_price = (high + low + close) / 3
-        money_flow = typical_price * volume
-        
-        positive_flow = money_flow.where(typical_price > typical_price.shift(1), 0)
-        negative_flow = money_flow.where(typical_price < typical_price.shift(1), 0)
-        
-        positive_mf_sum = positive_flow.rolling(window=period).sum()
-        negative_mf_sum = negative_flow.rolling(window=period).sum()
-        
-        mfi_ratio = positive_mf_sum / negative_mf_sum
-        mfi = 100 - (100 / (1 + mfi_ratio))
-        return mfi
-    except Exception as e:
-        print(f"      Warning: MFI calculation failed: {e}")
-        return pd.Series(np.nan, index=close.index)
-
-
-# ============================================================================
-# Decision-layer categorical features (Google Sheet visibility only)
-# ----------------------------------------------------------------------------
-# These columns are computed for Claude's decision-making and are written to
-# the Google Sheets ONLY. They are intentionally NOT added to compute_indicators,
-# so they never enter the model feature matrix or pipeline_metadata.json.
-# All existing engineered features are preserved untouched.
-# ============================================================================
-
-DECISION_FEATURE_COLUMNS = [
-    "RSI_7", "SMA_5_20", "SMA_20_50", "EMA_12_26", "EMA_26_50",
-    "BB_indicator", "BB_trend_state", "BB_volatility_state",
-    "BB_overbought_oversold", "RSI_indicator_7", "RSI_indicator_14",
-]
-
-# Minimum finite observations required to trust dynamic per-symbol percentiles.
-RSI_BIN_MIN_HISTORY = 30
-# Fallback (p25, p50, p75) — standard RSI rules — used when history is too short.
-_RSI_FALLBACK_THRESHOLDS = (30.0, 50.0, 70.0)
-
-
-def _finite(series):
-    """Coerce to numeric and replace +/-inf with NaN (never raises)."""
-    return pd.to_numeric(pd.Series(series), errors='coerce').replace([np.inf, -np.inf], np.nan)
-
-
-def find_close_column(df):
-    """Locate the Close column leniently (exact, then Close_SYMBOL pattern)."""
-    for col in df.columns:
-        if str(col).strip().lower() == 'close':
-            return col
-    for col in df.columns:
-        if str(col).strip().lower().startswith('close_'):
-            return col
-    return None
-
-
-def rsi_percentile_thresholds(rsi_values):
-    """Dynamic (p25, p50, p75) from a symbol's RSI history; None if too sparse."""
-    arr = _finite(pd.Series(list(rsi_values), dtype='float64')).dropna()
+def rsi_percentile_thresholds(
+    rsi_values,
+) -> Optional[Tuple[float, float, float]]:
+    arr = _finite(pd.Series(list(rsi_values), dtype="float64")).dropna()
     if len(arr) < RSI_BIN_MIN_HISTORY:
         return None
-    return (float(arr.quantile(0.25)), float(arr.quantile(0.50)), float(arr.quantile(0.75)))
+    return (
+        float(arr.quantile(0.25)),
+        float(arr.quantile(0.50)),
+        float(arr.quantile(0.75)),
+    )
 
 
-def classify_rsi_bins(rsi_series, thresholds):
-    """Map RSI to mutually-exclusive categorical bins.
-
-    thresholds: (p25, p50, p75). When None, falls back to fixed RSI rules.
-    Bins (checked in order, so they are mutually exclusive):
-      > p75 -> highly overbought ; > p50 -> slightly overbought ;
-      < p25 -> highly oversold   ; < p50 -> slightly oversold   ; else neutral.
-    """
-    p25, p50, p75 = thresholds if thresholds is not None else _RSI_FALLBACK_THRESHOLDS
+def classify_rsi_bins(rsi_series, thresholds) -> List:
+    p25, p50, p75 = (
+        thresholds if thresholds is not None else _RSI_FALLBACK_THRESHOLDS
+    )
     out = []
-    for value in _finite(rsi_series):
-        if pd.isna(value):
+    for v in _finite(rsi_series):
+        if pd.isna(v):
             out.append("")
-        elif value > p75:
+        elif v > p75:
             out.append("highly overbought")
-        elif value > p50:
+        elif v > p50:
             out.append("slightly overbought")
-        elif value < p25:
+        elif v < p25:
             out.append("highly oversold")
-        elif value < p50:
+        elif v < p50:
             out.append("slightly oversold")
         else:
             out.append("neutral")
     return out
 
 
-def _classify_cross(fast, slow, up_label, down_label, neutral_label="neutral"):
-    """Categorise a moving-average crossover; blank cell when inputs are NaN."""
+def _classify_cross(fast, slow, up_label, down_label, neutral="neutral") -> List:
     out = []
     for f, s in zip(_finite(fast), _finite(slow)):
         if pd.isna(f) or pd.isna(s):
@@ -468,46 +410,40 @@ def _classify_cross(fast, slow, up_label, down_label, neutral_label="neutral"):
         elif f < s:
             out.append(down_label)
         else:
-            out.append(neutral_label)
+            out.append(neutral)
     return out
 
 
-def bollinger_decision_states(close, period=20, std_dev=2):
-    """Return (BB_indicator, BB_trend_state, BB_volatility_state, BB_overbought_oversold).
-
-    Trend & overbought/oversold come from %B = (close - lower) / (upper - lower).
-    Volatility comes from bandwidth = (upper - lower) / middle, compared against
-    the symbol's own 25th/75th bandwidth percentiles (normal volatility when the
-    symbol's history is too short to form percentiles).
-    """
+def bollinger_decision_states(
+    close: pd.Series, period: int = 20, std_dev: float = 2.0
+) -> Tuple[List, List, List, List]:
     close = _finite(close)
     upper, middle, lower = compute_bollinger_bands(close, period, std_dev)
     width = upper - lower
     pct_b = (close - lower) / width.where(width != 0, np.nan)
     bandwidth = width / middle.where(middle != 0, np.nan)
     bw_finite = _finite(bandwidth).dropna()
+    bw_low = bw_high = None
     if len(bw_finite) >= RSI_BIN_MIN_HISTORY:
-        bw_low, bw_high = float(bw_finite.quantile(0.25)), float(bw_finite.quantile(0.75))
-    else:
-        bw_low = bw_high = None
+        bw_low = float(bw_finite.quantile(0.25))
+        bw_high = float(bw_finite.quantile(0.75))
 
     indicator, trend, volatility, obos = [], [], [], []
     for pb, bw in zip(pct_b, _finite(bandwidth)):
-        if pd.isna(pb):
-            t = o = ""
-        else:
+        t = o = ""
+        if not pd.isna(pb):
             o = "overbought" if pb >= 1.0 else ("oversold" if pb <= 0.0 else "neutral")
             t = "bullish" if pb > 0.6 else ("bearish" if pb < 0.4 else "neutral")
-        if pd.isna(bw):
-            v = ""
-        elif bw_low is None:
-            v = "normal volatility"
-        elif bw > bw_high:
-            v = "high volatility"
-        elif bw < bw_low:
-            v = "low volatility"
-        else:
-            v = "normal volatility"
+        v = ""
+        if not pd.isna(bw):
+            if bw_low is None:
+                v = "normal volatility"
+            elif bw > bw_high:
+                v = "high volatility"
+            elif bw < bw_low:
+                v = "low volatility"
+            else:
+                v = "normal volatility"
         trend.append(t)
         volatility.append(v)
         obos.append(o)
@@ -515,17 +451,14 @@ def bollinger_decision_states(close, period=20, std_dev=2):
     return indicator, trend, volatility, obos
 
 
-def compute_decision_features(df, rsi7_thresholds=None, rsi14_thresholds=None):
-    """Compute the 11 decision-layer categorical features for a single symbol.
-
-    `df` must already be ordered chronologically so indicator look-back is
-    correct. Returns a DataFrame of DECISION_FEATURE_COLUMNS aligned to df.index.
-    Never raises: any unresolved input simply yields blank cells.
-
-    The RSI bin thresholds are supplied by the caller (computed from the full
-    cross-sheet history for the symbol); when None the bins fall back safely.
-    """
-    out = pd.DataFrame(index=df.index, columns=DECISION_FEATURE_COLUMNS, dtype=object)
+def compute_decision_features(
+    df: pd.DataFrame,
+    rsi7_thresholds=None,
+    rsi14_thresholds=None,
+) -> pd.DataFrame:
+    out = pd.DataFrame(
+        index=df.index, columns=DECISION_FEATURE_COLUMNS, dtype=object
+    )
     close_col = find_close_column(df)
     if close_col is None:
         return out.fillna("")
@@ -534,15 +467,21 @@ def compute_decision_features(df, rsi7_thresholds=None, rsi14_thresholds=None):
         close.index = df.index
         rsi7 = compute_rsi(close, 7)
         rsi14 = compute_rsi(close, 14)
-        out["RSI_7"] = ["" if pd.isna(v) else round(float(v), 2) for v in _finite(rsi7)]
-        out["SMA_5_20"] = _classify_cross(compute_sma(close, 5), compute_sma(close, 20),
-                                          "bullish", "bearish")
-        out["SMA_20_50"] = _classify_cross(compute_sma(close, 20), compute_sma(close, 50),
-                                           "strong bullish", "strong bearish")
-        out["EMA_12_26"] = _classify_cross(compute_ema(close, 12), compute_ema(close, 26),
-                                           "bullish", "bearish")
-        out["EMA_26_50"] = _classify_cross(compute_ema(close, 26), compute_ema(close, 50),
-                                           "long-term bullish", "long-term bearish")
+        out["RSI_7"] = [
+            "" if pd.isna(v) else round(float(v), 2) for v in _finite(rsi7)
+        ]
+        out["SMA_5_20"] = _classify_cross(
+            compute_sma(close, 5), compute_sma(close, 20), "bullish", "bearish"
+        )
+        out["SMA_20_50"] = _classify_cross(
+            compute_sma(close, 20), compute_sma(close, 50), "strong bullish", "strong bearish"
+        )
+        out["EMA_12_26"] = _classify_cross(
+            compute_ema(close, 12), compute_ema(close, 26), "bullish", "bearish"
+        )
+        out["EMA_26_50"] = _classify_cross(
+            compute_ema(close, 26), compute_ema(close, 50), "long-term bullish", "long-term bearish"
+        )
         bb_ind, bb_trend, bb_vol, bb_obos = bollinger_decision_states(close)
         out["BB_indicator"] = bb_ind
         out["BB_trend_state"] = bb_trend
@@ -550,18 +489,15 @@ def compute_decision_features(df, rsi7_thresholds=None, rsi14_thresholds=None):
         out["BB_overbought_oversold"] = bb_obos
         out["RSI_indicator_7"] = classify_rsi_bins(rsi7, rsi7_thresholds)
         out["RSI_indicator_14"] = classify_rsi_bins(rsi14, rsi14_thresholds)
-    except Exception as exc:  # never break the caller's workflow
-        print(f"      Warning: decision feature computation failed: {exc}")
+    except Exception as exc:
+        _log.warning("Decision feature computation failed: %s", exc)
     return out.fillna("")
 
 
-def compute_decision_rsi_history(df, periods=(7, 14)):
-    """Return {period: list[float]} of finite RSI values from a chronological frame.
-
-    Used by the sheet sync to pool RSI history across BOTH sheets per symbol
-    before deriving dynamic percentile thresholds.
-    """
-    history = {p: [] for p in periods}
+def compute_decision_rsi_history(
+    df: pd.DataFrame, periods: Tuple[int, ...] = (7, 14)
+) -> Dict[int, List[float]]:
+    history: Dict[int, List[float]] = {p: [] for p in periods}
     close_col = find_close_column(df)
     if close_col is None:
         return history
@@ -574,291 +510,377 @@ def compute_decision_rsi_history(df, periods=(7, 14)):
     return history
 
 
-def compute_indicators(df, date_col):
+# ===========================================================================
+# Main feature engineering function
+# ===========================================================================
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute 24 technical indicators + 30 forward-return labels for one symbol.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame containing at minimum Open, High, Low, Close, Volume
+        columns (case-insensitive, prefix-tolerant).  Extra columns (Date,
+        Date_str, __sheet_row_number, __sort_position, etc.) are preserved
+        unchanged.
+
+    Returns
+    -------
+    pd.DataFrame
+        The original DataFrame with indicator and label columns appended.
+        All indicators are lagged by one step (``shift(1)``); labels are not.
+
+    Raises
+    ------
+    FeatureEngineeringError
+        If OHLCV columns cannot be located, or if no valid OHLCV rows remain
+        after NaN filtering.  Callers that previously relied on the silent
+        skip-and-return behaviour should catch this exception.
     """
-    Compute all technical indicators for the given DataFrame.
-    
-    Handles both daily and intraday data. Gracefully handles computation failures
-    by filling with NaN values instead of crashing.
-    
-    Args:
-        df: Input DataFrame with OHLCV data
-        date_col: Name of the date column
-        
-    Returns:
-        DataFrame with all indicators added (original columns + new indicator columns)
-    """
+    t0 = time.monotonic()
     df_work = df.copy()
-    
-    # Find OHLCV columns dynamically
+
+    # ── Step 1: locate OHLCV ────────────────────────────────────────────────
     ohlcv_map = find_ohlcv_columns(df_work)
-    
     if ohlcv_map is None:
-        print(f"      -> Skipping: Could not identify OHLCV columns")
-        return df_work
-    
+        available = list(df_work.columns)
+        raise FeatureEngineeringError(
+            f"Cannot locate OHLCV columns. "
+            f"Available columns: {available}. "
+            f"Expected lowercase or Title-Case: open/Open, high/High, low/Low, "
+            f"close/Close, volume/Volume (or Open_SYMBOL prefixed variants)."
+        )
+
+    _log.debug(
+        "[FE] OHLCV located — open=%s high=%s low=%s close=%s volume=%s",
+        ohlcv_map["open"], ohlcv_map["high"], ohlcv_map["low"],
+        ohlcv_map["close"], ohlcv_map["volume"],
+    )
+
+    # ── Step 2: coerce to numeric and filter NaN rows ───────────────────────
+    open_s  = pd.to_numeric(df_work[ohlcv_map["open"]],   errors="coerce")
+    high_s  = pd.to_numeric(df_work[ohlcv_map["high"]],   errors="coerce")
+    low_s   = pd.to_numeric(df_work[ohlcv_map["low"]],    errors="coerce")
+    close_s = pd.to_numeric(df_work[ohlcv_map["close"]],  errors="coerce")
+    vol_s   = pd.to_numeric(df_work[ohlcv_map["volume"]], errors="coerce")
+
+    valid_mask = ~(
+        open_s.isna() | high_s.isna() | low_s.isna() | close_s.isna() | vol_s.isna()
+    )
+    if not valid_mask.any():
+        raise FeatureEngineeringError(
+            "No valid OHLCV rows remain after NaN filtering. "
+            "The input DataFrame has no rows where all five price columns are finite."
+        )
+
+    dropped = int((~valid_mask).sum())
+    if dropped > 0:
+        _log.warning("[FE] Dropped %d rows with NaN OHLCV values", dropped)
+
+    df_work = df_work.loc[valid_mask].reset_index(drop=True)
+    open_s  = open_s.loc[valid_mask].reset_index(drop=True)
+    high_s  = high_s.loc[valid_mask].reset_index(drop=True)
+    low_s   = low_s.loc[valid_mask].reset_index(drop=True)
+    close_s = close_s.loc[valid_mask].reset_index(drop=True)
+    vol_s   = vol_s.loc[valid_mask].reset_index(drop=True)
+
+    _log.debug("[FE] Processing %d valid OHLCV rows", len(df_work))
+
+    # ── Step 3: compute indicators ──────────────────────────────────────────
+    indicators: Dict[str, pd.Series] = {}
+
     try:
-        # Extract OHLCV as numeric, coercing errors to NaN
-        open_prices = pd.to_numeric(df_work[ohlcv_map['open']], errors='coerce')
-        high_prices = pd.to_numeric(df_work[ohlcv_map['high']], errors='coerce')
-        low_prices = pd.to_numeric(df_work[ohlcv_map['low']], errors='coerce')
-        close_prices = pd.to_numeric(df_work[ohlcv_map['close']], errors='coerce')
-        volume = pd.to_numeric(df_work[ohlcv_map['volume']], errors='coerce')
-        
-        # Remove any NaN rows from OHLCV data
-        valid_idx = ~(open_prices.isna() | high_prices.isna() | 
-                      low_prices.isna() | close_prices.isna() | volume.isna())
-        
-        if not valid_idx.any():
-            print(f"      -> Skipping: No valid OHLCV data")
-            return df_work
-        
-        # Apply valid index filter using boolean indexing with .loc
-        open_prices = open_prices.loc[valid_idx].reset_index(drop=True)
-        high_prices = high_prices.loc[valid_idx].reset_index(drop=True)
-        low_prices = low_prices.loc[valid_idx].reset_index(drop=True)
-        close_prices = close_prices.loc[valid_idx].reset_index(drop=True)
-        volume = volume.loc[valid_idx].reset_index(drop=True)
-        df_work = df_work.loc[valid_idx].reset_index(drop=True)
-        
-        indicators = {}
-        
-        # RSI (14)
-        try:
-            indicators['RSI_14'] = compute_rsi(close_prices, 14)
-        except Exception as e:
-            print(f"      Warning: RSI failed: {e}")
-            indicators['RSI_14'] = pd.Series(np.nan, index=range(len(df_work)))
-        
-        # MACD (12, 26, 9)
-        try:
-            macd, signal, hist = compute_macd(close_prices, 12, 26, 9)
-            indicators['MACD_12_26'] = macd.reset_index(drop=True)
-            indicators['MACD_Signal_9'] = signal.reset_index(drop=True)
-            indicators['MACD_Histogram'] = hist.reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: MACD failed: {e}")
-        
-        # Stochastic Oscillator (%K and %D)
-        try:
-            k_percent, d_percent = compute_stochastic(high_prices, low_prices, close_prices, 14, 3)
-            indicators['Stochastic_%K'] = k_percent.reset_index(drop=True)
-            indicators['Stochastic_%D'] = d_percent.reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: Stochastic failed: {e}")
-        
-        # SMA (5, 20, 50)
-        try:
-            indicators['SMA_5'] = compute_sma(close_prices, 5).reset_index(drop=True)
-            indicators['SMA_20'] = compute_sma(close_prices, 20).reset_index(drop=True)
-            indicators['SMA_50'] = compute_sma(close_prices, 50).reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: SMA failed: {e}")
-        
-        # EMA (12, 26, 50)
-        try:
-            indicators['EMA_12'] = compute_ema(close_prices, 12).reset_index(drop=True)
-            indicators['EMA_26'] = compute_ema(close_prices, 26).reset_index(drop=True)
-            indicators['EMA_50'] = compute_ema(close_prices, 50).reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: EMA failed: {e}")
-        
-        # ADX (14)
-        try:
-            indicators['ADX_14'] = compute_adx(high_prices, low_prices, close_prices, 14).reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: ADX failed: {e}")
-        
-        # Bollinger Bands (20, 2)
-        try:
-            upper_band, middle_band, lower_band = compute_bollinger_bands(close_prices, 20, 2)
-            indicators['BB_Upper_20'] = upper_band.reset_index(drop=True)
-            indicators['BB_Middle_20'] = middle_band.reset_index(drop=True)
-            indicators['BB_Lower_20'] = lower_band.reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: Bollinger Bands failed: {e}")
-        
-        # ATR (14)
-        try:
-            indicators['ATR_14'] = compute_atr(high_prices, low_prices, close_prices, 14).reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: ATR failed: {e}")
-        
-        # OBV
-        try:
-            indicators['OBV'] = compute_obv(close_prices, volume).reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: OBV failed: {e}")
-        
-        # VWAP
-        try:
-            indicators['VWAP'] = compute_vwap(high_prices, low_prices, close_prices, volume).reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: VWAP failed: {e}")
-        
-        # Daily Return
-        try:
-            indicators['Daily_Return_%'] = compute_daily_return(close_prices).reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: Daily Return failed: {e}")
-        
-        # Log Return
-        try:
-            indicators['Log_Return_%'] = compute_log_return(close_prices).reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: Log Return failed: {e}")
-        
-        # ROC (12)
-        try:
-            indicators['ROC_12'] = compute_roc(close_prices, 12).reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: ROC failed: {e}")
-        
-        # CCI (20)
-        try:
-            indicators['CCI_20'] = compute_cci(high_prices, low_prices, close_prices, 20).reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: CCI failed: {e}")
-        
-        # Williams %R (14)
-        try:
-            indicators['Williams_%R'] = compute_williams_r(high_prices, low_prices, close_prices, 14).reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: Williams %R failed: {e}")
-        
-        # MFI (14)
-        try:
-            indicators['MFI_14'] = compute_mfi(high_prices, low_prices, close_prices, volume, 14).reset_index(drop=True)
-        except Exception as e:
-            print(f"      Warning: MFI failed: {e}")
-        
-        # Add all indicators to original dataframe
-        for col_name, col_data in indicators.items():
-            if isinstance(col_data, pd.Series):
-                df_work[col_name] = col_data.shift(1).values
-            else:
-                df_work[col_name] = np.nan
+        indicators["RSI_14"] = compute_rsi(close_s, 14)
+    except Exception as exc:
+        _log.warning("[FE] RSI_14 failed: %s", exc)
+        indicators["RSI_14"] = pd.Series(np.nan, index=range(len(df_work)))
 
-        # P0.1 — attach 30 forward-return labels + has_labels flag.
-        # These columns are TARGETS, not features. They must be stripped from
-        # the feature matrix before training (see training code).
-        try:
-            close_for_labels = pd.to_numeric(
-                df_work[ohlcv_map['close']], errors='coerce'
-            ).reset_index(drop=True)
-            forward_labels = compute_forward_log_returns(close_for_labels)
-            for label_name, label_series in forward_labels.items():
-                df_work[label_name] = label_series.values
-            label_cols = list(forward_labels.keys())
-            df_work[HAS_LABELS_COL] = df_work[label_cols].notna().all(axis=1).values
-        except Exception as e:
-            print(f"      Warning: forward label attachment failed: {e}")
-            for label_name in forward_label_columns():
-                df_work[label_name] = np.nan
-            df_work[HAS_LABELS_COL] = False
-
-        return df_work
-    
-    except Exception as e:
-        print(f"      -> Error computing indicators: {e}")
-        return df_work
-
-
-def write_updated_workbook(sheets_dict, output_filepath):
-    """
-    Write updated sheets back to the Excel workbook using openpyxl.
-    Preserves original sheet names and overwrites the file.
-    
-    Args:
-        sheets_dict: Dictionary mapping sheet names to DataFrames
-        output_filepath: Path to output Excel file
-    """
     try:
-        with pd.ExcelWriter(output_filepath, engine='openpyxl') as writer:
+        macd, sig, hist = compute_macd(close_s, 12, 26, 9)
+        indicators["MACD_12_26"]    = macd.reset_index(drop=True)
+        indicators["MACD_Signal_9"] = sig.reset_index(drop=True)
+        indicators["MACD_Histogram"]= hist.reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] MACD failed: %s", exc)
+
+    try:
+        k, d = compute_stochastic(high_s, low_s, close_s, 14, 3)
+        indicators["Stochastic_%K"] = k.reset_index(drop=True)
+        indicators["Stochastic_%D"] = d.reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] Stochastic failed: %s", exc)
+
+    try:
+        indicators["SMA_5"]  = compute_sma(close_s, 5).reset_index(drop=True)
+        indicators["SMA_20"] = compute_sma(close_s, 20).reset_index(drop=True)
+        indicators["SMA_50"] = compute_sma(close_s, 50).reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] SMA failed: %s", exc)
+
+    try:
+        indicators["EMA_12"] = compute_ema(close_s, 12).reset_index(drop=True)
+        indicators["EMA_26"] = compute_ema(close_s, 26).reset_index(drop=True)
+        indicators["EMA_50"] = compute_ema(close_s, 50).reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] EMA failed: %s", exc)
+
+    try:
+        indicators["ADX_14"] = compute_adx(high_s, low_s, close_s, 14).reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] ADX_14 failed: %s", exc)
+
+    try:
+        ub, mb, lb = compute_bollinger_bands(close_s, 20, 2)
+        indicators["BB_Upper_20"]  = ub.reset_index(drop=True)
+        indicators["BB_Middle_20"] = mb.reset_index(drop=True)
+        indicators["BB_Lower_20"]  = lb.reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] Bollinger Bands failed: %s", exc)
+
+    try:
+        indicators["ATR_14"] = compute_atr(high_s, low_s, close_s, 14).reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] ATR_14 failed: %s", exc)
+
+    try:
+        indicators["OBV"] = compute_obv(close_s, vol_s).reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] OBV failed: %s", exc)
+
+    try:
+        indicators["VWAP"] = compute_vwap(high_s, low_s, close_s, vol_s).reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] VWAP failed: %s", exc)
+
+    try:
+        indicators["Daily_Return_%"] = compute_daily_return(close_s).reset_index(drop=True)
+        indicators["Log_Return_%"]   = compute_log_return(close_s).reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] Return indicators failed: %s", exc)
+
+    try:
+        indicators["ROC_12"] = compute_roc(close_s, 12).reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] ROC_12 failed: %s", exc)
+
+    try:
+        indicators["CCI_20"] = compute_cci(high_s, low_s, close_s, 20).reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] CCI_20 failed: %s", exc)
+
+    try:
+        indicators["Williams_%R"] = compute_williams_r(high_s, low_s, close_s, 14).reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] Williams_%R failed: %s", exc)
+
+    # ── Step 4: attach to df_work (lag-1 to prevent look-ahead) ────────────
+    for col_name, series in indicators.items():
+        if isinstance(series, pd.Series):
+            df_work[col_name] = series.shift(1).values
+        else:
+            df_work[col_name] = np.nan
+
+    indicators_computed = len(indicators)
+    _log.debug("[FE] %d indicator columns computed and lagged by 1 step", indicators_computed)
+
+    # ── Step 5: forward-return labels (P0.1) — NOT shifted ─────────────────
+    try:
+        close_for_labels = pd.to_numeric(
+            df_work[ohlcv_map["close"]], errors="coerce"
+        ).reset_index(drop=True)
+        forward_labels = compute_forward_log_returns(close_for_labels)
+        for label_name, label_series in forward_labels.items():
+            df_work[label_name] = label_series.values
+        label_cols = list(forward_labels.keys())
+        df_work[HAS_LABELS_COL] = df_work[label_cols].notna().all(axis=1).values
+        labels_with_data = int(df_work[HAS_LABELS_COL].sum())
+        _log.debug(
+            "[FE] %d forward-return label columns attached; %d rows have complete labels",
+            len(forward_labels), labels_with_data,
+        )
+    except Exception as exc:
+        _log.warning("[FE] Forward label attachment failed: %s", exc)
+        for label_name in forward_label_columns():
+            df_work[label_name] = np.nan
+        df_work[HAS_LABELS_COL] = False
+
+    elapsed = time.monotonic() - t0
+    _log.info(
+        "[FE] compute_indicators complete — rows=%d indicators=%d elapsed=%.3fs",
+        len(df_work), indicators_computed, elapsed,
+    )
+    return df_work
+
+
+# ===========================================================================
+# Workbook I/O helpers (standalone batch mode only)
+# ===========================================================================
+
+def load_workbook_sheets(filepath: str) -> Dict[str, pd.DataFrame]:
+    """Load all sheets from an Excel workbook."""
+    try:
+        sheets = pd.read_excel(filepath, sheet_name=None)
+        _log.info("[FE:batch] Loaded %d sheets from %s", len(sheets), filepath)
+        return sheets
+    except FileNotFoundError:
+        _log.error("[FE:batch] Workbook not found: %s", filepath)
+        raise
+    except Exception as exc:
+        _log.error("[FE:batch] Error loading workbook %s: %s", filepath, exc)
+        raise
+
+
+def write_updated_workbook(
+    sheets_dict: Dict[str, pd.DataFrame], output_filepath: str
+) -> None:
+    """Write updated sheets back to the Excel workbook atomically.
+
+    Uses a temp-file-then-rename strategy to avoid partial writes that corrupt
+    the workbook if the process is interrupted mid-write.
+    """
+    output_path = Path(output_filepath)
+    tmp_path = output_path.with_suffix(".tmp.xlsx")
+    try:
+        with pd.ExcelWriter(str(tmp_path), engine="openpyxl") as writer:
             for sheet_name, df in sheets_dict.items():
-                # Remove entirely empty rows (all NaN)
-                df_clean = df.dropna(how='all')
-                
-                # Write to Excel
+                df_clean = df.dropna(how="all")
                 df_clean.to_excel(writer, sheet_name=sheet_name, index=False)
-        
-        print(f"Successfully saved updated workbook to {output_filepath}")
-    except Exception as e:
-        print(f"Error writing workbook: {e}")
-        sys.exit(1)
+        # Atomic replace
+        tmp_path.replace(output_path)
+        _log.info("[FE:batch] Workbook written atomically to %s", output_filepath)
+    except Exception as exc:
+        tmp_path.unlink(missing_ok=True)
+        _log.error("[FE:batch] Failed to write workbook: %s", exc)
+        raise
 
 
-def main():
-    """Main execution function"""
-    print("=" * 70)
-    print("NSE Stock Data - Technical Indicator Feature Engineering")
-    print("=" * 70)
-    
-    # Canonical workbook location: <project_root>/Data/nse_stock_data.xlsx
-    # (consistent with app/config/settings.py and Data_scraping.py output)
+# ===========================================================================
+# Standalone batch entry point (offline training-data refresh only)
+# ===========================================================================
+
+def main() -> None:
+    """Offline batch mode: read training workbook, engineer features, write back.
+
+    This function is NOT part of the Docker workflow.  It is intended for
+    offline use when refreshing the training corpus (Data/nse_stock_data_train.xlsx).
+
+    Usage::
+
+        python Feature_Engineering.py [--workbook Data/nse_stock_data_train.xlsx]
+
+    """
+    import argparse
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Offline feature engineering: read OHLCV workbook, compute indicators, write back."
+    )
+    parser.add_argument(
+        "--workbook",
+        default=None,
+        help=(
+            "Path to the Excel workbook to process. "
+            "Defaults to Data/nse_stock_data_train.xlsx if it exists, "
+            "otherwise Data/nse_stock_data.xlsx."
+        ),
+    )
+    args = parser.parse_args()
+
     script_dir = Path(__file__).parent
-    data_dir = script_dir / 'Data'
-    input_file = data_dir / 'nse_stock_data.xlsx'
-    output_file = data_dir / 'nse_stock_data.xlsx'
+    data_dir   = script_dir / "Data"
 
-    # Check if input file exists
+    # Determine input workbook — prefer the training corpus that actually exists
+    if args.workbook:
+        input_file = Path(args.workbook)
+    else:
+        candidate_train = data_dir / "nse_stock_data_train.xlsx"
+        candidate_std   = data_dir / "nse_stock_data.xlsx"
+        if candidate_train.exists():
+            input_file = candidate_train
+        elif candidate_std.exists():
+            input_file = candidate_std
+        else:
+            _log.error(
+                "[FE:batch] No workbook found. Tried:\n  %s\n  %s\n"
+                "Pass --workbook <path> explicitly.",
+                candidate_train, candidate_std,
+            )
+            sys.exit(1)
+
+    output_file = input_file  # overwrite in place (atomic write is safe)
+
     if not input_file.exists():
-        print(f"\nError: Input file '{input_file}' not found.")
-        print(f"Generate it first by running:")
-        print(f"  python3 Scripts/Data_scraping.py")
-        print(f"  (downloads NIFTY-50 OHLCV data from yfinance into Data/nse_stock_data.xlsx)")
+        _log.error("[FE:batch] Workbook not found: %s", input_file)
         sys.exit(1)
-    
-    # Load workbook
-    print(f"\nLoading workbook: {input_file.name}")
+
+    _log.info("=" * 70)
+    _log.info("NSE Stock Data — Offline Feature Engineering (batch mode)")
+    _log.info("=" * 70)
+    _log.info("[FE:batch] Input  : %s  (%s bytes)", input_file, f"{input_file.stat().st_size:,}")
+    _log.info("[FE:batch] Output : %s", output_file)
+
     sheets = load_workbook_sheets(str(input_file))
-    
     if not sheets:
-        print("Error: Workbook contains no sheets.")
+        _log.error("[FE:batch] Workbook contains no sheets.")
         sys.exit(1)
-    
-    # Process each sheet
-    print(f"\nProcessing {len(sheets)} sheets...\n")
-    processed_sheets = {}
-    
+
+    processed: Dict[str, pd.DataFrame] = {}
+    skipped = 0
+    total = len(sheets)
+    t_start = time.monotonic()
+
     for sheet_name, df in sheets.items():
-        print(f"Sheet: {sheet_name}")
-        
-        # Check if sheet is empty
+        _log.info("[FE:batch] Processing sheet '%s' (%d rows × %d cols)", sheet_name, len(df), len(df.columns))
+
         if df.empty:
-            print(f"  -> Sheet is empty, skipping.")
-            processed_sheets[sheet_name] = df
+            _log.warning("[FE:batch]   Sheet is empty — skipping")
+            processed[sheet_name] = df
+            skipped += 1
             continue
-        
-        print(f"  -> Rows: {len(df)}, Columns: {len(df.columns)}")
-        
-        # Detect date column
+
+        # Date detection and cleanup
         date_col = detect_date_column(df)
         if date_col is None:
-            print(f"  -> Could not detect date column, skipping indicators.")
-            processed_sheets[sheet_name] = df
+            _log.warning("[FE:batch]   No date column detected — skipping indicators")
+            processed[sheet_name] = df
+            skipped += 1
             continue
-        
-        print(f"  -> Date column detected: '{date_col}'")
-        
-        # Ensure date column is in proper format and sorted
+
+        _log.info("[FE:batch]   Date column: '%s'", date_col)
         df = ensure_date_column(df, date_col)
-        
-        # Compute all indicators
-        df = compute_indicators(df, date_col)
-        
-        processed_sheets[sheet_name] = df
-        print(f"  -> Completed: {len(df.columns)} total columns\n")
-    
-    # Write updated workbook
-    print("-" * 70)
-    print("Writing updated workbook...")
-    write_updated_workbook(processed_sheets, str(output_file))
-    
-    print("\n" + "=" * 70)
-    print("✓ Feature engineering completed successfully!")
-    print("=" * 70)
+
+        try:
+            df = compute_indicators(df)
+            _log.info(
+                "[FE:batch]   Done: %d rows, %d columns (including %d indicators, %d labels)",
+                len(df),
+                len(df.columns),
+                len(INDICATOR_COLUMNS),
+                len(FORWARD_HORIZONS),
+            )
+        except FeatureEngineeringError as exc:
+            _log.warning("[FE:batch]   Skipped: %s", exc)
+            skipped += 1
+
+        processed[sheet_name] = df
+
+    elapsed = time.monotonic() - t_start
+    _log.info("-" * 70)
+    _log.info(
+        "[FE:batch] Processed %d/%d sheets (%d skipped) in %.1fs",
+        total - skipped, total, skipped, elapsed,
+    )
+
+    write_updated_workbook(processed, str(output_file))
+
+    _log.info("=" * 70)
+    _log.info("[FE:batch] Feature engineering complete.")
+    _log.info("=" * 70)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

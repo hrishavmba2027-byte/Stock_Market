@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional
 
 from app.api.server import app
 from app.config.settings import get_settings
+from app.pipeline.metadata import initialize_metadata_if_missing
+from app.pipeline.startup import run_startup_checks
 from app.services.subprocess_runner import parse_last_json
 from app.utils.logging import configure_logging, get_logger, log_event
 
@@ -160,31 +162,127 @@ def run_prediction_pipeline(args: argparse.Namespace, worksheets: List[str], log
     return result
 
 
+def _stage(
+    logger: logging.Logger,
+    event: str,
+    message: str,
+    **kwargs: Any,
+) -> None:
+    """Emit a structured stage-transition log entry."""
+    log_event(logger, logging.INFO, event, message, **kwargs)
+
+
 def run_workflow(args: argparse.Namespace) -> Dict[str, Any]:
+    """
+    Deterministic workflow execution in strict stage order:
+
+        Stage 1 — DATA_UPDATE   : Data_update.py subprocess
+        Stage 2 — FE_GATE       : Validate update succeeded before proceeding
+        Stage 3 — MODEL_PIPELINE: main.py run_pipeline (FE runs inside here per-symbol)
+    """
     settings = get_settings()
     configure_logging(settings)
     logger = get_logger(__name__)
-    started = time.monotonic()
+    workflow_started = time.monotonic()
+    stage_times: Dict[str, float] = {}
+
     worksheets = parse_csv(args.worksheets)
     if args.worksheet:
         worksheets.extend(parse_csv(args.worksheet))
     worksheets = parse_csv(",".join(worksheets))
 
+    _stage(
+        logger,
+        "workflow_start",
+        "=== WORKFLOW START ===",
+        run_id=args.run_id,
+        reason=args.reason,
+        worksheets=worksheets,
+    )
+
     try:
+        # ── Stage 1: DATA UPDATE ──────────────────────────────────────────────
+        _stage(logger, "stage_data_update_begin", "[Stage 1/3] DATA UPDATE — starting Data_update.py")
+        t0 = time.monotonic()
         update_result = run_update_subprocess(args, logger)
-        if update_result.get("status") == "error" and update_result.get("returncode", 1) != 0:
+        stage_times["data_update"] = time.monotonic() - t0
+
+        update_failed = (
+            update_result.get("status") == "error"
+            and update_result.get("returncode", 1) != 0
+        )
+        _stage(
+            logger,
+            "stage_data_update_end",
+            "[Stage 1/3] DATA UPDATE — done",
+            elapsed=round(stage_times["data_update"], 3),
+            returncode=update_result.get("returncode"),
+            update_status=update_result.get("status"),
+        )
+
+        # ── Stage 2: FE GATE ─────────────────────────────────────────────────
+        # Feature Engineering runs inside run_pipeline per-symbol; this gate
+        # ensures we never launch the model pipeline after a hard data failure.
+        _stage(logger, "stage_fe_gate_begin", "[Stage 2/3] FE GATE — checking data update health")
+        if update_failed:
+            _stage(
+                logger,
+                "stage_fe_gate_blocked",
+                "[Stage 2/3] FE GATE — BLOCKED: data update hard-failed; "
+                "skipping Feature Engineering and Model Pipeline to prevent "
+                "inference on stale data",
+                error=update_result.get("error") or update_result.get("stderr", "")[:400],
+            )
             return {
                 "status": "error",
                 "run_id": args.run_id,
                 "reason": args.reason,
                 "worksheets": worksheets,
                 "update_result": update_result,
-                "error": update_result.get("error") or update_result.get("stderr"),
-                "duration_seconds": time.monotonic() - started,
+                "error": (
+                    "Workflow aborted at FE Gate: Data_update.py exited with "
+                    f"returncode={update_result.get('returncode')}. "
+                    "Feature Engineering and Model Pipeline were NOT executed."
+                ),
+                "stage_times": stage_times,
+                "duration_seconds": time.monotonic() - workflow_started,
             }
 
+        _stage(
+            logger,
+            "stage_fe_gate_passed",
+            "[Stage 2/3] FE GATE — PASSED: data update healthy; "
+            "Feature Engineering will run per-symbol inside Model Pipeline",
+        )
+
+        # ── Stage 3: MODEL PIPELINE (FE + inference) ─────────────────────────
+        _stage(
+            logger,
+            "stage_model_pipeline_begin",
+            "[Stage 3/3] MODEL PIPELINE — starting (Feature Engineering runs per-symbol here)",
+            worksheets=worksheets,
+        )
+        t0 = time.monotonic()
         prediction_result = run_prediction_pipeline(args, worksheets, logger)
-        status = "success" if prediction_result.get("status") != "error" else "error"
+        stage_times["model_pipeline"] = time.monotonic() - t0
+
+        pipeline_status = prediction_result.get("status", "unknown")
+        _stage(
+            logger,
+            "stage_model_pipeline_end",
+            "[Stage 3/3] MODEL PIPELINE — done",
+            elapsed=round(stage_times["model_pipeline"], 3),
+            pipeline_status=pipeline_status,
+        )
+
+        status = "success" if pipeline_status != "error" else "error"
+        _stage(
+            logger,
+            "workflow_end",
+            f"=== WORKFLOW END — {status.upper()} ===",
+            run_id=args.run_id,
+            elapsed=round(time.monotonic() - workflow_started, 3),
+        )
         return {
             "status": status,
             "run_id": args.run_id,
@@ -192,8 +290,10 @@ def run_workflow(args: argparse.Namespace) -> Dict[str, Any]:
             "worksheets": worksheets,
             "update_result": update_result.get("result", update_result),
             "prediction_result": prediction_result,
-            "duration_seconds": time.monotonic() - started,
+            "stage_times": stage_times,
+            "duration_seconds": time.monotonic() - workflow_started,
         }
+
     except Exception as exc:
         log_event(
             logger,
@@ -210,13 +310,28 @@ def run_workflow(args: argparse.Namespace) -> Dict[str, Any]:
             "reason": args.reason,
             "worksheets": worksheets,
             "error": str(exc),
-            "duration_seconds": time.monotonic() - started,
+            "stage_times": stage_times,
+            "duration_seconds": time.monotonic() - workflow_started,
         }
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    # ── Startup self-checks (non-fatal: logs warnings, never aborts the CLI) ──
+    settings = get_settings()
+    try:
+        # Ensure metadata file exists before any subprocess spawns main.py
+        initialize_metadata_if_missing(settings.metadata_path)
+        run_startup_checks(settings, strict=False)
+    except Exception as exc:
+        # Startup checks should never kill the process; surface as a warning
+        import logging
+        logging.getLogger(__name__).warning(
+            "Startup checks raised an exception (non-fatal): %s", exc
+        )
+
     if args.command in {None, "run"}:
         if args.command is None:
             args = parser.parse_args(["run", *sys.argv[1:]])

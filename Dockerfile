@@ -1,5 +1,11 @@
 FROM python:3.11-slim
 
+# TARGETARCH is populated automatically by Docker BuildKit (arm64 on Apple
+# Silicon, amd64 on x86_64 hosts / CI).  We use it to pick the right torch
+# wheel: pytorch.org's CPU-only +cpu builds for amd64, and the standard PyPI
+# wheel (which is already CPU-only) for arm64.
+ARG TARGETARCH
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
@@ -10,10 +16,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # System deps:
-#   - build-essential / gcc: native wheels (pyarrow, sentencepiece)
-#   - libgomp1: lightgbm / pytorch runtime
+#   - build-essential / gcc: native C wheels (pyarrow, sentencepiece, scipy)
+#   - libgomp1: PyTorch OpenMP runtime
 #   - libglib2.0-0, libgl1: pyarrow + some transformers backends
-#   - curl, ca-certificates: healthcheck + HTTPS
+#   - curl, ca-certificates: healthcheck + HTTPS downloads
+#   - git: needed by pip when any dependency is resolved from a VCS source
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gcc \
@@ -22,16 +29,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     curl \
     ca-certificates \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Layer-cache pip install: copy only requirements.txt first so rebuilds
 # triggered by code changes don't reinstall the world.
 COPY requirements.txt .
-# Install the CPU torch wheel first from pytorch.org's index so we don't drag
-# in the multi-gig CUDA build. The subsequent `-r requirements.txt` reuses it
-# (the version range in requirements.txt is satisfied).
+
+# Install PyTorch CPU wheel.
+#
+# amd64 (x86_64): use pytorch.org's /whl/cpu index — the +cpu suffix wheel
+#   avoids pulling down the multi-gigabyte CUDA build from PyPI.
+#
+# arm64 (aarch64 / Apple Silicon): the standard PyPI wheel IS already CPU-only
+#   for linux/aarch64; the +cpu suffix wheels on pytorch.org do not have
+#   reliable aarch64 builds for all minor releases. Using plain PyPI keeps the
+#   install reproducible across arm64 hosts.
+#
+# Neither path installs torchvision or torchaudio — nothing in this project
+# imports them, and their wheels carry a strict torch== requirement that
+# conflicts with the +cpu local-version identifier on amd64.
 RUN python -m pip install --upgrade pip setuptools wheel && \
-    python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu "torch==2.6.0+cpu" && \
+    if [ "${TARGETARCH}" = "arm64" ] || [ "${TARGETARCH}" = "aarch64" ]; then \
+        echo "ARM64 host detected — installing torch from standard PyPI (CPU-only wheel)" && \
+        python -m pip install "torch==2.6.0"; \
+    else \
+        echo "AMD64 host detected — installing torch CPU wheel from pytorch.org" && \
+        python -m pip install \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            "torch==2.6.0+cpu"; \
+    fi && \
     python -m pip install -r requirements.txt
 
 # Application code — everything we need at runtime.

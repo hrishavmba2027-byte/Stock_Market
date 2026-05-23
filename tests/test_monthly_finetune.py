@@ -1,5 +1,4 @@
 import argparse
-import json
 import re
 from pathlib import Path
 
@@ -8,7 +7,10 @@ import pandas as pd
 import torch
 
 import monthly_finetune as mf
+from app.pipeline.metadata import get_or_create_metadata
 from app.services.sheet_archival import archive_old_rows_for_worksheet
+
+_METADATA_PATH = Path("outputs/pipeline_metadata.json")
 
 
 def test_forward_log_return_labels_anchor_to_previous_close():
@@ -21,7 +23,7 @@ def test_forward_log_return_labels_anchor_to_previous_close():
 
 
 def test_forecast_days_env_extends_forecast_columns(monkeypatch):
-    metadata = json.loads(Path("outputs/pipeline_metadata.json").read_text())
+    metadata = get_or_create_metadata(_METADATA_PATH)
 
     monkeypatch.setenv("FORECAST_DAYS", "15")
     assert mf.forecast.forecast_close_columns(metadata)[-1] == "Forecast_Close_T+15"
@@ -31,7 +33,7 @@ def test_forecast_days_env_extends_forecast_columns(monkeypatch):
 
 
 def test_recursive_forecast_continues_beyond_direct_horizon(monkeypatch):
-    metadata = json.loads(Path("outputs/pipeline_metadata.json").read_text())
+    metadata = get_or_create_metadata(_METADATA_PATH)
     monkeypatch.setenv("FORECAST_DAYS", "7")
     dates = pd.bdate_range("2025-01-01", periods=80)
     close = np.linspace(100.0, 120.0, len(dates))
@@ -77,7 +79,7 @@ def test_recursive_forecast_continues_beyond_direct_horizon(monkeypatch):
 
 
 def test_build_finetune_arrays_from_synthetic_frame():
-    metadata = json.loads(Path("outputs/pipeline_metadata.json").read_text())
+    metadata = get_or_create_metadata(_METADATA_PATH)
     dates = pd.bdate_range("2025-01-01", periods=90)
     close = np.linspace(100.0, 130.0, len(dates)) + np.sin(np.arange(len(dates)))
     frame = pd.DataFrame(
@@ -109,7 +111,7 @@ def test_build_finetune_arrays_from_synthetic_frame():
 
 
 def test_build_finetune_arrays_respects_last_finetuned_date():
-    metadata = json.loads(Path("outputs/pipeline_metadata.json").read_text())
+    metadata = get_or_create_metadata(_METADATA_PATH)
     dates = pd.bdate_range("2025-01-01", periods=100)
     close = np.linspace(100.0, 135.0, len(dates)) + np.sin(np.arange(len(dates)))
     frame = pd.DataFrame(
@@ -140,7 +142,7 @@ def test_build_finetune_arrays_respects_last_finetuned_date():
 
 
 def test_build_finetune_arrays_skips_when_checkpoint_is_current():
-    metadata = json.loads(Path("outputs/pipeline_metadata.json").read_text())
+    metadata = get_or_create_metadata(_METADATA_PATH)
     dates = pd.bdate_range("2025-01-01", periods=80)
     close = np.linspace(100.0, 120.0, len(dates))
     frame = pd.DataFrame(

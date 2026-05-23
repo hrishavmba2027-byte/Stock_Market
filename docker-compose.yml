@@ -1,9 +1,11 @@
-# Docker Compose for local development.
+# =============================================================================
+# Stock Market ML Automation — docker-compose.yml
+# Recreated 2026-05-23
 #
-# Two long-running services (api + watcher) come up with `docker compose up`.
-# A third service, `pipeline`, is **opt-in** via the `tools` profile — use it
-# for one-shot ingestion / sentiment runs without touching the long-running
-# containers. See README/DEPLOYMENT.md for usage recipes.
+# Services:
+#   api      — FastAPI + Uvicorn server (port 8000).  Primary entry point.
+#   watcher  — Google Sheets polling daemon. Calls the API when it detects
+#              new data rows; runs in the same image, different command.
 #
 # All three services share the same image — built once, reused — so
 # `requirements.txt` is installed exactly once at build time.
@@ -47,39 +49,116 @@ x-app-shared: &app-shared
     # to point at it (defaults to "service-account.json" if unset).
     - ./credentials/${CREDENTIALS_FILE:-service-account.json}:/app/credentials/service-account.json:ro
 services:
+
+  # ---------------------------------------------------------------------------
+  # API service — FastAPI / Uvicorn (uvicorn app_data:app ...)
+  # ---------------------------------------------------------------------------
   api:
-    <<: *app-shared
-    # Only the api service builds the image; watcher + pipeline reuse the tag.
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: stock_market_api
-    command: uvicorn app_data:app --host 0.0.0.0 --port 8000
+    image: stock-market-app:latest
+    container_name: stock-market-api
+    restart: unless-stopped
+
     ports:
       - "8000:8000"
+
+    env_file:
+      - .env
+
+    # Override the few vars whose values differ inside Docker vs. on the host.
+    # All other settings come from .env above.
+    environment:
+      # Credentials path — absolute macOS path in .env → container path here
+      GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/Credentials_New.json
+      GOOGLE_CREDENTIALS: /app/credentials/Credentials_New.json
+
+      # Service-discovery: watcher must call the API container by service name
+      API_BASE_URL: http://api:8000
+
+      # Move workflow state into the persisted state/ bind-mount so it
+      # survives `docker compose down` (default is /app/workflow_state.json)
+      WORKFLOW_STATE_PATH: /app/state/workflow_state.json
+      MONTHLY_FINETUNE_STATE_FILE: /app/state/monthly_finetune_state.json
+
+      # Force CPU — no GPU inside Docker Desktop on macOS
+      DEVICE: cpu
+
     volumes:
+      # --- Secrets / credentials (read-only inside container) ----------------
+      - ./credentials:/app/credentials:ro
+
+      # --- Persisted runtime outputs (write-able) ----------------------------
+      # logs/ keeps app.log, error.log across restarts
       - ./logs:/app/logs
-      - ./outputs:/app/outputs
+      # outputs/ sub-dirs for inference artefacts, plots, metrics, etc.
+      # NOTE: outputs/Saved_Models is baked into the image by the Dockerfile
+      #       (COPY outputs/Saved_Models ./outputs/Saved_Models) and is NOT
+      #       mounted here to avoid overwriting model weights.
+      - ./outputs/main_inference:/app/outputs/main_inference
+      - ./outputs/plots:/app/outputs/plots
+      # pipeline_metadata.json is the model-contract file. Mount it explicitly
+      # so it persists across container restarts and is shared between api and
+      # watcher (both read it; the api subprocess also writes it after runs).
+      - ./outputs/pipeline_metadata.json:/app/outputs/pipeline_metadata.json
+
+      # --- Source data (read-write so ingest jobs can update xlsx/parquet) ---
+      - ./Data:/app/Data
+
+      # --- State files (workflow_state.json, monthly_finetune_state.json) ----
       - ./state:/app/state
     working_dir: /app
-    restart: unless-stopped
+
+    # Dockerfile already defines a HEALTHCHECK; keep it here for compose
+    # so `depends_on: condition: service_healthy` works in the watcher.
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 30s
+      start_period: 45s
+      retries: 5
 
+    command:
+      - uvicorn
+      - "app_data:app"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--log-level"
+      - "info"
+
+  # ---------------------------------------------------------------------------
+  # Watcher service — polls Google Sheets, POSTs to api /run on changes
+  # ---------------------------------------------------------------------------
   watcher:
-    <<: *app-shared
-    container_name: stock_market_watcher
-    command: python -m app.watcher.service
+    # Reuse the image built for the api service (no second build step).
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stock-market-app:latest
+    container_name: stock-market-watcher
+    restart: unless-stopped
+
     depends_on:
       api:
         condition: service_healthy
+
+    env_file:
+      - .env
+
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/Credentials_New.json
+      GOOGLE_CREDENTIALS: /app/credentials/Credentials_New.json
+      API_BASE_URL: http://api:8000
+      WORKFLOW_STATE_PATH: /app/state/workflow_state.json
+      MONTHLY_FINETUNE_STATE_FILE: /app/state/monthly_finetune_state.json
+      DEVICE: cpu
+
     volumes:
+      - ./credentials:/app/credentials:ro
       - ./logs:/app/logs
-      - ./outputs:/app/outputs
       - ./state:/app/state
     working_dir: /app
     restart: unless-stopped

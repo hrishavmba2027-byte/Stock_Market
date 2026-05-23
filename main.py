@@ -6,6 +6,7 @@ import json
 import math
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -21,6 +22,11 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DataLoader, TensorDataset
 
+from app.pipeline.metadata import (
+    get_or_create_metadata,
+    record_run_result,
+    safe_load_metadata,
+)
 from app.services.sheet_archival import (
     DEFAULT_HISTORICAL_TRAINING_SHEET_ID,
     archive_old_rows_for_worksheet,
@@ -32,7 +38,13 @@ from app.services.google_sheet_updates import (
     PredictionSheetUpdateService,
     sync_decision_features,
 )
-from Feature_Engineering import compute_indicators, detect_date_column, ensure_date_column
+from Feature_Engineering import (
+    FeatureEngineeringError,
+    INDICATOR_COLUMNS,
+    compute_indicators,
+    detect_date_column,
+    ensure_date_column,
+)
 
 
 DEFAULT_SHEET_ID = "1uekPHyvJj4p6YjxNwlBBIAI71SWRye-xxFu47Kgpf9o"
@@ -342,6 +354,15 @@ def choose_device(device_arg: str) -> torch.device:
 
 
 def load_json(path: Path) -> Dict[str, Any]:
+    """
+    Load JSON from *path*.
+
+    For pipeline_metadata.json use ``get_or_create_metadata`` / ``safe_load_metadata``
+    instead — those functions add corruption recovery, atomic backups, and schema
+    migration that this bare implementation lacks.
+
+    Kept here to avoid breaking callers that load non-metadata JSON files.
+    """
     with open(path, "r") as file:
         return json.load(file)
 
@@ -747,13 +768,40 @@ def prepare_stock_part(
         if "Open" not in feature_columns:
             raise ValueError("metadata feature_columns must include Open when USE_INTRADAY_OPEN is True")
 
+    # ── Feature Engineering stage ────────────────────────────────────────────
+    # compute_indicators now raises FeatureEngineeringError on missing OHLCV;
+    # this propagates to process_payloads which records it in skipped[].
+    fe_t0 = time.monotonic()
+    log(f"[FE] Starting feature engineering for {payload.name} ({len(df)} rows)")
     with contextlib.redirect_stdout(sys.stderr):
-        engineered = compute_indicators(df, date_col)
+        engineered = compute_indicators(df)
+    fe_elapsed = time.monotonic() - fe_t0
     engineered = normalize_columns(engineered)
+
+    # ── Post-FE structural validation ───────────────────────────────────────
     if TARGET_COL not in engineered.columns:
-        raise ValueError("could not identify a Close column after feature engineering")
+        raise ValueError(
+            f"[FE] {payload.name}: Close column missing after feature engineering. "
+            f"Available columns: {list(engineered.columns)}"
+        )
     if SHEET_ROW_COL not in engineered.columns or SORT_POSITION_COL not in engineered.columns:
-        raise ValueError("internal row tracking columns were lost during feature engineering")
+        raise ValueError(
+            f"[FE] {payload.name}: Internal row-tracking columns were lost during "
+            f"feature engineering ({SHEET_ROW_COL}, {SORT_POSITION_COL})."
+        )
+
+    # Verify expected indicator columns were actually produced
+    _fe_missing = [c for c in INDICATOR_COLUMNS if c not in engineered.columns]
+    if _fe_missing:
+        log(
+            f"[FE] WARNING {payload.name}: {len(_fe_missing)} indicator column(s) absent "
+            f"from engineered output: {_fe_missing}"
+        )
+    else:
+        log(
+            f"[FE] {payload.name}: all {len(INDICATOR_COLUMNS)} indicator columns present "
+            f"({len(engineered)} rows, elapsed={fe_elapsed:.3f}s)"
+        )
 
     leakage_columns = forward_label_like_columns(engineered.columns, metadata)
     overlap = sorted(forward_label_like_columns(feature_columns, metadata))
@@ -765,7 +813,10 @@ def prepare_stock_part(
     engineered[TARGET_COL] = to_numeric_series(engineered[TARGET_COL])
     engineered = engineered.dropna(subset=[TARGET_COL])
     if engineered.empty:
-        raise ValueError("no valid OHLCV rows remain after feature engineering")
+        raise ValueError(
+            f"[FE] {payload.name}: no valid OHLCV rows remain after feature engineering. "
+            "All Close values are NaN or missing."
+        )
 
     engineered_positions = to_numeric_series(engineered[SORT_POSITION_COL]).astype(np.int64).to_numpy()
     historical_mask = engineered_positions <= first_valid_position
@@ -1152,7 +1203,7 @@ def scaled_latest_feature_row(
     if history.empty:
         raise ValueError(f"{part.symbol}: recursive history is empty")
     with contextlib.redirect_stdout(sys.stderr):
-        engineered = compute_indicators(history, part.forecast_date_col)
+        engineered = compute_indicators(history)
     engineered = normalize_columns(engineered)
     leakage_columns = forward_label_like_columns(engineered.columns, metadata)
     engineered = engineered.drop(columns=leakage_columns, errors="ignore")
@@ -1593,9 +1644,15 @@ def write_metrics(
         "skipped": list(skipped),
     }
     metrics_path = output_dir / "metrics.json"
-    with open(metrics_path, "w") as file:
-        json.dump(sanitize_for_json(metrics), file, indent=2, allow_nan=False)
-    log(f"Saved metrics: {metrics_path}")
+    tmp_metrics = metrics_path.with_suffix(".tmp.json")
+    try:
+        with open(tmp_metrics, "w") as file:
+            json.dump(sanitize_for_json(metrics), file, indent=2, allow_nan=False)
+        tmp_metrics.replace(metrics_path)
+    except Exception:
+        tmp_metrics.unlink(missing_ok=True)
+        raise
+    log(f"Saved metrics (atomic): {metrics_path}")
     return metrics
 
 
@@ -1967,8 +2024,14 @@ def process_payloads(
 
 def write_predictions(output_dir: Path, results: pd.DataFrame) -> Path:
     predictions_path = output_dir / "predictions.csv"
-    results.to_csv(predictions_path, index=False)
-    log(f"Saved predictions: {predictions_path}")
+    tmp_path = predictions_path.with_suffix(".tmp.csv")
+    try:
+        results.to_csv(tmp_path, index=False)
+        tmp_path.replace(predictions_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    log(f"Saved predictions (atomic): {predictions_path}")
     return predictions_path
 
 
@@ -2057,7 +2120,11 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
 
     metadata_path = Path(args.metadata)
     model_dir = Path(args.model_dir)
-    metadata = load_json(metadata_path)
+
+    # Self-healing load: auto-creates from defaults if absent, recovers from
+    # corruption, and applies schema migrations.  validate_metadata() below
+    # provides the hard model-architecture check on top.
+    metadata = get_or_create_metadata(metadata_path)
     validate_metadata(metadata)
 
     device = choose_device(args.device)
