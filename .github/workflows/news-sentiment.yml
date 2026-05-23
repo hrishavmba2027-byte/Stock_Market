@@ -1,0 +1,163 @@
+name: news-sentiment
+
+# Pulls news + Reddit + X for NIFTY tickers, runs FinBERT, writes the
+# per-(ticker, date, source) sentiment features. Raw ingests are first staged
+# under Data/archive so sentiment can score them, then drain-only upload steps
+# push those staged rows to Firestore and delete the parquet files on success.
+
+on:
+  schedule:
+    # 18:00 UTC = 23:30 IST — late enough to catch US/global news cycle
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: news-sentiment
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ingest-and-score:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Cache HuggingFace models (FinBERT ~440MB)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-finbert-v1
+          # Stable cache — only invalidate if you change the model name
+          restore-keys: |
+            hf-
+
+      - name: Restore retained upload archive, if any
+        uses: actions/cache@v4
+        with:
+          path: Data
+          key: news-sentiment-parquet-${{ github.run_id }}
+          # Restore any staged parquet files retained by a prior failed upload.
+          restore-keys: |
+            news-sentiment-parquet-
+
+      - name: Install runtime deps
+        run: |
+          pip install --upgrade pip
+          # CPU-only torch wheel keeps install fast (~150MB vs ~2GB for CUDA)
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            "torch==2.6.0+cpu"
+          pip install \
+            "pandas>=2.0,<3.0" \
+            "numpy>=1.24,<2.0" \
+            "pyarrow>=14.0" \
+            "yfinance>=0.2.38" \
+            "snscrape>=0.7" \
+            "beautifulsoup4>=4.12" \
+            "transformers>=4.36" \
+            "sentencepiece>=0.1.99" \
+            "google-cloud-firestore>=2.16" \
+            "pydantic>=1.10,<3" \
+            "python-dotenv>=1.0" \
+            "requests>=2.31"
+
+      - name: Restore Google credentials
+        env:
+          GCP_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          mkdir -p credentials
+          printf '%s' "$GCP_JSON" > credentials/service-account.json
+          chmod 600 credentials/service-account.json
+
+      - name: News ingestion (stage only, yfinance 7-day cap)
+        env:
+          GOOGLE_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          FIRESTORE_PROJECT: ${{ secrets.FIRESTORE_PROJECT }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m ingestion.news_ingest --no-firestore
+
+      - name: Reddit ingestion (stage only, anonymous JSON scrape)
+        env:
+          REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
+          GOOGLE_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          FIRESTORE_PROJECT: ${{ secrets.FIRESTORE_PROJECT }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m ingestion.reddit_ingest --no-firestore
+
+      - name: X / Twitter ingestion (stage only, best-effort)
+        continue-on-error: true  # snscrape breaks intermittently; don't fail the run
+        env:
+          GOOGLE_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          FIRESTORE_PROJECT: ${{ secrets.FIRESTORE_PROJECT }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m ingestion.x_ingest --no-firestore
+
+      - name: FinBERT sentiment scoring (wipes & writes sentiment_latest in Firestore)
+        env:
+          GOOGLE_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          FIRESTORE_PROJECT: ${{ secrets.FIRESTORE_PROJECT }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m features.sentiment
+
+      - name: Upload staged news archive to Firestore
+        env:
+          COLLECT_NEWS: "false"
+          GOOGLE_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          FIRESTORE_PROJECT: ${{ secrets.FIRESTORE_PROJECT }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m ingestion.news_ingest
+
+      - name: Upload staged Reddit archive to Firestore
+        env:
+          COLLECT_REDDIT: "false"
+          REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
+          GOOGLE_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          FIRESTORE_PROJECT: ${{ secrets.FIRESTORE_PROJECT }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m ingestion.reddit_ingest
+
+      - name: Upload staged X archive to Firestore
+        continue-on-error: true
+        env:
+          COLLECT_X: "false"
+          GOOGLE_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          FIRESTORE_PROJECT: ${{ secrets.FIRESTORE_PROJECT }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m ingestion.x_ingest
+
+      - name: Archive parquet outputs as workflow artifact (7-day retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: social-parquets-${{ github.run_id }}
+          path: |
+            Data/archive/news.parquet
+            Data/archive/reddit_posts.parquet
+            Data/archive/x_posts.parquet
+            Data/archive/sentiment_features.parquet
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Notify Slack on failure
+        if: failure() && env.SLACK_WEBHOOK != ''
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":warning: news-sentiment failed on ${GITHUB_REPOSITORY} (run ${GITHUB_RUN_ID})\"}" \
+            "$SLACK_WEBHOOK"

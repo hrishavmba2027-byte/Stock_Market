@@ -1,0 +1,191 @@
+name: monthly-training
+
+# Retrain the PyTorch ensemble on the latest 8 years of OHLCV + features,
+# then **replace** the assets attached to the GitHub Release tagged
+# `models-current`. Daily prediction pulls from that same tag. No history
+# is kept on GitHub — strict replacement, as configured.
+#
+# Runs on the 1st of every month at 04:00 UTC (09:30 IST — well before
+# Monday market open even if the 1st is a trading day). Also exposes a
+# manual trigger via the "Run workflow" button in the Actions tab.
+#
+# IMPORTANT: the actual training script is still pending (ROADMAP P0.6 —
+# extract training out of Notebooks/model_2(GPU).ipynb into
+# `training/train.py`). Until that lands, this workflow is wired but gated
+# behind a `RUN_TRAINING` repo variable so it doesn't fail silently every
+# month. Set it to `1` once `training/train.py` exists.
+
+on:
+  schedule:
+    - cron: "0 4 1 * *"  # 04:00 UTC, day-1, every month
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Run identifier (default: today's date)"
+        required: false
+        type: string
+      force_upload:
+        description: "Skip training and upload current outputs/Saved_Models contents (bootstrap)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: monthly-training
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # required to create / update a release
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # GH Actions hard cap is 360 min per job
+    if: ${{ github.event.inputs.force_upload == 'true' || vars.RUN_TRAINING == '1' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install runtime + training deps (CPU torch)
+        if: ${{ github.event.inputs.force_upload != 'true' }}
+        run: |
+          pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            "torch==2.6.0+cpu"
+          pip install \
+            "pandas>=2.0,<3.0" \
+            "numpy>=1.24,<2.0" \
+            "pyarrow>=14.0" \
+            "scikit-learn>=1.3,<2.0" \
+            "openpyxl>=3.1" \
+            "yfinance>=0.2.38" \
+            "gspread>=6.0" \
+            "oauth2client>=4.1" \
+            "google-auth>=2.28" \
+            "lightgbm>=4.0" \
+            "pydantic>=1.10,<3" \
+            "python-dotenv>=1.0" \
+            "requests>=2.31"
+
+      - name: Restore Google credentials
+        if: ${{ github.event.inputs.force_upload != 'true' }}
+        env:
+          GCP_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          mkdir -p credentials
+          printf '%s' "$GCP_JSON" > credentials/service-account.json
+          chmod 600 credentials/service-account.json
+
+      - name: Pull latest OHLCV from Google Sheets
+        if: ${{ github.event.inputs.force_upload != 'true' }}
+        env:
+          GOOGLE_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python Data_update.py \
+            --sheet-id "$SHEET_ID" \
+            --google-credentials "$GOOGLE_CREDENTIALS"
+
+      - name: Determine run id
+        id: runid
+        run: |
+          RID="${{ github.event.inputs.run_id }}"
+          if [ -z "$RID" ]; then
+            RID="$(date -u +%Y-%m-%d)"
+          fi
+          echo "run_id=$RID" >> "$GITHUB_OUTPUT"
+          echo "Training run id: $RID"
+
+      - name: Train models  # <-- PENDING (ROADMAP P0.6)
+        if: ${{ github.event.inputs.force_upload != 'true' }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          RUN_ID: ${{ steps.runid.outputs.run_id }}
+        run: |
+          # Once training/train.py exists, this becomes:
+          #   python -m training.train \
+          #     --horizons 1-30 \
+          #     --start 2017-01-01 \
+          #     --end "$(date -u +%Y-%m-%d)" \
+          #     --model lightgbm \
+          #     --output-dir outputs/Saved_Models \
+          #     --metadata outputs/pipeline_metadata.json \
+          #     --run-id "$RUN_ID"
+          #
+          # The training script must produce these files at exactly these paths:
+          #   outputs/Saved_Models/Dense.pt
+          #   outputs/Saved_Models/LSTM.pt
+          #   outputs/Saved_Models/Transformer.pt
+          #   outputs/pipeline_metadata.json
+          echo "::error::training/train.py is not implemented yet (ROADMAP P0.6)."
+          echo "::error::To enable monthly retraining, build training/train.py then set RUN_TRAINING=1 in repo variables."
+          echo "::error::To upload the model already checked into the repo, re-run with force_upload=true."
+          exit 1
+
+      - name: Replace 'models-current' release with new artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          FILES=(
+            outputs/Saved_Models/Dense.pt
+            outputs/Saved_Models/LSTM.pt
+            outputs/Saved_Models/Transformer.pt
+            outputs/pipeline_metadata.json
+          )
+          for f in "${FILES[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::missing required artifact $f"
+              exit 1
+            fi
+          done
+
+          if gh release view models-current >/dev/null 2>&1; then
+            echo "release models-current exists — replacing assets via --clobber"
+            gh release upload models-current "${FILES[@]}" --clobber
+          else
+            echo "release models-current missing — creating it"
+            gh release create models-current "${FILES[@]}" \
+              --title "Current model weights" \
+              --notes "Auto-uploaded by monthly-training (run ${{ steps.runid.outputs.run_id }})."
+          fi
+
+      - name: Notify Slack on success
+        if: success() && env.SLACK_WEBHOOK != ''
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_ID: ${{ steps.runid.outputs.run_id }}
+        run: |
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":white_check_mark: monthly-training replaced models-current with run ${RUN_ID} on ${GITHUB_REPOSITORY}\"}" \
+            "$SLACK_WEBHOOK"
+
+      - name: Notify Slack on failure
+        if: failure() && env.SLACK_WEBHOOK != ''
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":x: monthly-training FAILED on ${GITHUB_REPOSITORY} (run ${GITHUB_RUN_ID}). models-current NOT replaced — daily-prediction continues using prior version.\"}" \
+            "$SLACK_WEBHOOK"
+
+  # Companion job that always runs and tells you when the training is gated
+  # off — keeps the cron observable even when RUN_TRAINING != '1'.
+  status:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.force_upload != 'true' && vars.RUN_TRAINING != '1' }}
+    steps:
+      - name: Explain gating
+        run: |
+          echo "monthly-training is gated off (RUN_TRAINING variable != '1')."
+          echo "Daily prediction continues to use whatever weights currently live on the"
+          echo "'models-current' GitHub Release."
+          echo "To enable: build training/train.py (ROADMAP P0.6), then set RUN_TRAINING=1."
+          echo "To upload a manually trained model from this repo without running training,"
+          echo "re-trigger this workflow with force_upload=true, or use the 'upload-models' workflow."

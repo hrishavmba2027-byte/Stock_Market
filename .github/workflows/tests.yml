@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel older runs when new commits land on the same branch.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install lightweight test deps only
+        run: |
+          # The full requirements.txt pulls torch + transformers (~2GB).
+          # Unit tests don't need them — install just what the test files import.
+          pip install --upgrade pip
+          pip install \
+            "pandas>=2.0,<3.0" \
+            "numpy>=1.24,<2.0" \
+            "pyarrow>=14.0" \
+            "pydantic>=1.10,<3" \
+            "python-dotenv>=1.0" \
+            "fastapi>=0.111" \
+            "requests>=2.31" \
+            "langchain-core>=0.2" \
+            "pytest>=8" \
+            "pytest-timeout>=2"
+
+      - name: Run pytest
+        run: python -m pytest tests/ -v --timeout=60

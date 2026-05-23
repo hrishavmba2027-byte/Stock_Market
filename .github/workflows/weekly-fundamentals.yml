@@ -1,0 +1,88 @@
+name: weekly-fundamentals
+
+# Pulls quarterly financials from yfinance for the NIFTY universe and writes:
+#   • Data/archive/fundamentals.parquet  (temporary Firestore staging)
+#   • Firestore collection `fundamentals` (one doc per ticker, quarters nested)
+# Re-running is idempotent — same ticker doc IDs are overwritten.
+#
+# The flat parquet is also uploaded as a workflow artifact (7-day retention)
+# so you can grab last week's snapshot from the Actions tab if needed.
+
+on:
+  schedule:
+    # Sunday 02:00 UTC = Sunday 07:30 IST (before Monday market open)
+    - cron: "0 2 * * 0"
+  workflow_dispatch:  # allow manual trigger from the Actions tab
+
+concurrency:
+  group: weekly-fundamentals
+  cancel-in-progress: false  # never cancel a fundamentals run mid-write
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install runtime deps (ingest-only — no torch / transformers)
+        run: |
+          pip install --upgrade pip
+          pip install \
+            "pandas>=2.0,<3.0" \
+            "numpy>=1.24,<2.0" \
+            "pyarrow>=14.0" \
+            "yfinance>=0.2.38" \
+            "gspread>=6.0" \
+            "oauth2client>=4.1" \
+            "google-auth>=2.28" \
+            "google-cloud-firestore>=2.16" \
+            "pydantic>=1.10,<3" \
+            "python-dotenv>=1.0" \
+            "requests>=2.31"
+
+      - name: Restore Google credentials from secret
+        env:
+          GCP_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          mkdir -p credentials
+          printf '%s' "$GCP_JSON" > credentials/service-account.json
+          chmod 600 credentials/service-account.json
+
+      - name: Refresh fundamentals (parquet + Firestore)
+        env:
+          GOOGLE_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          FIRESTORE_PROJECT: ${{ secrets.FIRESTORE_PROJECT }}
+          FIRESTORE_FUNDAMENTALS_COLLECTION: fundamentals
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m ingestion.fundamentals --lookback-quarters 4
+
+      - name: Archive parquet snapshot as workflow artifact (7-day retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fundamentals-${{ github.run_id }}
+          path: |
+            Data/archive/fundamentals.parquet
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Notify Slack on failure
+        if: failure() && env.SLACK_WEBHOOK != ''
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":warning: weekly-fundamentals failed on ${GITHUB_REPOSITORY} (run ${GITHUB_RUN_ID})\"}" \
+            "$SLACK_WEBHOOK"
