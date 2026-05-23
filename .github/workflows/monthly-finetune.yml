@@ -1,0 +1,241 @@
+name: monthly-finetune
+
+# Runs monthly_finetune.py on the 1st of every month at 12:30 UTC = 6:00 PM IST.
+#
+# What it does:
+#   1. Downloads model artifacts (Dense.pt / LSTM.pt / Transformer.pt +
+#      pipeline_metadata.json) from the 'models-current' GitHub Release.
+#   2. Archives overflow rows from the operational Google Sheet into the
+#      historical training sheet (idempotent, append-only).
+#   3. Builds incremental fine-tuning arrays from historical rows that are
+#      newer than the last successful fine-tune checkpoint (stored in state/).
+#   4. Warm-starts each model for up to 8 epochs with early stopping.
+#   5. Evaluates the fine-tuned ensemble on a held-out validation split.
+#   6. Atomically overwrites Dense.pt / LSTM.pt / Transformer.pt with the
+#      best-loss checkpoints, then replaces the 'models-current' release assets.
+#   7. Uploads the fine-tune metrics JSON and updated state/ as artifacts.
+#
+# The run is fully idempotent: if no historical rows are newer than the
+# state checkpoint, the script exits with status "no_new_historical_data"
+# and the checkpoints are left untouched.
+#
+# Secrets required:
+#   GOOGLE_CREDENTIALS_JSON     — GCP service-account JSON for Sheets + Firestore
+#   SHEET_ID                    — Operational (live) Google Sheet ID
+#   HISTORICAL_TRAINING_SHEET_ID — Historical training dataset Google Sheet ID
+#   GITHUB_TOKEN                — auto-provided; needs contents:write for release upload
+# Optional:
+#   SLACK_WEBHOOK_URL           — receives a success / failure notification
+
+on:
+  schedule:
+    - cron: "30 12 1 * *"   # 12:30 UTC on the 1st of every month = 6:00 PM IST
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run: validate and train in memory without writing checkpoints or sheets"
+        required: false
+        type: boolean
+        default: false
+      skip_archival:
+        description: "Skip operational-to-historical archival step"
+        required: false
+        type: boolean
+        default: false
+      worksheets:
+        description: "Comma-separated symbol names to process (blank = all)"
+        required: false
+        type: string
+
+concurrency:
+  group: monthly-finetune
+  cancel-in-progress: false   # never abort a checkpoint-write mid-flight
+
+permissions:
+  contents: write   # upload / replace assets on the 'models-current' release
+
+jobs:
+  finetune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install runtime deps (CPU torch)
+        run: |
+          pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            "torch==2.6.0+cpu"
+          pip install \
+            "pandas>=2.0,<3.0" \
+            "numpy>=1.24,<2.0" \
+            "pyarrow>=14.0" \
+            "scikit-learn>=1.3,<2.0" \
+            "yfinance>=0.2.38" \
+            "gspread>=6.0" \
+            "google-auth>=2.28" \
+            "google-cloud-firestore>=2.16" \
+            "pydantic>=1.10,<3" \
+            "python-dotenv>=1.0" \
+            "requests>=2.31" \
+            "pandas-ta>=0.3.14b0" \
+            "plotly>=5.20"
+
+      - name: Restore Google credentials
+        env:
+          GCP_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          mkdir -p credentials
+          printf '%s' "$GCP_JSON" > credentials/service-account.json
+          chmod 600 credentials/service-account.json
+
+      - name: Create required directories
+        run: mkdir -p outputs/Saved_Models outputs/monthly_finetune state
+
+      - name: Download model artifacts from 'models-current' release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view models-current >/dev/null 2>&1; then
+            gh release download models-current \
+              --pattern "*.pt" \
+              --dir outputs/Saved_Models \
+              --clobber
+            gh release download models-current \
+              --pattern "pipeline_metadata.json" \
+              --dir outputs \
+              --clobber
+            echo "restored model artifacts from models-current"
+          else
+            echo "::error::models-current release not found — cannot fine-tune without base checkpoints"
+            exit 1
+          fi
+
+      - name: Restore fine-tune state (cache across runs)
+        uses: actions/cache@v4
+        with:
+          path: state/monthly_finetune_state.json
+          key: monthly-finetune-state-${{ github.ref_name }}
+          restore-keys: monthly-finetune-state-
+
+      - name: Run monthly_finetune.py
+        id: finetune
+        env:
+          GOOGLE_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/credentials/service-account.json
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          OPERATIONAL_SHEET_ID: ${{ secrets.SHEET_ID }}
+          HISTORICAL_TRAINING_SHEET_ID: ${{ secrets.HISTORICAL_TRAINING_SHEET_ID }}
+          FIRESTORE_PROJECT: ${{ secrets.FIRESTORE_PROJECT }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+
+          EXTRA_FLAGS=""
+
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            EXTRA_FLAGS="$EXTRA_FLAGS --dry-run"
+          fi
+
+          if [ "${{ github.event.inputs.skip_archival }}" = "true" ]; then
+            EXTRA_FLAGS="$EXTRA_FLAGS --skip-archival"
+          fi
+
+          if [ -n "${{ github.event.inputs.worksheets }}" ]; then
+            EXTRA_FLAGS="$EXTRA_FLAGS --worksheets ${{ github.event.inputs.worksheets }}"
+          fi
+
+          python monthly_finetune.py \
+            --operational-sheet-id "$OPERATIONAL_SHEET_ID" \
+            --historical-sheet-id  "$HISTORICAL_TRAINING_SHEET_ID" \
+            --google-credentials   "$GOOGLE_CREDENTIALS" \
+            --model-dir            outputs/Saved_Models \
+            --metadata             outputs/pipeline_metadata.json \
+            --output-dir           outputs/monthly_finetune \
+            --state-file           state/monthly_finetune_state.json \
+            --device               cpu \
+            $EXTRA_FLAGS \
+            | tee outputs/monthly_finetune/monthly_finetune_result.json
+
+          # Expose fine-tune status to later steps
+          STATUS=$(python -c "
+          import json, sys
+          data = json.load(open('outputs/monthly_finetune/monthly_finetune_result.json'))
+          print(data.get('status', 'unknown'))
+          ")
+          echo "finetune_status=$STATUS" >> "$GITHUB_OUTPUT"
+
+      - name: Replace 'models-current' release with fine-tuned checkpoints
+        if: |
+          steps.finetune.outputs.finetune_status == 'ok' &&
+          github.event.inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          FILES=(
+            outputs/Saved_Models/Dense.pt
+            outputs/Saved_Models/LSTM.pt
+            outputs/Saved_Models/Transformer.pt
+            outputs/pipeline_metadata.json
+          )
+          for f in "${FILES[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::missing artifact after fine-tune: $f"
+              exit 1
+            fi
+          done
+
+          RUN_DATE="$(date -u +%Y-%m-%d)"
+          if gh release view models-current >/dev/null 2>&1; then
+            echo "replacing assets on models-current"
+            gh release upload models-current "${FILES[@]}" --clobber
+          else
+            echo "creating models-current release"
+            gh release create models-current "${FILES[@]}" \
+              --title "Current model weights" \
+              --notes "Auto-uploaded by monthly-finetune (run ${RUN_DATE})."
+          fi
+
+      - name: Upload fine-tune metrics and state as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monthly-finetune-${{ github.run_id }}
+          path: |
+            outputs/monthly_finetune/monthly_finetune_metrics.json
+            outputs/monthly_finetune/monthly_finetune_result.json
+            state/monthly_finetune_state.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Slack notification on success
+        if: success() && env.SLACK_WEBHOOK != ''
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          STATUS: ${{ steps.finetune.outputs.finetune_status }}
+        run: |
+          if [ "$STATUS" = "ok" ]; then
+            MSG=":white_check_mark: monthly-finetune complete — models-current updated (run ${GITHUB_RUN_ID})"
+          else
+            MSG=":information_source: monthly-finetune completed with status \`${STATUS}\` — no checkpoint overwrite needed (run ${GITHUB_RUN_ID})"
+          fi
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"${MSG} on ${GITHUB_REPOSITORY}\"}" \
+            "$SLACK_WEBHOOK"
+
+      - name: Slack notification on failure
+        if: failure() && env.SLACK_WEBHOOK != ''
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":x: monthly-finetune FAILED on ${GITHUB_REPOSITORY} (run ${GITHUB_RUN_ID}). models-current NOT replaced — daily-prediction continues using prior version.\"}" \
+            "$SLACK_WEBHOOK"
