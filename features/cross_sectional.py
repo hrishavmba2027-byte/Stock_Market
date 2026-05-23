@@ -19,7 +19,7 @@ import json
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -27,6 +27,7 @@ import pandas as pd
 DEFAULT_INDEX_CACHE = Path(__file__).resolve().parents[1] / "Data" / "archive" / "indices.parquet"
 NIFTY_SYMBOL = "^NSEI"
 VIX_SYMBOL = "^INDIAVIX"
+FIRESTORE_COLLECTION = "index_history"
 
 
 def _log(msg: str) -> None:
@@ -76,6 +77,33 @@ def load_index_history(path: Path = DEFAULT_INDEX_CACHE) -> pd.DataFrame:
     df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
     df = df.sort_index()
     return df
+
+
+def write_indices_to_firestore(
+    df: pd.DataFrame,
+    collection: str = FIRESTORE_COLLECTION,
+    client: Optional[Any] = None,
+) -> int:
+    """Wipe ``collection`` and write one doc per date. Returns rows written."""
+    if df.empty:
+        return 0
+    from ingestion._firestore import batch_write, init_firestore_client, wipe_collection
+
+    client = client or init_firestore_client()
+    wipe_collection(client, collection)
+
+    def _docs():
+        for date_val, row in df.iterrows():
+            doc_id = pd.Timestamp(date_val).strftime("%Y-%m-%d")
+            payload: Dict[str, Any] = {"date": doc_id}
+            for col in df.columns:
+                val = row[col]
+                payload[col] = None if pd.isna(val) else float(val)
+            yield doc_id, payload
+
+    written = batch_write(client, collection, _docs())
+    _log(f"[cross-sectional] wrote {written} rows to Firestore collection '{collection}'")
+    return written
 
 
 def _compute_regime(index_df: pd.DataFrame) -> pd.DataFrame:
