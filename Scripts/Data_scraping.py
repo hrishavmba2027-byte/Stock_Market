@@ -188,8 +188,14 @@ def main():
         logger.error("No data collected")
         return
 
+    # Write to Data/ in the project root (Scripts/ is one level below root).
+    # This is the canonical location expected by Feature_Engineering.py,
+    # main.py, and app/config/settings.py.
     script_dir = os.path.dirname(os.path.realpath(__file__))
-    output_file = os.path.join(script_dir, "nse_stock_data.xlsx")
+    project_root = os.path.dirname(script_dir)
+    data_dir = os.path.join(project_root, "Data")
+    os.makedirs(data_dir, exist_ok=True)
+    output_file = os.path.join(data_dir, "nse_stock_data.xlsx")
 
     update_excel(results, output_file, args.interval)
 

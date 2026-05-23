@@ -112,7 +112,7 @@ def find_ohlcv_columns(df):
     # Try exact matches first
     ohlcv_map = {}
     for ohlc_name in ['open', 'high', 'low', 'close', 'volume']:
-        if ohlc_name in col_lower:
+        if ohlc_name in col_lower.values():
             ohlcv_map[ohlc_name] = [col for col, lower_col in col_lower.items() if lower_col == ohlc_name][0]
     
     # If we found all 5, return
@@ -282,6 +282,61 @@ def compute_log_return(close):
     return np.log(close / close.shift(1)) * 100
 
 
+# ============================================================================
+# P0.1 — Forward-return label construction
+# ============================================================================
+# These labels look INTO THE FUTURE — they must never be used as model inputs.
+# They are the targets for the multi-horizon quantile forecaster (P0.2).
+# ============================================================================
+
+FORWARD_HORIZONS = tuple(range(1, 31))  # h = 1, 2, ..., 30
+FORWARD_LABEL_PREFIX = "y_logret_h"
+HAS_LABELS_COL = "has_labels"
+
+
+def forward_label_columns(horizons=FORWARD_HORIZONS):
+    """Canonical names for the forward-return label columns."""
+    return [f"{FORWARD_LABEL_PREFIX}{h}" for h in horizons]
+
+
+def compute_forward_log_returns(close, horizons=FORWARD_HORIZONS):
+    """
+    For each row at time t, compute y_h = log(Close[t+h] / Close[t]) for h in horizons.
+
+    Implemented via close.shift(-h) so y_h at row t is undefined for the last h rows
+    of the series — that's intentional. Those rows are NOT training-eligible and
+    are flagged via `has_labels=False`.
+
+    Returns:
+        Dict[str, pd.Series] keyed by forward_label_columns(horizons).
+    """
+    labels = {}
+    log_close = np.log(close)
+    for h in horizons:
+        labels[f"{FORWARD_LABEL_PREFIX}{h}"] = log_close.shift(-h) - log_close
+    return labels
+
+
+def attach_forward_labels(df, close_col="close", horizons=FORWARD_HORIZONS):
+    """
+    Attach 30 forward-return label columns plus a `has_labels` boolean flag to df.
+
+    `has_labels=True` iff every forward label at that row is finite (i.e. the row
+    has at least `max(horizons)` future bars available in the same frame).
+
+    The flag is deliberately surfaced as a column so any downstream train/test
+    code can `assert df.loc[train_mask, 'has_labels'].all()` and any leakage bug
+    becomes visible in code review (per ROADMAP P0.1).
+    """
+    df_out = df.copy()
+    labels = compute_forward_log_returns(df_out[close_col], horizons=horizons)
+    label_cols = list(labels.keys())
+    for name, series in labels.items():
+        df_out[name] = series.values
+    df_out[HAS_LABELS_COL] = df_out[label_cols].notna().all(axis=1)
+    return df_out
+
+
 def compute_roc(close, period=12):
     """Compute Rate of Change (ROC)"""
     roc = ((close - close.shift(period)) / close.shift(period)) * 100
@@ -329,6 +384,194 @@ def compute_mfi(high, low, close, volume, period=14):
     except Exception as e:
         print(f"      Warning: MFI calculation failed: {e}")
         return pd.Series(np.nan, index=close.index)
+
+
+# ============================================================================
+# Decision-layer categorical features (Google Sheet visibility only)
+# ----------------------------------------------------------------------------
+# These columns are computed for Claude's decision-making and are written to
+# the Google Sheets ONLY. They are intentionally NOT added to compute_indicators,
+# so they never enter the model feature matrix or pipeline_metadata.json.
+# All existing engineered features are preserved untouched.
+# ============================================================================
+
+DECISION_FEATURE_COLUMNS = [
+    "RSI_7", "SMA_5_20", "SMA_20_50", "EMA_12_26", "EMA_26_50",
+    "BB_indicator", "BB_trend_state", "BB_volatility_state",
+    "BB_overbought_oversold", "RSI_indicator_7", "RSI_indicator_14",
+]
+
+# Minimum finite observations required to trust dynamic per-symbol percentiles.
+RSI_BIN_MIN_HISTORY = 30
+# Fallback (p25, p50, p75) — standard RSI rules — used when history is too short.
+_RSI_FALLBACK_THRESHOLDS = (30.0, 50.0, 70.0)
+
+
+def _finite(series):
+    """Coerce to numeric and replace +/-inf with NaN (never raises)."""
+    return pd.to_numeric(pd.Series(series), errors='coerce').replace([np.inf, -np.inf], np.nan)
+
+
+def find_close_column(df):
+    """Locate the Close column leniently (exact, then Close_SYMBOL pattern)."""
+    for col in df.columns:
+        if str(col).strip().lower() == 'close':
+            return col
+    for col in df.columns:
+        if str(col).strip().lower().startswith('close_'):
+            return col
+    return None
+
+
+def rsi_percentile_thresholds(rsi_values):
+    """Dynamic (p25, p50, p75) from a symbol's RSI history; None if too sparse."""
+    arr = _finite(pd.Series(list(rsi_values), dtype='float64')).dropna()
+    if len(arr) < RSI_BIN_MIN_HISTORY:
+        return None
+    return (float(arr.quantile(0.25)), float(arr.quantile(0.50)), float(arr.quantile(0.75)))
+
+
+def classify_rsi_bins(rsi_series, thresholds):
+    """Map RSI to mutually-exclusive categorical bins.
+
+    thresholds: (p25, p50, p75). When None, falls back to fixed RSI rules.
+    Bins (checked in order, so they are mutually exclusive):
+      > p75 -> highly overbought ; > p50 -> slightly overbought ;
+      < p25 -> highly oversold   ; < p50 -> slightly oversold   ; else neutral.
+    """
+    p25, p50, p75 = thresholds if thresholds is not None else _RSI_FALLBACK_THRESHOLDS
+    out = []
+    for value in _finite(rsi_series):
+        if pd.isna(value):
+            out.append("")
+        elif value > p75:
+            out.append("highly overbought")
+        elif value > p50:
+            out.append("slightly overbought")
+        elif value < p25:
+            out.append("highly oversold")
+        elif value < p50:
+            out.append("slightly oversold")
+        else:
+            out.append("neutral")
+    return out
+
+
+def _classify_cross(fast, slow, up_label, down_label, neutral_label="neutral"):
+    """Categorise a moving-average crossover; blank cell when inputs are NaN."""
+    out = []
+    for f, s in zip(_finite(fast), _finite(slow)):
+        if pd.isna(f) or pd.isna(s):
+            out.append("")
+        elif f > s:
+            out.append(up_label)
+        elif f < s:
+            out.append(down_label)
+        else:
+            out.append(neutral_label)
+    return out
+
+
+def bollinger_decision_states(close, period=20, std_dev=2):
+    """Return (BB_indicator, BB_trend_state, BB_volatility_state, BB_overbought_oversold).
+
+    Trend & overbought/oversold come from %B = (close - lower) / (upper - lower).
+    Volatility comes from bandwidth = (upper - lower) / middle, compared against
+    the symbol's own 25th/75th bandwidth percentiles (normal volatility when the
+    symbol's history is too short to form percentiles).
+    """
+    close = _finite(close)
+    upper, middle, lower = compute_bollinger_bands(close, period, std_dev)
+    width = upper - lower
+    pct_b = (close - lower) / width.where(width != 0, np.nan)
+    bandwidth = width / middle.where(middle != 0, np.nan)
+    bw_finite = _finite(bandwidth).dropna()
+    if len(bw_finite) >= RSI_BIN_MIN_HISTORY:
+        bw_low, bw_high = float(bw_finite.quantile(0.25)), float(bw_finite.quantile(0.75))
+    else:
+        bw_low = bw_high = None
+
+    indicator, trend, volatility, obos = [], [], [], []
+    for pb, bw in zip(pct_b, _finite(bandwidth)):
+        if pd.isna(pb):
+            t = o = ""
+        else:
+            o = "overbought" if pb >= 1.0 else ("oversold" if pb <= 0.0 else "neutral")
+            t = "bullish" if pb > 0.6 else ("bearish" if pb < 0.4 else "neutral")
+        if pd.isna(bw):
+            v = ""
+        elif bw_low is None:
+            v = "normal volatility"
+        elif bw > bw_high:
+            v = "high volatility"
+        elif bw < bw_low:
+            v = "low volatility"
+        else:
+            v = "normal volatility"
+        trend.append(t)
+        volatility.append(v)
+        obos.append(o)
+        indicator.append(" | ".join(p for p in (t, o, v) if p))
+    return indicator, trend, volatility, obos
+
+
+def compute_decision_features(df, rsi7_thresholds=None, rsi14_thresholds=None):
+    """Compute the 11 decision-layer categorical features for a single symbol.
+
+    `df` must already be ordered chronologically so indicator look-back is
+    correct. Returns a DataFrame of DECISION_FEATURE_COLUMNS aligned to df.index.
+    Never raises: any unresolved input simply yields blank cells.
+
+    The RSI bin thresholds are supplied by the caller (computed from the full
+    cross-sheet history for the symbol); when None the bins fall back safely.
+    """
+    out = pd.DataFrame(index=df.index, columns=DECISION_FEATURE_COLUMNS, dtype=object)
+    close_col = find_close_column(df)
+    if close_col is None:
+        return out.fillna("")
+    try:
+        close = _finite(df[close_col])
+        close.index = df.index
+        rsi7 = compute_rsi(close, 7)
+        rsi14 = compute_rsi(close, 14)
+        out["RSI_7"] = ["" if pd.isna(v) else round(float(v), 2) for v in _finite(rsi7)]
+        out["SMA_5_20"] = _classify_cross(compute_sma(close, 5), compute_sma(close, 20),
+                                          "bullish", "bearish")
+        out["SMA_20_50"] = _classify_cross(compute_sma(close, 20), compute_sma(close, 50),
+                                           "strong bullish", "strong bearish")
+        out["EMA_12_26"] = _classify_cross(compute_ema(close, 12), compute_ema(close, 26),
+                                           "bullish", "bearish")
+        out["EMA_26_50"] = _classify_cross(compute_ema(close, 26), compute_ema(close, 50),
+                                           "long-term bullish", "long-term bearish")
+        bb_ind, bb_trend, bb_vol, bb_obos = bollinger_decision_states(close)
+        out["BB_indicator"] = bb_ind
+        out["BB_trend_state"] = bb_trend
+        out["BB_volatility_state"] = bb_vol
+        out["BB_overbought_oversold"] = bb_obos
+        out["RSI_indicator_7"] = classify_rsi_bins(rsi7, rsi7_thresholds)
+        out["RSI_indicator_14"] = classify_rsi_bins(rsi14, rsi14_thresholds)
+    except Exception as exc:  # never break the caller's workflow
+        print(f"      Warning: decision feature computation failed: {exc}")
+    return out.fillna("")
+
+
+def compute_decision_rsi_history(df, periods=(7, 14)):
+    """Return {period: list[float]} of finite RSI values from a chronological frame.
+
+    Used by the sheet sync to pool RSI history across BOTH sheets per symbol
+    before deriving dynamic percentile thresholds.
+    """
+    history = {p: [] for p in periods}
+    close_col = find_close_column(df)
+    if close_col is None:
+        return history
+    close = _finite(df[close_col])
+    for period in periods:
+        try:
+            history[period] = _finite(compute_rsi(close, period)).dropna().tolist()
+        except Exception:
+            history[period] = []
+    return history
 
 
 def compute_indicators(df, date_col):
@@ -492,10 +735,28 @@ def compute_indicators(df, date_col):
         # Add all indicators to original dataframe
         for col_name, col_data in indicators.items():
             if isinstance(col_data, pd.Series):
-                df_work[col_name] = col_data.values
+                df_work[col_name] = col_data.shift(1).values
             else:
                 df_work[col_name] = np.nan
-        
+
+        # P0.1 — attach 30 forward-return labels + has_labels flag.
+        # These columns are TARGETS, not features. They must be stripped from
+        # the feature matrix before training (see training code).
+        try:
+            close_for_labels = pd.to_numeric(
+                df_work[ohlcv_map['close']], errors='coerce'
+            ).reset_index(drop=True)
+            forward_labels = compute_forward_log_returns(close_for_labels)
+            for label_name, label_series in forward_labels.items():
+                df_work[label_name] = label_series.values
+            label_cols = list(forward_labels.keys())
+            df_work[HAS_LABELS_COL] = df_work[label_cols].notna().all(axis=1).values
+        except Exception as e:
+            print(f"      Warning: forward label attachment failed: {e}")
+            for label_name in forward_label_columns():
+                df_work[label_name] = np.nan
+            df_work[HAS_LABELS_COL] = False
+
         return df_work
     
     except Exception as e:
@@ -533,15 +794,19 @@ def main():
     print("NSE Stock Data - Technical Indicator Feature Engineering")
     print("=" * 70)
     
-    # Define file paths relative to script location
+    # Canonical workbook location: <project_root>/Data/nse_stock_data.xlsx
+    # (consistent with app/config/settings.py and Data_scraping.py output)
     script_dir = Path(__file__).parent
-    input_file = script_dir / 'nse_stock_data.xlsx'
-    output_file = script_dir / 'nse_stock_data.xlsx'
-    
+    data_dir = script_dir / 'Data'
+    input_file = data_dir / 'nse_stock_data.xlsx'
+    output_file = data_dir / 'nse_stock_data.xlsx'
+
     # Check if input file exists
     if not input_file.exists():
         print(f"\nError: Input file '{input_file}' not found.")
-        print(f"Please ensure 'nse_stock_data.xlsx' exists in the same directory.")
+        print(f"Generate it first by running:")
+        print(f"  python3 Scripts/Data_scraping.py")
+        print(f"  (downloads NIFTY-50 OHLCV data from yfinance into Data/nse_stock_data.xlsx)")
         sys.exit(1)
     
     # Load workbook

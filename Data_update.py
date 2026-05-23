@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials as _GoogleCredentials
 
 
 DEFAULT_SHEET_ID = "1uekPHyvJj4p6YjxNwlBBIAI71SWRye-xxFu47Kgpf9o"
@@ -93,7 +93,12 @@ def authorize_gspread(credentials_path: Optional[str]) -> Any:
     )
     if not credential_file:
         raise RuntimeError("Google service-account credentials path is required")
-    credentials = ServiceAccountCredentials.from_json_keyfile_name(credential_file, GOOGLE_SCOPES)
+
+    print(f"[google_auth] Using credentials : {credential_file}", flush=True)
+    credentials = _GoogleCredentials.from_service_account_file(
+        credential_file, scopes=GOOGLE_SCOPES
+    )
+    print("[google_auth] Service Account Loaded Successfully", flush=True)
     return gspread.authorize(credentials)
 
 
