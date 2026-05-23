@@ -10,8 +10,8 @@ name: weekly-fundamentals
 
 on:
   schedule:
-    # Sunday 02:00 UTC = Sunday 07:30 IST (before Monday market open)
-    - cron: "0 2 * * 0"
+    # Monday 11:30 UTC = Monday 5:00 PM IST
+    - cron: "30 11 * * 1"
   workflow_dispatch:  # allow manual trigger from the Actions tab
 
 concurrency:
@@ -31,7 +31,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
           cache: pip
 
       - name: Install runtime deps (ingest-only — no torch / transformers)

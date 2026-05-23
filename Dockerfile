@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -47,7 +47,6 @@ COPY tests ./tests
 # Committed model artifacts (overridden at runtime when the GitHub Release
 # bootstrap puts fresher weights here via the volume mount):
 COPY outputs/Saved_Models ./outputs/Saved_Models
-COPY outputs/pipeline_metadata.json ./outputs/pipeline_metadata.json
 
 # Legacy back-compat symlink (some scripts referenced Data_Update.py with
 # a capital U) + runtime dirs used by the FastAPI app & ingest modules.
