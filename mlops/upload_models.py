@@ -68,11 +68,14 @@ def _gh_path() -> str:
     return gh
 
 
+_GH_TIMEOUT_SECONDS = 120  # generous ceiling for slow GitHub API / large uploads
+
+
 def _release_exists(gh: str, tag: str, repo: str | None) -> bool:
     cmd = [gh, "release", "view", tag]
     if repo:
         cmd += ["--repo", repo]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=_GH_TIMEOUT_SECONDS)
     return result.returncode == 0
 
 
@@ -90,7 +93,7 @@ def _create_release(gh: str, tag: str, repo: str | None, files: List[Path]) -> N
     if repo:
         cmd += ["--repo", repo]
     cmd += [str(p) for p in files]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, timeout=_GH_TIMEOUT_SECONDS)
 
 
 def _upload_clobber(gh: str, tag: str, repo: str | None, files: List[Path]) -> None:
@@ -98,7 +101,7 @@ def _upload_clobber(gh: str, tag: str, repo: str | None, files: List[Path]) -> N
     if repo:
         cmd += ["--repo", repo]
     cmd += [str(p) for p in files]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, timeout=_GH_TIMEOUT_SECONDS)
 
 
 def upload(

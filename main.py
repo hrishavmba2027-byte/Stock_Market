@@ -6,6 +6,7 @@ import json
 import math
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -21,6 +22,11 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DataLoader, TensorDataset
 
+from app.pipeline.metadata import (
+    get_or_create_metadata,
+    record_run_result,
+    safe_load_metadata,
+)
 from app.services.sheet_archival import (
     DEFAULT_HISTORICAL_TRAINING_SHEET_ID,
     archive_old_rows_for_worksheet,
@@ -30,9 +36,16 @@ from app.services.sheet_archival import (
 )
 from app.services.google_sheet_updates import (
     PredictionSheetUpdateService,
+    overwrite_worksheet_with_engineered_data,
     sync_decision_features,
 )
-from Feature_Engineering import compute_indicators, detect_date_column, ensure_date_column
+from Feature_Engineering import (
+    FeatureEngineeringError,
+    INDICATOR_COLUMNS,
+    compute_indicators,
+    detect_date_column,
+    ensure_date_column,
+)
 
 
 DEFAULT_SHEET_ID = "1uekPHyvJj4p6YjxNwlBBIAI71SWRye-xxFu47Kgpf9o"
@@ -113,6 +126,9 @@ class StockInferencePart:
     status: str = STATUS_OK
     eligible_target_count: int = 0
     last_valid_position: Optional[int] = None
+    # Full engineered DataFrame (OHLCV + all FE indicator columns) used for
+    # the full-sheet overwrite.  Set by prepare_stock_part() after FE runs.
+    engineered_frame: Optional[pd.DataFrame] = None
 
 
 def select_quantile_outputs(
@@ -342,6 +358,15 @@ def choose_device(device_arg: str) -> torch.device:
 
 
 def load_json(path: Path) -> Dict[str, Any]:
+    """
+    Load JSON from *path*.
+
+    For pipeline_metadata.json use ``get_or_create_metadata`` / ``safe_load_metadata``
+    instead — those functions add corruption recovery, atomic backups, and schema
+    migration that this bare implementation lacks.
+
+    Kept here to avoid breaking callers that load non-metadata JSON files.
+    """
     with open(path, "r") as file:
         return json.load(file)
 
@@ -648,6 +673,7 @@ def prepare_stock_part(
     latest_only: bool = False,
     refresh_existing_forecasts: bool = False,
     all_eligible_rows: bool = False,
+    force_all_rows: bool = False,
 ) -> StockInferencePart:
     feature_columns, seq_len, feature_count, _ = validate_metadata(metadata)
     raw_df = payload.frame.copy()
@@ -678,10 +704,10 @@ def prepare_stock_part(
 
     predicted_values = to_numeric_series(df[pred_col]).fillna(0).to_numpy(dtype=np.float64)
     valid_prediction_indices = np.flatnonzero(predicted_values == 1)
-    if all_eligible_rows:
+    if force_all_rows or all_eligible_rows:
         first_valid_position = min(max(seq_len - 1, 0), len(df) - 1)
         log(
-            f"{payload.name}: all eligible row forecasting enabled; "
+            f"{payload.name}: {'force_all_rows' if force_all_rows else 'all_eligible_rows'} enabled; "
             f"using position {first_valid_position} as the initial prediction checkpoint"
         )
     elif len(valid_prediction_indices) == 0:
@@ -704,12 +730,19 @@ def prepare_stock_part(
     assert first_valid_position < len(df)
 
     refresh_existing_forecasts = bool(refresh_existing_forecasts and has_forecast_output_columns(df, metadata))
-    # Forecast columns are refreshed when present so older long-horizon outputs
-    # are replaced by the 5-day hybrid forecast without changing processed flags.
-    valid_indices = np.where(
-        (candidate_positions > first_valid_position)
-        & ((predicted_values == 0) | forecast_missing_values | refresh_existing_forecasts)
-    )[0]
+    # When force_all_rows is True every row past the warm-up window is eligible
+    # regardless of its current predicted / forecast state.  This powers the
+    # full-sheet overwrite path where we re-predict every row on every run.
+    if force_all_rows:
+        valid_indices = np.where(candidate_positions > first_valid_position)[0]
+    else:
+        # Forecast columns are refreshed when present so older long-horizon
+        # outputs are replaced by the 5-day hybrid forecast without changing
+        # processed flags.
+        valid_indices = np.where(
+            (candidate_positions > first_valid_position)
+            & ((predicted_values == 0) | forecast_missing_values | refresh_existing_forecasts)
+        )[0]
     if latest_only and len(valid_indices) > 0:
         valid_indices = valid_indices[-1:]
     eligible_target_count = int(len(valid_indices))
@@ -719,6 +752,21 @@ def prepare_stock_part(
             f"Prepared {payload.name}: rows={len(raw_df)}, "
             f"first_valid_position={first_valid_position}, eligible_predictions=0"
         )
+        # Run FE even on the no-inference path so engineered_frame is available
+        # for the full-sheet overwrite when force_all_rows is True.
+        _ef: Optional[pd.DataFrame] = None
+        if force_all_rows:
+            try:
+                _eng_early = compute_indicators(prepare_feature_engineering_input(raw_df))
+                _eng_early = normalize_columns(_eng_early)
+                _fwd = forward_label_like_columns(_eng_early.columns, metadata)
+                _eng_early = _eng_early.drop(columns=_fwd, errors="ignore")
+                _eng_early[TARGET_COL] = to_numeric_series(_eng_early[TARGET_COL])
+                _eng_early = _eng_early.dropna(subset=[TARGET_COL])
+                if not _eng_early.empty:
+                    _ef = _eng_early
+            except Exception as _exc:
+                log(f"[FE] {payload.name}: early-return FE for overwrite failed: {_exc}")
         return StockInferencePart(
             symbol=payload.name,
             X=np.empty((0, seq_len, feature_count), dtype=np.float32),
@@ -738,6 +786,7 @@ def prepare_stock_part(
             status=STATUS_NO_NEW_DATA,
             eligible_target_count=eligible_target_count,
             last_valid_position=first_valid_position,
+            engineered_frame=_ef,
         )
 
     if TARGET_COL not in candidate_df.columns:
@@ -747,13 +796,40 @@ def prepare_stock_part(
         if "Open" not in feature_columns:
             raise ValueError("metadata feature_columns must include Open when USE_INTRADAY_OPEN is True")
 
+    # ── Feature Engineering stage ────────────────────────────────────────────
+    # compute_indicators now raises FeatureEngineeringError on missing OHLCV;
+    # this propagates to process_payloads which records it in skipped[].
+    fe_t0 = time.monotonic()
+    log(f"[FE] Starting feature engineering for {payload.name} ({len(df)} rows)")
     with contextlib.redirect_stdout(sys.stderr):
-        engineered = compute_indicators(df, date_col)
+        engineered = compute_indicators(df)
+    fe_elapsed = time.monotonic() - fe_t0
     engineered = normalize_columns(engineered)
+
+    # ── Post-FE structural validation ───────────────────────────────────────
     if TARGET_COL not in engineered.columns:
-        raise ValueError("could not identify a Close column after feature engineering")
+        raise ValueError(
+            f"[FE] {payload.name}: Close column missing after feature engineering. "
+            f"Available columns: {list(engineered.columns)}"
+        )
     if SHEET_ROW_COL not in engineered.columns or SORT_POSITION_COL not in engineered.columns:
-        raise ValueError("internal row tracking columns were lost during feature engineering")
+        raise ValueError(
+            f"[FE] {payload.name}: Internal row-tracking columns were lost during "
+            f"feature engineering ({SHEET_ROW_COL}, {SORT_POSITION_COL})."
+        )
+
+    # Verify expected indicator columns were actually produced
+    _fe_missing = [c for c in INDICATOR_COLUMNS if c not in engineered.columns]
+    if _fe_missing:
+        log(
+            f"[FE] WARNING {payload.name}: {len(_fe_missing)} indicator column(s) absent "
+            f"from engineered output: {_fe_missing}"
+        )
+    else:
+        log(
+            f"[FE] {payload.name}: all {len(INDICATOR_COLUMNS)} indicator columns present "
+            f"({len(engineered)} rows, elapsed={fe_elapsed:.3f}s)"
+        )
 
     leakage_columns = forward_label_like_columns(engineered.columns, metadata)
     overlap = sorted(forward_label_like_columns(feature_columns, metadata))
@@ -765,7 +841,16 @@ def prepare_stock_part(
     engineered[TARGET_COL] = to_numeric_series(engineered[TARGET_COL])
     engineered = engineered.dropna(subset=[TARGET_COL])
     if engineered.empty:
-        raise ValueError("no valid OHLCV rows remain after feature engineering")
+        raise ValueError(
+            f"[FE] {payload.name}: no valid OHLCV rows remain after feature engineering. "
+            "All Close values are NaN or missing."
+        )
+
+    # ── Capture full engineered frame for the sheet overwrite ────────────────
+    # This preserves every row (OHLCV + all indicator columns + original sheet
+    # columns like predicted/Predicted_Close_Price) so run_pipeline() can
+    # overwrite the entire TEST sheet after inference.
+    engineered_for_sheet = engineered.copy()
 
     engineered_positions = to_numeric_series(engineered[SORT_POSITION_COL]).astype(np.int64).to_numpy()
     historical_mask = engineered_positions <= first_valid_position
@@ -840,10 +925,13 @@ def prepare_stock_part(
         selected_dates.append(candidate_dates[idx] if idx < len(candidate_dates) else idx)
 
     assert len(selected_positions) == len(set(selected_positions))
-    assert all(
-        (predicted_values[row_pos] == 0) or forecast_missing_values[row_pos] or refresh_existing_forecasts
-        for row_pos in selected_positions
-    )
+    # When force_all_rows is True we intentionally include already-predicted
+    # rows, so the eligibility assert is skipped.
+    if not force_all_rows:
+        assert all(
+            (predicted_values[row_pos] == 0) or forecast_missing_values[row_pos] or refresh_existing_forecasts
+            for row_pos in selected_positions
+        )
 
     if X_sequences:
         X = np.stack(X_sequences).astype(np.float32)
@@ -875,6 +963,7 @@ def prepare_stock_part(
         status=part_status,
         eligible_target_count=eligible_target_count,
         last_valid_position=first_valid_position,
+        engineered_frame=engineered_for_sheet,
     )
 
 
@@ -1152,7 +1241,7 @@ def scaled_latest_feature_row(
     if history.empty:
         raise ValueError(f"{part.symbol}: recursive history is empty")
     with contextlib.redirect_stdout(sys.stderr):
-        engineered = compute_indicators(history, part.forecast_date_col)
+        engineered = compute_indicators(history)
     engineered = normalize_columns(engineered)
     leakage_columns = forward_label_like_columns(engineered.columns, metadata)
     engineered = engineered.drop(columns=leakage_columns, errors="ignore")
@@ -1593,9 +1682,15 @@ def write_metrics(
         "skipped": list(skipped),
     }
     metrics_path = output_dir / "metrics.json"
-    with open(metrics_path, "w") as file:
-        json.dump(sanitize_for_json(metrics), file, indent=2, allow_nan=False)
-    log(f"Saved metrics: {metrics_path}")
+    tmp_metrics = metrics_path.with_suffix(".tmp.json")
+    try:
+        with open(tmp_metrics, "w") as file:
+            json.dump(sanitize_for_json(metrics), file, indent=2, allow_nan=False)
+        tmp_metrics.replace(metrics_path)
+    except Exception:
+        tmp_metrics.unlink(missing_ok=True)
+        raise
+    log(f"Saved metrics (atomic): {metrics_path}")
     return metrics
 
 
@@ -1938,6 +2033,7 @@ def process_payloads(
     latest_only: bool = False,
     refresh_existing_forecasts: bool = False,
     all_eligible_rows: bool = False,
+    force_all_rows: bool = False,
 ) -> Tuple[List[StockInferencePart], List[str]]:
     parts: List[StockInferencePart] = []
     skipped: List[str] = []
@@ -1954,6 +2050,7 @@ def process_payloads(
                     latest_only=latest_only,
                     refresh_existing_forecasts=refresh_existing_forecasts,
                     all_eligible_rows=all_eligible_rows,
+                    force_all_rows=force_all_rows,
                 )
             )
         except NoValidStartPointError as exc:
@@ -1967,8 +2064,14 @@ def process_payloads(
 
 def write_predictions(output_dir: Path, results: pd.DataFrame) -> Path:
     predictions_path = output_dir / "predictions.csv"
-    results.to_csv(predictions_path, index=False)
-    log(f"Saved predictions: {predictions_path}")
+    tmp_path = predictions_path.with_suffix(".tmp.csv")
+    try:
+        results.to_csv(tmp_path, index=False)
+        tmp_path.replace(predictions_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    log(f"Saved predictions (atomic): {predictions_path}")
     return predictions_path
 
 
@@ -2057,7 +2160,11 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
 
     metadata_path = Path(args.metadata)
     model_dir = Path(args.model_dir)
-    metadata = load_json(metadata_path)
+
+    # Self-healing load: auto-creates from defaults if absent, recovers from
+    # corruption, and applies schema migrations.  validate_metadata() below
+    # provides the hard model-architecture check on top.
+    metadata = get_or_create_metadata(metadata_path)
     validate_metadata(metadata)
 
     device = choose_device(args.device)
@@ -2078,12 +2185,15 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             worksheet_filters=worksheet_filters,
         )
 
+    # force_all_rows=True makes every row past the warm-up window eligible
+    # for prediction on every run, which powers the full-sheet overwrite.
     parts, skipped = process_payloads(
         payloads,
         metadata,
         latest_only=bool(getattr(args, "latest_only", False)),
         refresh_existing_forecasts=bool(getattr(args, "refresh_existing_forecasts", False)),
         all_eligible_rows=bool(getattr(args, "all_eligible_rows", False)),
+        force_all_rows=True,
     )
     has_prediction_data = any(len(part.X) > 0 for part in parts)
     if has_prediction_data:
@@ -2114,22 +2224,55 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             archive_spreadsheet = authorize_gspread(args.google_credentials).open_by_key(archive_sheet_id)
         except Exception as exc:
             log(f"Historical archive spreadsheet unavailable; operational cleanup will be skipped: {exc}")
+
     if args.source == "google" and not args.dry_run:
-        updated_row_count = 0
+        # ── Full-sheet overwrite path ─────────────────────────────────────────
+        # For every symbol: overwrite the ENTIRE TEST worksheet with the latest
+        # FE output + fresh model predictions, then archive excess rows to TRAIN.
+        # No partial appends, no silent skips, no stale data.
+        overwrite_row_count = 0
         for part in parts:
+            ef = part.engineered_frame
+            if ef is None or part.worksheet is None:
+                msg = (
+                    f"{part.symbol}: skipping sheet overwrite "
+                    f"(engineered_frame={'None' if ef is None else 'ok'}, "
+                    f"worksheet={'None' if part.worksheet is None else 'ok'})"
+                )
+                skipped.append(msg)
+                sheet_update_errors.append({"worksheet": part.symbol, "error": msg})
+                log(msg)
+                continue
+
+            # Determine forecast horizon from the actual row_forecasts data
+            _fh = 5  # default
+            if part.row_forecasts:
+                _first_vals = next(iter(part.row_forecasts.values()), [])
+                _fh = len(_first_vals) if _first_vals else _fh
+
             try:
-                part_updated_count = update_google_predictions(part)
+                rows_written = overwrite_worksheet_with_engineered_data(
+                    part.worksheet,
+                    ef,
+                    part.row_predictions,
+                    part.row_forecasts,
+                    forecast_horizon=_fh,
+                    dry_run=False,
+                )
+                overwrite_row_count += rows_written
+                log(
+                    f"Overwrote Google worksheet {part.symbol}: "
+                    f"rows={rows_written}, predictions={len(part.row_predictions)}"
+                )
+                sheet_updates_written = True
             except Exception as exc:
-                message = f"{part.symbol}: sheet update failed: {exc}"
+                message = f"{part.symbol}: full-sheet overwrite failed: {exc}"
                 skipped.append(message)
                 sheet_update_errors.append({"worksheet": part.symbol, "error": str(exc)})
                 log(message)
                 continue
 
-            updated_row_count += part_updated_count
-            if part_updated_count <= 0:
-                continue
-
+            # ── Archive excess rows to TRAIN sheet (keep TEST ≤ 30 rows) ─────
             try:
                 archive_worksheet = (
                     find_worksheet_by_title(archive_spreadsheet, part.symbol)
@@ -2146,21 +2289,21 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 sheet_cleanup_results.append(cleanup_result)
                 if cleanup_result.get("status") == STATUS_OK:
                     log(
-                        f"Cleaned Google worksheet {part.symbol}: "
+                        f"Archived old rows for {part.symbol}: "
                         f"rows_deleted={cleanup_result.get('rows_deleted', 0)}"
                     )
                 else:
                     log(
-                        f"Skipped Google worksheet cleanup {part.symbol}: "
+                        f"Archive step skipped for {part.symbol}: "
                         f"{cleanup_result.get('reason', 'unknown')}"
                     )
             except Exception as exc:
                 cleanup_error = {"worksheet": part.symbol, "status": "error", "error": str(exc)}
                 sheet_cleanup_results.append(cleanup_error)
-                log(f"Google worksheet cleanup failed for {part.symbol}: {exc}")
-        sheet_updates_written = updated_row_count > 0
+                log(f"Archive step failed for {part.symbol}: {exc}")
+
     elif args.source == "google" and args.dry_run:
-        log("Dry run enabled: Google Sheet updates were not written")
+        log("Dry run enabled: Google Sheet overwrite was not executed")
 
     # Decision-layer feature sync: write the 11 categorical decision columns
     # into BOTH Google Sheets. This is isolated from forecasting — any failure

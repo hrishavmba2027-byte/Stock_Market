@@ -74,7 +74,14 @@ class GoogleSheetsService:
                     **context,
                 )
                 if attempt < self.settings.google_retries:
-                    time.sleep(self.settings.retry_backoff_seconds * attempt)
+                    # Exponential backoff with full jitter to avoid thundering-herd
+                    # when multiple workers hit the Sheets API simultaneously.
+                    # Formula: uniform(0, base * 2^(attempt-1)), capped at 60 s.
+                    import random
+                    cap = 60.0
+                    base = self.settings.retry_backoff_seconds
+                    ceiling = min(cap, base * (2 ** (attempt - 1)))
+                    time.sleep(random.uniform(0, ceiling))
         assert last_error is not None
         raise last_error
 

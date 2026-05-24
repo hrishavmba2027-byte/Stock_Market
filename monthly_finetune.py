@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 import Data_update
 import main as forecast
+from app.pipeline.metadata import get_or_create_metadata
 from app.services.sheet_archival import (
     DEFAULT_HISTORICAL_TRAINING_SHEET_ID,
     DEFAULT_OPERATIONAL_SHEET_ID,
@@ -656,7 +657,7 @@ def build_symbol_examples(
     source = frame.copy()
     source[forecast.SORT_POSITION_COL] = np.arange(len(source), dtype=np.int64)
     with contextlib.redirect_stdout(sys.stderr):
-        engineered = compute_indicators(source, "Date")
+        engineered = compute_indicators(source)
     engineered = forecast.normalize_columns(engineered)
     if forecast.SORT_POSITION_COL not in engineered.columns or forecast.TARGET_COL not in engineered.columns:
         summary = SymbolDatasetSummary(
@@ -1119,7 +1120,7 @@ def run_monthly_finetune(args: argparse.Namespace) -> Dict[str, Any]:
     model_dir = Path(args.model_dir)
     state_path = Path(args.state_file)
     state, state_status = load_finetune_state(state_path)
-    metadata = forecast.load_json(metadata_path)
+    metadata = get_or_create_metadata(metadata_path)
     forecast.validate_metadata(metadata)
     device = forecast.choose_device(args.device)
     log(f"Device: {device}")

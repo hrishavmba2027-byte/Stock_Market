@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-05-22T20:28:08.624080+00:00",
+  "last_modified_at": "2026-05-22T20:28:08.626709+00:00",
+  "pipeline_version": "1.0.0",
+  "feature_engineering_version": "1.0.0",
+  "feature_columns": [
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume",
+    "RSI_14",
+    "MACD_12_26",
+    "MACD_Signal_9",
+    "MACD_Histogram",
+    "Stochastic_%K",
+    "Stochastic_%D",
+    "SMA_5",
+    "SMA_20",
+    "SMA_50",
+    "EMA_12",
+    "EMA_26",
+    "EMA_50",
+    "ADX_14",
+    "BB_Upper_20",
+    "BB_Middle_20",
+    "BB_Lower_20",
+    "ATR_14",
+    "OBV",
+    "VWAP",
+    "Daily_Return_%",
+    "Log_Return_%",
+    "ROC_12",
+    "Williams_%R",
+    "CCI_20"
+  ],
+  "seq_len": 20,
+  "feature_count": 29,
+  "dense_input_size": 580,
+  "horizons": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "quantiles": [
+    0.1,
+    0.5,
+    0.9
+  ],
+  "target_type": "multi_horizon_quantile_log_return",
+  "label_columns": [
+    "y_logret_h1",
+    "y_logret_h2",
+    "y_logret_h3",
+    "y_logret_h4",
+    "y_logret_h5",
+    "y_logret_h6",
+    "y_logret_h7",
+    "y_logret_h8",
+    "y_logret_h9",
+    "y_logret_h10",
+    "y_logret_h11",
+    "y_logret_h12",
+    "y_logret_h13",
+    "y_logret_h14",
+    "y_logret_h15",
+    "y_logret_h16",
+    "y_logret_h17",
+    "y_logret_h18",
+    "y_logret_h19",
+    "y_logret_h20",
+    "y_logret_h21",
+    "y_logret_h22",
+    "y_logret_h23",
+    "y_logret_h24",
+    "y_logret_h25",
+    "y_logret_h26",
+    "y_logret_h27",
+    "y_logret_h28",
+    "y_logret_h29",
+    "y_logret_h30",
+    "has_labels"
+  ],
+  "ensemble_weights": {
+    "Dense": 0.2,
+    "LSTM": 0.3,
+    "Transformer": 0.5
+  },
+  "model_capacity": {
+    "Dense": {
+      "hidden_size": 128
+    },
+    "LSTM": {
+      "hidden_size": 64,
+      "num_layers": 2
+    },
+    "Transformer": {
+      "hidden_size": 128,
+      "num_heads": 4,
+      "num_layers": 2
+    }
+  },
+  "last_successful_run": null,
+  "last_run_status": null,
+  "last_run_at": null,
+  "run_count": 0,
+  "worksheet_state": {},
+  "trained_at": null,
+  "training_data_start": null,
+  "training_data_end": null,
+  "model_files": {
+    "Dense": "outputs/Saved_Models/Dense.pt",
+    "LSTM": "outputs/Saved_Models/LSTM.pt",
+    "Transformer": "outputs/Saved_Models/Transformer.pt"
+  }
+}
