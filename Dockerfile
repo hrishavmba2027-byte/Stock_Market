@@ -63,7 +63,7 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
 
 # Application code — everything we need at runtime.
 # Top-level scripts:
-COPY app.py app_data.py main.py Data_update.py Feature_Engineering.py ./
+COPY app.py app_data.py main.py Data_update.py Feature_Engineering.py monthly_finetune.py ./
 # Top-level Python packages added in P1:
 COPY app ./app
 COPY ingestion ./ingestion

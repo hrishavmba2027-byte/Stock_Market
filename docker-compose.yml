@@ -1,124 +1,77 @@
 # =============================================================================
 # Stock Market ML Automation — docker-compose.yml
-# Recreated 2026-05-23
 #
 # Services:
-#   api      — FastAPI + Uvicorn server (port 8000).  Primary entry point.
+#   api      — FastAPI + Uvicorn server (port 8000). Primary entry point.
 #   watcher  — Google Sheets polling daemon. Calls the API when it detects
-#              new data rows; runs in the same image, different command.
+#              new data; runs in the same image with a different command.
+#   pipeline — One-shot runner for ingestion / fine-tuning (opt-in via
+#              --profile tools). Never started by plain `docker compose up`.
 #
-# All three services share the same image — built once, reused — so
-# `requirements.txt` is installed exactly once at build time.
+# Only `api` has a `build:` block. `watcher` and `pipeline` inherit the same
+# image tag and skip the build step — BuildKit's parallel builder would race
+# to tag the same image twice and fail the second one otherwise.
+#
+# Volume strategy for outputs/:
+#   outputs/Saved_Models  -> baked into the image by the Dockerfile COPY step.
+#                            NOT bind-mounted so image weights are never
+#                            shadowed by an empty host directory.
+#   outputs/main_inference, outputs/plots, outputs/pipeline_metadata.json
+#                         -> bind-mounted so results survive container restarts.
+# =============================================================================
 
+# ---------------------------------------------------------------------------
+# Shared base — inherited by all three services via YAML anchor merge (<<:).
+# ---------------------------------------------------------------------------
 x-app-shared: &app-shared
-  # Only the `api` service overrides this with a real `build:` block. Every
-  # other service inherits the same image tag and skips the build step —
-  # otherwise BuildKit's parallel builder races to tag the same image twice
-  # and fails the second one with "image already exists".
   image: stock-market-automation:local
   working_dir: /app
-  # .env is the single source of truth for secrets and config. Container-path
-  # overrides live in `environment:` below.
   env_file:
     - .env
   environment:
-    # These override anything in .env so the container always sees container
-    # paths regardless of what the host .env contains.
     PYTHONPATH: /app
     BASE_DIR: /app
-    GOOGLE_CREDENTIALS: /app/credentials/service-account.json
-    GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/service-account.json
+    GOOGLE_CREDENTIALS: /app/credentials/Credentials_New.json
+    GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/Credentials_New.json
     WORKFLOW_STATE_PATH: /app/state/workflow_state.json
+    MONTHLY_FINETUNE_STATE_FILE: /app/state/monthly_finetune_state.json
     LOGS_DIR: /app/logs
     OUTPUTS_DIR: /app/outputs
     OUTPUT_DIR: /app/outputs/main_inference
     MODEL_DIR: /app/outputs/Saved_Models
     METADATA_PATH: /app/outputs/pipeline_metadata.json
     HF_HOME: /app/.cache/huggingface
-    DEVICE: auto
+    DEVICE: cpu
+    API_BASE_URL: http://api:8000
   volumes:
-    # Code/data persistence:
+    - ./credentials/Credentials_New.json:/app/credentials/Credentials_New.json:ro
     - ./logs:/app/logs
-    - ./outputs:/app/outputs
     - ./state:/app/state
     - ./Data:/app/Data
-    # Caches kept outside the image so reinstalls don't redownload FinBERT:
+    - ./outputs/main_inference:/app/outputs/main_inference
+    - ./outputs/plots:/app/outputs/plots
+    - ./outputs/pipeline_metadata.json:/app/outputs/pipeline_metadata.json
     - hf-cache:/app/.cache/huggingface
-    # Service-account JSON, mounted read-only at the path the env vars expect.
-    # The host filename is whatever GCP gave you; set CREDENTIALS_FILE in .env
-    # to point at it (defaults to "service-account.json" if unset).
-    - ./credentials/${CREDENTIALS_FILE:-service-account.json}:/app/credentials/service-account.json:ro
+
+# ---------------------------------------------------------------------------
 services:
 
-  # ---------------------------------------------------------------------------
-  # API service — FastAPI / Uvicorn (uvicorn app_data:app ...)
-  # ---------------------------------------------------------------------------
+  # -- API -------------------------------------------------------------------
   api:
+    <<: *app-shared
     build:
       context: .
       dockerfile: Dockerfile
-    image: stock-market-app:latest
-    container_name: stock-market-api
+    container_name: stock_market_api
     restart: unless-stopped
-
     ports:
       - "8000:8000"
-
-    env_file:
-      - .env
-
-    # Override the few vars whose values differ inside Docker vs. on the host.
-    # All other settings come from .env above.
-    environment:
-      # Credentials path — absolute macOS path in .env → container path here
-      GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/Credentials_New.json
-      GOOGLE_CREDENTIALS: /app/credentials/Credentials_New.json
-
-      # Service-discovery: watcher must call the API container by service name
-      API_BASE_URL: http://api:8000
-
-      # Move workflow state into the persisted state/ bind-mount so it
-      # survives `docker compose down` (default is /app/workflow_state.json)
-      WORKFLOW_STATE_PATH: /app/state/workflow_state.json
-      MONTHLY_FINETUNE_STATE_FILE: /app/state/monthly_finetune_state.json
-
-      # Force CPU — no GPU inside Docker Desktop on macOS
-      DEVICE: cpu
-
-    volumes:
-      # --- Secrets / credentials (read-only inside container) ----------------
-      - ./credentials:/app/credentials:ro
-
-      # --- Persisted runtime outputs (write-able) ----------------------------
-      # logs/ keeps app.log, error.log across restarts
-      - ./logs:/app/logs
-      # outputs/ sub-dirs for inference artefacts, plots, metrics, etc.
-      # NOTE: outputs/Saved_Models is baked into the image by the Dockerfile
-      #       (COPY outputs/Saved_Models ./outputs/Saved_Models) and is NOT
-      #       mounted here to avoid overwriting model weights.
-      - ./outputs/main_inference:/app/outputs/main_inference
-      - ./outputs/plots:/app/outputs/plots
-      # pipeline_metadata.json is the model-contract file. Mount it explicitly
-      # so it persists across container restarts and is shared between api and
-      # watcher (both read it; the api subprocess also writes it after runs).
-      - ./outputs/pipeline_metadata.json:/app/outputs/pipeline_metadata.json
-
-      # --- Source data (read-write so ingest jobs can update xlsx/parquet) ---
-      - ./Data:/app/Data
-
-      # --- State files (workflow_state.json, monthly_finetune_state.json) ----
-      - ./state:/app/state
-    working_dir: /app
-
-    # Dockerfile already defines a HEALTHCHECK; keep it here for compose
-    # so `depends_on: condition: service_healthy` works in the watcher.
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       start_period: 45s
       retries: 5
-
     command:
       - uvicorn
       - "app_data:app"
@@ -129,39 +82,15 @@ services:
       - "--log-level"
       - "info"
 
-  # ---------------------------------------------------------------------------
-  # Watcher service — polls Google Sheets, POSTs to api /run on changes
-  # ---------------------------------------------------------------------------
+  # -- Watcher ---------------------------------------------------------------
   watcher:
-    # Reuse the image built for the api service (no second build step).
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: stock-market-app:latest
-    container_name: stock-market-watcher
+    <<: *app-shared
+    container_name: stock_market_watcher
     restart: unless-stopped
-
     depends_on:
       api:
         condition: service_healthy
-
-    env_file:
-      - .env
-
-    environment:
-      GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/Credentials_New.json
-      GOOGLE_CREDENTIALS: /app/credentials/Credentials_New.json
-      API_BASE_URL: http://api:8000
-      WORKFLOW_STATE_PATH: /app/state/workflow_state.json
-      MONTHLY_FINETUNE_STATE_FILE: /app/state/monthly_finetune_state.json
-      DEVICE: cpu
-
-    volumes:
-      - ./credentials:/app/credentials:ro
-      - ./logs:/app/logs
-      - ./state:/app/state
-    working_dir: /app
-    restart: unless-stopped
+    command: python -m app.watcher.service
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; data=open('/proc/1/cmdline','rb').read(); sys.exit(0 if b'app.watcher.service' in data else 1)"]
       interval: 30s
@@ -169,32 +98,18 @@ services:
       retries: 3
       start_period: 30s
 
-  # One-shot runner for ingestion / collection / fine-tuning. Not started by
-  # `docker compose up`; opt-in with --profile tools.
-  #
-  # Usage pattern:
-  #   docker compose --profile tools run --rm pipeline <full-command>
-  #
-  # Common invocations:
-  #   docker compose --profile tools run --rm pipeline python -m ingestion.collect_all
-  #   docker compose --profile tools run --rm pipeline python -m ingestion.collect_all --no-sentiment
-  #   docker compose --profile tools run --rm pipeline python -m ingestion.collect_all --tickers RELIANCE,TCS
-  #   docker compose --profile tools run --rm pipeline python -m ingestion.news_ingest
-  #   docker compose --profile tools run --rm pipeline python -m ingestion.reddit_ingest
-  #   docker compose --profile tools run --rm pipeline python -m ingestion.x_ingest
-  #   docker compose --profile tools run --rm pipeline python -m ingestion.fundamentals --lookback-quarters 4
-  #   docker compose --profile tools run --rm pipeline python -m features.cross_sectional
-  #   docker compose --profile tools run --rm pipeline python -m features.sentiment
-  #   docker compose --profile tools run --rm pipeline python Data_update.py
-  #   docker compose --profile tools run --rm pipeline python monthly_finetune.py --dry-run
-  #   docker compose --profile tools run --rm pipeline pytest -q
+  # -- Pipeline (opt-in, one-shot) -------------------------------------------
+  # docker compose --profile tools run --rm pipeline python -m ingestion.collect_all
+  # docker compose --profile tools run --rm pipeline python monthly_finetune.py --dry-run
+  # docker compose --profile tools run --rm pipeline python Data_update.py
+  # docker compose --profile tools run --rm pipeline pytest -q
   pipeline:
     <<: *app-shared
     container_name: stock_market_pipeline
     profiles: ["tools"]
-    entrypoint: []          # No default entrypoint — caller provides the full command.
-    # No `restart:` — this service is meant to be invoked ad-hoc and exit.
+    entrypoint: []
 
+# ---------------------------------------------------------------------------
 volumes:
   hf-cache:
     name: stock-market-hf-cache

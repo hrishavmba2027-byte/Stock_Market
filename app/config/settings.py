@@ -15,7 +15,10 @@ except ImportError:  # pragma: no cover - dependency is installed in Docker
         return False
 
 
-load_dotenv()
+# override=True ensures the project's .env always wins over any shell-level
+# env vars set by other projects (e.g. a GOOGLE_APPLICATION_CREDENTIALS export
+# in .zshrc that points at a different project's credentials file).
+load_dotenv(override=True)
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]

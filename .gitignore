@@ -30,6 +30,7 @@ stock-prices-*.json
 
 outputs/*
 !outputs/pipeline_metadata.json
+state/*
 
 
 # ---------------------------------------------------------------------------

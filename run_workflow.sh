@@ -122,25 +122,30 @@ cmd_run_api() {
   wait_for_api
 
   # Build JSON payload
-  local worksheets_json="[]"
-  if [[ -n "$STOCK" ]]; then
-    # Convert "RELIANCE,TCS" → ["RELIANCE","TCS"]
-    worksheets_json=$(echo "$STOCK" | python3 -c "
-import sys, json
-parts = [s.strip() for s in sys.stdin.read().split(',') if s.strip()]
-print(json.dumps(parts))
-")
-  fi
+  # NOTE: Never interpolate shell booleans/variables directly into Python source
+  # as Python literals — bash `false` ≠ Python `False`.  Instead, pass all
+  # dynamic values as environment variables and decode them inside Python.
+  local worksheets_csv="${STOCK:-}"
+  local force_flag="${FORCE}"   # bash string: "true" or "false"
 
   local payload
-  payload=$(python3 -c "
-import json
+  payload=$(
+    WORKSHEETS_CSV="${worksheets_csv}" \
+    FORCE_FLAG="${force_flag}" \
+    python3 - <<'PYEOF'
+import json, os
+
+csv = os.environ.get("WORKSHEETS_CSV", "").strip()
+worksheets = [s.strip() for s in csv.split(",") if s.strip()] if csv else []
+force = os.environ.get("FORCE_FLAG", "false").lower() == "true"
+
 print(json.dumps({
-    'worksheets': ${worksheets_json},
-    'force': $(echo $FORCE | tr '[:upper:]' '[:lower:]'),
-    'reason': 'manual_run_script',
+    "worksheets": worksheets,
+    "force": force,
+    "reason": "manual_run_script",
 }))
-")
+PYEOF
+  )
 
   info "Payload: ${payload}"
   info "POST ${API_URL}/run"

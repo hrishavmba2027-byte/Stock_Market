@@ -5,6 +5,8 @@ import math
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+
 import pandas as pd
 
 from app.langchain.chain import build_prediction_write_chain
@@ -28,6 +30,176 @@ FORECAST_CLOSE_PREFIX = "Forecast_Close_T+"
 
 def forecast_close_columns() -> List[str]:
     return [f"{FORECAST_CLOSE_PREFIX}{horizon}" for horizon in range(1, 31)]
+
+
+# ---------------------------------------------------------------------------
+# Internal constants
+# ---------------------------------------------------------------------------
+_OVERWRITE_INTERNAL_COLS = {"__sheet_row_number", "__sort_position", "has_labels"}
+_OVERWRITE_FORWARD_LABEL_PREFIX = "y_logret_h"
+_OVERWRITE_NULL_VALUES = {"nan", "none", "nat", "inf", "-inf", ""}
+
+
+def _clean_cell_for_sheets(value: Any) -> Any:
+    """Convert a value to something safe for Google Sheets API."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and not math.isfinite(value):
+        return ""
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return "" if not np.isfinite(value) else float(value)
+    if isinstance(value, bool):
+        return int(value)  # 0 / 1 rather than True / False
+    text = str(value).strip()
+    return "" if text.lower() in _OVERWRITE_NULL_VALUES else value
+
+
+def overwrite_worksheet_with_engineered_data(
+    worksheet: Any,
+    engineered_frame: "pd.DataFrame",
+    row_predictions: Dict[int, float],
+    row_forecasts: Optional[Dict[int, List[float]]],
+    *,
+    dry_run: bool = False,
+    forecast_horizon: int = 5,
+) -> int:
+    """Full-sheet overwrite: clear the worksheet and rewrite it with the
+    complete feature-engineered data plus the latest model predictions.
+
+    Every call:
+      1. Merges ``row_predictions`` / ``row_forecasts`` back into the
+         engineered DataFrame using ``__sheet_row_number``.
+      2. Strips internal tracking columns and forward-label columns.
+      3. Clears the worksheet (header + all data).
+      4. Writes the header row + all data rows atomically via a single
+         ``worksheet.update()`` call.
+
+    Parameters
+    ----------
+    worksheet:
+        A ``gspread.Worksheet`` object.
+    engineered_frame:
+        Full-row DataFrame produced by ``compute_indicators()`` (forward
+        labels already dropped, internal columns still present).
+    row_predictions:
+        Mapping of original sheet row-number → predicted Close price.
+    row_forecasts:
+        Optional mapping of sheet row-number → list of horizon forecasts.
+    dry_run:
+        When True, skip all Sheets API calls and return the row count.
+    forecast_horizon:
+        Number of ``Forecast_Close_T+N`` columns to write.
+
+    Returns
+    -------
+    int
+        Number of data rows written to the sheet.
+    """
+    import pandas as pd  # local import — already a project dependency
+
+    logger = get_logger(__name__)
+    worksheet_title = str(getattr(worksheet, "title", ""))
+
+    df = engineered_frame.copy().reset_index(drop=True)
+    row_forecasts = row_forecasts or {}
+
+    # ── Retrieve original sheet-row numbers before stripping them ───────────
+    _SROW = "__sheet_row_number"
+    if _SROW in df.columns:
+        row_nums: List[int] = [
+            int(v) if pd.notna(v) else 0
+            for v in df[_SROW].tolist()
+        ]
+    else:
+        row_nums = list(range(2, len(df) + 2))
+
+    # ── Ensure output columns exist ─────────────────────────────────────────
+    if "predicted" not in df.columns:
+        df["predicted"] = 0
+    if "Predicted_Close_Price" not in df.columns:
+        df["Predicted_Close_Price"] = ""
+
+    forecast_cols = [f"Forecast_Close_T+{h}" for h in range(1, forecast_horizon + 1)]
+    for col in forecast_cols:
+        if col not in df.columns:
+            df[col] = ""
+
+    # ── Merge predictions by original sheet-row number ───────────────────────
+    pred_idx = df.columns.get_loc("predicted")
+    price_idx = df.columns.get_loc("Predicted_Close_Price")
+    fc_idxs = [df.columns.get_loc(c) for c in forecast_cols]
+
+    rows_with_predictions = 0
+    for i, sheet_row in enumerate(row_nums):
+        if sheet_row in row_predictions:
+            df.iat[i, pred_idx] = 1
+            df.iat[i, price_idx] = round(float(row_predictions[sheet_row]), 6)
+            rows_with_predictions += 1
+            if sheet_row in row_forecasts:
+                fvals = row_forecasts[sheet_row]
+                for h_idx, fc_idx in enumerate(fc_idxs):
+                    if h_idx < len(fvals) and math.isfinite(float(fvals[h_idx])):
+                        df.iat[i, fc_idx] = round(float(fvals[h_idx]), 6)
+
+    # ── Drop internal / forward-label columns ───────────────────────────────
+    drop_cols = [
+        c for c in df.columns
+        if c in _OVERWRITE_INTERNAL_COLS
+        or str(c).startswith(_OVERWRITE_FORWARD_LABEL_PREFIX)
+    ]
+    df = df.drop(columns=drop_cols, errors="ignore")
+
+    # ── Build list-of-lists for the Sheets API ───────────────────────────────
+    headers = list(df.columns)
+    data_rows: List[List[Any]] = [
+        [_clean_cell_for_sheets(v) for v in row]
+        for row in df.itertuples(index=False, name=None)
+    ]
+    all_values = [headers] + data_rows
+    total_rows = len(data_rows)
+
+    log_event(
+        logger,
+        logging.INFO,
+        "worksheet_overwrite_prepared",
+        "Full-sheet overwrite prepared",
+        worksheet=worksheet_title,
+        total_rows=total_rows,
+        rows_with_predictions=rows_with_predictions,
+        columns=len(headers),
+        dry_run=dry_run,
+    )
+
+    if dry_run:
+        return total_rows
+
+    # ── Atomic clear + write ─────────────────────────────────────────────────
+    try:
+        worksheet.clear()
+        worksheet.update(all_values, "A1")
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.ERROR,
+            "worksheet_overwrite_failed",
+            "Full-sheet overwrite failed",
+            worksheet=worksheet_title,
+            error=str(exc),
+        )
+        raise
+
+    log_event(
+        logger,
+        logging.INFO,
+        "worksheet_overwritten",
+        "Full-sheet overwrite complete",
+        worksheet=worksheet_title,
+        rows_written=total_rows,
+        rows_with_predictions=rows_with_predictions,
+    )
+    return total_rows
 
 
 def column_number_to_letter(number: int) -> str:
