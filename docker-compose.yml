@@ -52,8 +52,10 @@ x-app-shared: &app-shared
     - ./outputs/plots:/app/outputs/plots
     - ./outputs/pipeline_metadata.json:/app/outputs/pipeline_metadata.json
     - hf-cache:/app/.cache/huggingface
-
-# ---------------------------------------------------------------------------
+    # Service-account JSON, mounted read-only at the path the env vars expect.
+    # The host filename is whatever GCP gave you; set CREDENTIALS_FILE in .env
+    # to point at it (defaults to "service-account.json" if unset).
+    - ./credentials/${CREDENTIALS_FILE:-service-account.json}:/app/credentials/service-account.json:ro
 services:
 
   # -- API -------------------------------------------------------------------
@@ -66,6 +68,11 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+      - ./outputs:/app/outputs
+      - ./state:/app/state
+    working_dir: /app
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -90,6 +97,11 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - ./outputs:/app/outputs
+      - ./state:/app/state
+    working_dir: /app
     command: python -m app.watcher.service
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; data=open('/proc/1/cmdline','rb').read(); sys.exit(0 if b'app.watcher.service' in data else 1)"]
@@ -98,16 +110,31 @@ services:
       retries: 3
       start_period: 30s
 
-  # -- Pipeline (opt-in, one-shot) -------------------------------------------
-  # docker compose --profile tools run --rm pipeline python -m ingestion.collect_all
-  # docker compose --profile tools run --rm pipeline python monthly_finetune.py --dry-run
-  # docker compose --profile tools run --rm pipeline python Data_update.py
-  # docker compose --profile tools run --rm pipeline pytest -q
+  # One-shot runner for ingestion / collection / fine-tuning. Not started by
+  # `docker compose up`; opt-in with --profile tools.
+  #
+  # Usage pattern:
+  #   docker compose --profile tools run --rm pipeline <full-command>
+  #
+  # Common invocations:
+  #   docker compose --profile tools run --rm pipeline python -m ingestion.collect_all
+  #   docker compose --profile tools run --rm pipeline python -m ingestion.collect_all --no-sentiment
+  #   docker compose --profile tools run --rm pipeline python -m ingestion.collect_all --tickers RELIANCE,TCS
+  #   docker compose --profile tools run --rm pipeline python -m ingestion.news_ingest
+  #   docker compose --profile tools run --rm pipeline python -m ingestion.reddit_ingest
+  #   docker compose --profile tools run --rm pipeline python -m ingestion.x_ingest
+  #   docker compose --profile tools run --rm pipeline python -m ingestion.fundamentals --lookback-quarters 4
+  #   docker compose --profile tools run --rm pipeline python -m features.cross_sectional
+  #   docker compose --profile tools run --rm pipeline python -m features.sentiment
+  #   docker compose --profile tools run --rm pipeline python Data_update.py
+  #   docker compose --profile tools run --rm pipeline python monthly_finetune.py --dry-run
+  #   docker compose --profile tools run --rm pipeline pytest -q
   pipeline:
     <<: *app-shared
     container_name: stock_market_pipeline
     profiles: ["tools"]
-    entrypoint: []
+    entrypoint: []          # No default entrypoint — caller provides the full command.
+    # No `restart:` — this service is meant to be invoked ad-hoc and exit.
 
 # ---------------------------------------------------------------------------
 volumes:
