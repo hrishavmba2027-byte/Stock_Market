@@ -87,17 +87,16 @@ def deterministic_route(request: WorkflowRunRequest) -> WorkflowDecision:
             }
         )
 
-    # No specific event or worksheet list supplied — run a full refresh
-    # so that every run overwrites the TEST sheet with fresh FE + predictions.
+    # No actionable change, worksheet list, or force flag supplied.
     return _validate_decision(
         {
-            "route": RouteType.FULL_UPDATE,
+            "route": RouteType.SKIP,
             "worksheets": [],
-            "should_run": True,
-            "reason": "scheduled full-refresh run — all worksheets",
-            "noise": False,
-            "execution_mode": ExecutionMode.FULL,
-            "notification_level": NotificationLevel.SUCCESS,
+            "should_run": False,
+            "reason": request.reason or "no actionable changes",
+            "noise": True,
+            "execution_mode": ExecutionMode.SKIP,
+            "notification_level": NotificationLevel.NONE,
         }
     )
 
@@ -132,6 +131,14 @@ def validate_prediction_write(
             "row_number": row_number,
             "predicted_value": None,
             "reason": "prediction value is missing or invalid",
+        }
+    elif current_flag != 0.0:
+        payload = {
+            "should_write": False,
+            "worksheet": worksheet,
+            "row_number": row_number,
+            "predicted_value": numeric_prediction,
+            "reason": "row is already marked predicted",
         }
     else:
         payload = {

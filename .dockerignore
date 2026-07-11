@@ -6,6 +6,9 @@
 Data/
 notebooks/
 Notebooks/
+docs/
+scripts/
+*.md
 *.ipynb
 *.xlsx
 logs/

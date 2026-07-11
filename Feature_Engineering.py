@@ -6,7 +6,7 @@ This module provides two distinct modes of operation:
     ``compute_indicators(df)`` is imported directly by ``main.py``,
     ``monthly_finetune.py``, and other modules.  The function receives a
     single-symbol DataFrame already loaded from Google Sheets (or another
-    source), computes 29 technical indicators, attaches 30 forward-return
+    source), computes 32 technical indicators, attaches 30 forward-return
     labels, and returns the enriched DataFrame.  It never touches the
     filesystem.
 
@@ -42,7 +42,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from openpyxl import load_workbook
 
 warnings_module_available = False
 try:
@@ -53,6 +52,23 @@ except Exception:
     pass
 
 _log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Optional dependency: arch (GARCH estimation)
+# ---------------------------------------------------------------------------
+# Checked once at import time.  When arch is absent GARCH_Cond_Vol falls back
+# to EWMA — see compute_garch_vol().  The flag is exported so callers (e.g.
+# the training notebook) can record which regime was active in metadata.
+# ---------------------------------------------------------------------------
+try:
+    from arch import arch_model as _arch_model  # noqa: F401
+    ARCH_AVAILABLE: bool = True
+except ImportError:
+    ARCH_AVAILABLE = False
+    _log.warning(
+        "[FE] 'arch' package not found — GARCH_Cond_Vol will use EWMA fallback "
+        "for ALL series lengths. Install with: pip install 'arch>=6.0.0'"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -79,10 +95,9 @@ FORWARD_HORIZONS: Tuple[int, ...] = tuple(range(1, 31))   # h = 1, 2, …, 30
 FORWARD_LABEL_PREFIX = "y_logret_h"
 HAS_LABELS_COL = "has_labels"
 
-# Columns produced by compute_indicators that the model uses (29 total).
-# MFI_14 is intentionally excluded — it was computed historically but was never
-# added to pipeline_metadata.json feature_columns, so including it here
-# prevents a silent divergence between what FE produces and what the model reads.
+# Columns produced by compute_indicators that the model uses. The active
+# checkpoints are 32-feature models, and pipeline_metadata.json includes MFI_14,
+# so feature engineering must keep producing it for live inference.
 INDICATOR_COLUMNS: Tuple[str, ...] = (
     "RSI_14",
     "MACD_12_26", "MACD_Signal_9", "MACD_Histogram",
@@ -93,9 +108,13 @@ INDICATOR_COLUMNS: Tuple[str, ...] = (
     "BB_Upper_20", "BB_Middle_20", "BB_Lower_20",
     "ATR_14",
     "OBV", "VWAP",
+    "MFI_14",
     "Daily_Return_%", "Log_Return_%",
     "ROC_12", "CCI_20", "Williams_%R",
-)  # len = 24; plus 5 OHLCV = 29 total
+    "Realized_Vol_20",
+    "EWMA_Vol_30",
+    "GARCH_Cond_Vol",
+)  # len = 28; plus 4 raw OHLCV model columns = 32 total
 
 # Decision-layer categorical features (Google Sheets only — never model inputs)
 DECISION_FEATURE_COLUMNS = [
@@ -289,6 +308,32 @@ def compute_vwap(
         return pd.Series(np.nan, index=close.index)
 
 
+def compute_mfi(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    volume: pd.Series,
+    period: int = 14,
+) -> pd.Series:
+    """Money Flow Index, scaled 0-100.
+
+    Uses typical-price direction to split raw money flow into positive and
+    negative rolling sums. Flat windows are neutral rather than infinite.
+    """
+    typical_price = (high + low + close) / 3.0
+    raw_money_flow = typical_price * volume
+    direction = typical_price.diff()
+    positive_flow = raw_money_flow.where(direction > 0, 0.0)
+    negative_flow = raw_money_flow.where(direction < 0, 0.0)
+    positive_sum = positive_flow.rolling(period).sum()
+    negative_sum = negative_flow.rolling(period).sum().abs()
+    money_ratio = positive_sum / negative_sum.replace(0.0, np.nan)
+    mfi = 100.0 - (100.0 / (1.0 + money_ratio))
+    mfi = mfi.where(negative_sum != 0.0, 100.0)
+    mfi = mfi.where(~((positive_sum == 0.0) & (negative_sum == 0.0)), 50.0)
+    return mfi
+
+
 def compute_daily_return(close: pd.Series) -> pd.Series:
     return close.pct_change() * 100.0
 
@@ -320,6 +365,82 @@ def compute_williams_r(
     hh = high.rolling(period).max()
     ll = low.rolling(period).min()
     return -100.0 * ((hh - close) / (hh - ll))
+
+
+# ===========================================================================
+# Volatility indicators (GARCH-style conditional volatility family)
+# ===========================================================================
+
+def compute_realized_vol(log_returns: pd.Series, window: int = 20) -> pd.Series:
+    """Rolling realized volatility = rolling std of log returns.
+
+    Uses ``min_periods=max(2, window // 2)`` so a partial-but-meaningful
+    window still produces a value rather than NaN.
+    """
+    return log_returns.rolling(window, min_periods=max(2, window // 2)).std()
+
+
+def compute_ewma_vol(log_returns: pd.Series, span: int = 30) -> pd.Series:
+    """Exponentially weighted volatility = EWMA std of log returns.
+
+    Unlike a rolling std, ``ewm`` never requires a warm-up minimum, so it
+    works on any series length — including the short (~60-row) windows used
+    at inference time.
+    """
+    return log_returns.ewm(span=span, adjust=False).std()
+
+
+_GARCH_MIN_ROWS: int = 100  # minimum series length to attempt GARCH fitting
+
+
+def compute_garch_vol(log_returns: pd.Series, p: int = 1, q: int = 1) -> pd.Series:
+    """GARCH(1,1) conditional volatility with a deterministic EWMA fallback.
+
+    Regime selection (evaluated in order):
+    1. ``arch`` unavailable (ARCH_AVAILABLE=False) → EWMA(span=30).
+    2. Series has fewer than ``_GARCH_MIN_ROWS`` valid rows → EWMA(span=30).
+       This always applies during live inference (~60 rows).
+    3. GARCH fitting succeeds → in-sample conditional volatility / 100.
+    4. GARCH fitting raises any exception → EWMA(span=30).
+
+    Train/inference consistency note
+    ---------------------------------
+    During notebook training the full price history is available (≥1 000 rows),
+    so regime 3 is used when arch is installed.  During inference ``main.py``
+    passes only the live sheet (~60 rows), so regime 2 is always triggered.
+    To keep features consistent across training and inference the notebook
+    records which regime was active in ``pipeline_metadata.json`` under the
+    ``garch_mode`` key (``"garch"`` or ``"ewma"``).  When the notebook is run
+    without arch installed, both training and inference use ``"ewma"``.
+    """
+    ewma_fallback = log_returns.ewm(span=30, adjust=False).std()
+
+    if not ARCH_AVAILABLE:
+        # Warning was already emitted once at module import — don't repeat it.
+        return ewma_fallback
+
+    series = log_returns.dropna()
+    if len(series) < _GARCH_MIN_ROWS:
+        _log.debug(
+            "[FE] GARCH_Cond_Vol: series too short (%d < %d rows), using EWMA",
+            len(series), _GARCH_MIN_ROWS,
+        )
+        return ewma_fallback
+
+    try:
+        import warnings as _w
+        from arch import arch_model  # noqa: F811 — re-import is cheap here
+
+        scaled = series * 100.0  # arch expects % returns
+        gm = arch_model(scaled, vol="Garch", p=p, q=q, dist="Normal", rescale=False)
+        with _w.catch_warnings():
+            _w.simplefilter("ignore")
+            res = gm.fit(disp="off", show_warning=False)
+        cond_vol = (res.conditional_volatility / 100.0).reindex(log_returns.index)
+        return cond_vol
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("[FE] GARCH_Cond_Vol fitting failed (%s), falling back to EWMA", exc)
+        return ewma_fallback
 
 
 # ===========================================================================
@@ -515,7 +636,7 @@ def compute_decision_rsi_history(
 # ===========================================================================
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute 24 technical indicators + 30 forward-return labels for one symbol.
+    """Compute 28 technical indicators + 30 forward-return labels for one symbol.
 
     Parameters
     ----------
@@ -654,10 +775,24 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         _log.warning("[FE] VWAP failed: %s", exc)
 
     try:
+        indicators["MFI_14"] = compute_mfi(high_s, low_s, close_s, vol_s, 14).reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] MFI_14 failed: %s", exc)
+
+    try:
         indicators["Daily_Return_%"] = compute_daily_return(close_s).reset_index(drop=True)
         indicators["Log_Return_%"]   = compute_log_return(close_s).reset_index(drop=True)
     except Exception as exc:
         _log.warning("[FE] Return indicators failed: %s", exc)
+
+    # ── Volatility family (GARCH-style) — derived from the log-return series ──
+    try:
+        log_ret_series = indicators["Log_Return_%"]   # already in the function
+        indicators["Realized_Vol_20"] = compute_realized_vol(log_ret_series, 20).reset_index(drop=True)
+        indicators["EWMA_Vol_30"]     = compute_ewma_vol(log_ret_series, 30).reset_index(drop=True)
+        indicators["GARCH_Cond_Vol"]  = compute_garch_vol(log_ret_series).reset_index(drop=True)
+    except Exception as exc:
+        _log.warning("[FE] Volatility indicators failed: %s", exc)
 
     try:
         indicators["ROC_12"] = compute_roc(close_s, 12).reset_index(drop=True)

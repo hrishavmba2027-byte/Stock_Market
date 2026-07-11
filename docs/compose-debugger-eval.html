@@ -1,0 +1,1325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Eval Review</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@500;600&family=Lora:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js" integrity="sha384-EnyY0/GSHQGSxSgMwaIPzSESbqoOLSexfnSMN2AP+39Ckmn92stwABZynq1JyzdT" crossorigin="anonymous"></script>
+  <style>
+    :root {
+      --bg: #faf9f5;
+      --surface: #ffffff;
+      --border: #e8e6dc;
+      --text: #141413;
+      --text-muted: #b0aea5;
+      --accent: #d97757;
+      --accent-hover: #c4613f;
+      --green: #788c5d;
+      --green-bg: #eef2e8;
+      --red: #c44;
+      --red-bg: #fceaea;
+      --header-bg: #141413;
+      --header-text: #faf9f5;
+      --radius: 6px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Lora', Georgia, serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ---- Header ---- */
+    .header {
+      background: var(--header-bg);
+      color: var(--header-text);
+      padding: 1rem 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-shrink: 0;
+    }
+    .header h1 {
+      font-family: 'Poppins', sans-serif;
+      font-size: 1.25rem;
+      font-weight: 600;
+    }
+    .header .instructions {
+      font-size: 0.8rem;
+      opacity: 0.7;
+      margin-top: 0.25rem;
+    }
+    .header .progress {
+      font-size: 0.875rem;
+      opacity: 0.8;
+      text-align: right;
+    }
+
+    /* ---- Main content ---- */
+    .main {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1.5rem 2rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+
+    /* ---- Sections ---- */
+    .section {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      flex-shrink: 0;
+    }
+    .section-header {
+      font-family: 'Poppins', sans-serif;
+      padding: 0.75rem 1rem;
+      font-size: 0.75rem;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .section-body {
+      padding: 1rem;
+    }
+
+    /* ---- Config badge ---- */
+    .config-badge {
+      display: inline-block;
+      padding: 0.2rem 0.625rem;
+      border-radius: 9999px;
+      font-family: 'Poppins', sans-serif;
+      font-size: 0.6875rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      margin-left: 0.75rem;
+      vertical-align: middle;
+    }
+    .config-badge.config-primary {
+      background: rgba(33, 150, 243, 0.12);
+      color: #1976d2;
+    }
+    .config-badge.config-baseline {
+      background: rgba(255, 193, 7, 0.15);
+      color: #f57f17;
+    }
+
+    /* ---- Prompt ---- */
+    .prompt-text {
+      white-space: pre-wrap;
+      font-size: 0.9375rem;
+      line-height: 1.6;
+    }
+
+    /* ---- Outputs ---- */
+    .output-file {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .output-file + .output-file {
+      margin-top: 1rem;
+    }
+    .output-file-header {
+      padding: 0.5rem 0.75rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      font-family: 'SF Mono', SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .output-file-header .dl-btn {
+      font-size: 0.7rem;
+      color: var(--accent);
+      text-decoration: none;
+      cursor: pointer;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-weight: 500;
+      opacity: 0.8;
+    }
+    .output-file-header .dl-btn:hover {
+      opacity: 1;
+      text-decoration: underline;
+    }
+    .output-file-content {
+      padding: 0.75rem;
+      overflow-x: auto;
+    }
+    .output-file-content pre {
+      font-size: 0.8125rem;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: 'SF Mono', SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+    }
+    .output-file-content img {
+      max-width: 100%;
+      height: auto;
+      border-radius: 4px;
+    }
+    .output-file-content iframe {
+      width: 100%;
+      height: 600px;
+      border: none;
+    }
+    .output-file-content table {
+      border-collapse: collapse;
+      font-size: 0.8125rem;
+      width: 100%;
+    }
+    .output-file-content table td,
+    .output-file-content table th {
+      border: 1px solid var(--border);
+      padding: 0.375rem 0.5rem;
+      text-align: left;
+    }
+    .output-file-content table th {
+      background: var(--bg);
+      font-weight: 600;
+    }
+    .output-file-content .download-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.5rem 1rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 0.875rem;
+      cursor: pointer;
+    }
+    .output-file-content .download-link:hover {
+      background: var(--border);
+    }
+    .empty-state {
+      color: var(--text-muted);
+      font-style: italic;
+      padding: 2rem;
+      text-align: center;
+    }
+
+    /* ---- Feedback ---- */
+    .prev-feedback {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.625rem 0.75rem;
+      margin-top: 0.75rem;
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+    .prev-feedback-label {
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-bottom: 0.25rem;
+      color: var(--text-muted);
+    }
+    .feedback-textarea {
+      width: 100%;
+      min-height: 100px;
+      padding: 0.75rem;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: 0.9375rem;
+      line-height: 1.5;
+      resize: vertical;
+      color: var(--text);
+    }
+    .feedback-textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+    }
+    .feedback-status {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-top: 0.5rem;
+      min-height: 1.1em;
+    }
+
+    /* ---- Grades (collapsible) ---- */
+    .grades-toggle {
+      display: flex;
+      align-items: center;
+      cursor: pointer;
+      user-select: none;
+    }
+    .grades-toggle:hover {
+      color: var(--accent);
+    }
+    .grades-toggle .arrow {
+      margin-right: 0.5rem;
+      transition: transform 0.15s;
+      font-size: 0.75rem;
+    }
+    .grades-toggle .arrow.open {
+      transform: rotate(90deg);
+    }
+    .grades-content {
+      display: none;
+      margin-top: 0.75rem;
+    }
+    .grades-content.open {
+      display: block;
+    }
+    .grades-summary {
+      font-size: 0.875rem;
+      margin-bottom: 0.75rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .grade-badge {
+      display: inline-block;
+      padding: 0.125rem 0.5rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .grade-pass { background: var(--green-bg); color: var(--green); }
+    .grade-fail { background: var(--red-bg); color: var(--red); }
+    .assertion-list {
+      list-style: none;
+    }
+    .assertion-item {
+      padding: 0.625rem 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.8125rem;
+    }
+    .assertion-item:last-child { border-bottom: none; }
+    .assertion-status {
+      font-weight: 600;
+      margin-right: 0.5rem;
+    }
+    .assertion-status.pass { color: var(--green); }
+    .assertion-status.fail { color: var(--red); }
+    .assertion-evidence {
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      margin-top: 0.25rem;
+      padding-left: 1.5rem;
+    }
+
+    /* ---- View tabs ---- */
+    .view-tabs {
+      display: flex;
+      gap: 0;
+      padding: 0 2rem;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .view-tab {
+      font-family: 'Poppins', sans-serif;
+      padding: 0.625rem 1.25rem;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+      background: none;
+      color: var(--text-muted);
+      border-bottom: 2px solid transparent;
+      transition: all 0.15s;
+    }
+    .view-tab:hover { color: var(--text); }
+    .view-tab.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+    .view-panel { display: none; }
+    .view-panel.active { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
+
+    /* ---- Benchmark view ---- */
+    .benchmark-view {
+      padding: 1.5rem 2rem;
+      overflow-y: auto;
+      flex: 1;
+    }
+    .benchmark-table {
+      border-collapse: collapse;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 0.8125rem;
+      width: 100%;
+      margin-bottom: 1.5rem;
+    }
+    .benchmark-table th, .benchmark-table td {
+      padding: 0.625rem 0.75rem;
+      text-align: left;
+      border: 1px solid var(--border);
+    }
+    .benchmark-table th {
+      font-family: 'Poppins', sans-serif;
+      background: var(--header-bg);
+      color: var(--header-text);
+      font-weight: 500;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .benchmark-table tr:hover { background: var(--bg); }
+    .benchmark-table tr.benchmark-row-with { background: rgba(33, 150, 243, 0.06); }
+    .benchmark-table tr.benchmark-row-without { background: rgba(255, 193, 7, 0.06); }
+    .benchmark-table tr.benchmark-row-with:hover { background: rgba(33, 150, 243, 0.12); }
+    .benchmark-table tr.benchmark-row-without:hover { background: rgba(255, 193, 7, 0.12); }
+    .benchmark-table tr.benchmark-row-avg { font-weight: 600; border-top: 2px solid var(--border); }
+    .benchmark-table tr.benchmark-row-avg.benchmark-row-with { background: rgba(33, 150, 243, 0.12); }
+    .benchmark-table tr.benchmark-row-avg.benchmark-row-without { background: rgba(255, 193, 7, 0.12); }
+    .benchmark-delta-positive { color: var(--green); font-weight: 600; }
+    .benchmark-delta-negative { color: var(--red); font-weight: 600; }
+    .benchmark-notes {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem;
+    }
+    .benchmark-notes h3 {
+      font-family: 'Poppins', sans-serif;
+      font-size: 0.875rem;
+      margin-bottom: 0.75rem;
+    }
+    .benchmark-notes ul {
+      list-style: disc;
+      padding-left: 1.25rem;
+    }
+    .benchmark-notes li {
+      font-size: 0.8125rem;
+      line-height: 1.6;
+      margin-bottom: 0.375rem;
+    }
+    .benchmark-empty {
+      color: var(--text-muted);
+      font-style: italic;
+      text-align: center;
+      padding: 3rem;
+    }
+
+    /* ---- Navigation ---- */
+    .nav {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 1rem 2rem;
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0;
+    }
+    .nav-btn {
+      font-family: 'Poppins', sans-serif;
+      padding: 0.5rem 1.25rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      cursor: pointer;
+      font-size: 0.875rem;
+      font-weight: 500;
+      color: var(--text);
+      transition: all 0.15s;
+    }
+    .nav-btn:hover:not(:disabled) {
+      background: var(--bg);
+      border-color: var(--text-muted);
+    }
+    .nav-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    .done-btn {
+      font-family: 'Poppins', sans-serif;
+      padding: 0.5rem 1.5rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: all 0.15s;
+    }
+    .done-btn:hover {
+      background: var(--bg);
+      border-color: var(--text-muted);
+    }
+    .done-btn.ready {
+      border: none;
+      background: var(--accent);
+      color: white;
+      font-weight: 600;
+    }
+    .done-btn.ready:hover {
+      background: var(--accent-hover);
+    }
+    /* ---- Done overlay ---- */
+    .done-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.5);
+      z-index: 100;
+      justify-content: center;
+      align-items: center;
+    }
+    .done-overlay.visible {
+      display: flex;
+    }
+    .done-card {
+      background: var(--surface);
+      border-radius: 12px;
+      padding: 2rem 3rem;
+      text-align: center;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      max-width: 500px;
+    }
+    .done-card h2 {
+      font-size: 1.5rem;
+      margin-bottom: 0.5rem;
+    }
+    .done-card p {
+      color: var(--text-muted);
+      margin-bottom: 1.5rem;
+      line-height: 1.5;
+    }
+    .done-card .btn-row {
+      display: flex;
+      gap: 0.5rem;
+      justify-content: center;
+    }
+    .done-card button {
+      padding: 0.5rem 1.25rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      cursor: pointer;
+      font-size: 0.875rem;
+    }
+    .done-card button:hover {
+      background: var(--bg);
+    }
+    /* ---- Toast ---- */
+    .toast {
+      position: fixed;
+      bottom: 5rem;
+      left: 50%;
+      transform: translateX(-50%);
+      background: var(--header-bg);
+      color: var(--header-text);
+      padding: 0.625rem 1.25rem;
+      border-radius: var(--radius);
+      font-size: 0.875rem;
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+      z-index: 200;
+    }
+    .toast.visible {
+      opacity: 1;
+    }
+  </style>
+</head>
+<body>
+  <div id="app" style="height:100vh; display:flex; flex-direction:column;">
+    <div class="header">
+      <div>
+        <h1>Eval Review: <span id="skill-name"></span></h1>
+        <div class="instructions">Review each output and leave feedback below. Navigate with arrow keys or buttons. When done, copy feedback and paste into Claude Code.</div>
+      </div>
+      <div class="progress" id="progress"></div>
+    </div>
+
+    <!-- View tabs (only shown when benchmark data exists) -->
+    <div class="view-tabs" id="view-tabs" style="display:none;">
+      <button class="view-tab active" onclick="switchView('outputs')">Outputs</button>
+      <button class="view-tab" onclick="switchView('benchmark')">Benchmark</button>
+    </div>
+
+    <!-- Outputs panel (qualitative review) -->
+    <div class="view-panel active" id="panel-outputs">
+    <div class="main">
+      <!-- Prompt -->
+      <div class="section">
+        <div class="section-header">Prompt <span class="config-badge" id="config-badge" style="display:none;"></span></div>
+        <div class="section-body">
+          <div class="prompt-text" id="prompt-text"></div>
+        </div>
+      </div>
+
+      <!-- Outputs -->
+      <div class="section">
+        <div class="section-header">Output</div>
+        <div class="section-body" id="outputs-body">
+          <div class="empty-state">No output files found</div>
+        </div>
+      </div>
+
+      <!-- Previous Output (collapsible) -->
+      <div class="section" id="prev-outputs-section" style="display:none;">
+        <div class="section-header">
+          <div class="grades-toggle" onclick="togglePrevOutputs()">
+            <span class="arrow" id="prev-outputs-arrow">&#9654;</span>
+            Previous Output
+          </div>
+        </div>
+        <div class="grades-content" id="prev-outputs-content"></div>
+      </div>
+
+      <!-- Grades (collapsible) -->
+      <div class="section" id="grades-section" style="display:none;">
+        <div class="section-header">
+          <div class="grades-toggle" onclick="toggleGrades()">
+            <span class="arrow" id="grades-arrow">&#9654;</span>
+            Formal Grades
+          </div>
+        </div>
+        <div class="grades-content" id="grades-content"></div>
+      </div>
+
+      <!-- Feedback -->
+      <div class="section">
+        <div class="section-header">Your Feedback</div>
+        <div class="section-body">
+          <textarea
+            class="feedback-textarea"
+            id="feedback"
+            placeholder="What do you think of this output? Any issues, suggestions, or things that look great?"
+          ></textarea>
+          <div class="feedback-status" id="feedback-status"></div>
+          <div class="prev-feedback" id="prev-feedback" style="display:none;">
+            <div class="prev-feedback-label">Previous feedback</div>
+            <div id="prev-feedback-text"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="nav" id="outputs-nav">
+      <button class="nav-btn" id="prev-btn" onclick="navigate(-1)">&#8592; Previous</button>
+      <button class="done-btn" id="done-btn" onclick="showDoneDialog()">Submit All Reviews</button>
+      <button class="nav-btn" id="next-btn" onclick="navigate(1)">Next &#8594;</button>
+    </div>
+    </div><!-- end panel-outputs -->
+
+    <!-- Benchmark panel (quantitative stats) -->
+    <div class="view-panel" id="panel-benchmark">
+      <div class="benchmark-view" id="benchmark-content">
+        <div class="benchmark-empty">No benchmark data available. Run a benchmark to see quantitative results here.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Done overlay -->
+  <div class="done-overlay" id="done-overlay">
+    <div class="done-card">
+      <h2>Review Complete</h2>
+      <p>Your feedback has been saved. Go back to your Claude Code session and tell Claude you're done reviewing.</p>
+      <div class="btn-row">
+        <button onclick="closeDoneDialog()">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast"></div>
+
+  <script>
+    // ---- Embedded data (injected by generate_review.py) ----
+    const EMBEDDED_DATA = {"skill_name": "docker-compose-debugger", "runs": [{"id": "eval-0-duplicate-restart-with_skill", "prompt": "Fix docker-compose.yml with duplicate restart key in worker service after PR merge", "eval_id": 0, "outputs": [{"name": "analysis.md", "type": "text", "content": "# Docker Compose Debug Analysis\n\n## Root Cause\n\nThe YAML parse error was caused by a **duplicate `restart` key** in the `worker` service block. After the PR merge, `restart: unless-stopped` appeared twice in the same service mapping \u2014 once at line 31 and again at line 47.\n\n## Problem Table\n\n| Problem | Location | Root Cause |\n|---|---|---|\n| Duplicate `restart` key in `worker` service | Lines 31 and 47 | PR merge appended a second block of service properties below the first, resulting in `restart: unless-stopped` being declared twice in the same YAML mapping |\n\n## What Was Wrong\n\nIn the original file, the `worker` service had:\n```yaml\n  worker:\n    ...\n    restart: unless-stopped       # line 31 \u2014 first declaration\n    environment:\n      DATABASE_URL: postgres://db:5432/mydb\n    volumes:\n      - ./logs:/app/logs\n    working_dir: /app\n    restart: unless-stopped       # line 47 \u2014 duplicate! causes parse error\n    healthcheck:\n      ...\n```\n\nDocker Compose uses a strict YAML parser that rejects duplicate mapping keys. Most YAML parsers would silently use the last value, but Docker Compose raises a parse error to avoid silent misconfigurations.\n\n## Fix Applied\n\nRemoved the second (duplicate) `restart: unless-stopped` entry from the `worker` service, keeping the first occurrence in its correct position. All other configuration was preserved unchanged.\n\n## Validation\n\nThe fixed file parses cleanly:\n```\napi: build=yes restart=unless-stopped\nworker: build=yes restart=unless-stopped\ndb: build=no restart=none\nYAML OK\n```\n"}, {"name": "fixed_docker-compose.yml", "type": "text", "content": "services:\n  api:\n    build:\n      context: .\n      dockerfile: Dockerfile\n    image: myapp:latest\n    container_name: myapp-api\n    restart: unless-stopped\n    ports:\n      - \"8000:8000\"\n    environment:\n      DATABASE_URL: postgres://db:5432/mydb\n      SECRET_KEY: changeme\n    volumes:\n      - ./logs:/app/logs\n    healthcheck:\n      test: [\"CMD\", \"curl\", \"-f\", \"http://localhost:8000/health\"]\n      interval: 30s\n      timeout: 10s\n      retries: 3\n\n  worker:\n    build:\n      context: .\n      dockerfile: Dockerfile\n    image: myapp:latest\n    container_name: myapp-worker\n    restart: unless-stopped\n    environment:\n      DATABASE_URL: postgres://db:5432/mydb\n    volumes:\n      - ./logs:/app/logs\n    working_dir: /app\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"print('ok')\"]\n      interval: 30s\n      timeout: 10s\n      retries: 3\n\n  db:\n    image: postgres:15\n    container_name: myapp-db\n    environment:\n      POSTGRES_DB: mydb\n      POSTGRES_USER: user\n      POSTGRES_PASSWORD: password\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n\nvolumes:\n  pgdata:\n"}], "grading": {"assertions": [{"text": "identifies-duplicate-restart", "passed": true, "evidence": "Analysis mentions duplicate+restart: True"}, {"text": "identifies-dual-build-problem", "passed": false, "evidence": "Analysis mentions dual-build race: False"}, {"text": "produces-valid-yaml", "passed": true, "evidence": "YAML parsed: True"}, {"text": "single-build-block", "passed": false, "evidence": "Services with build block: 2"}, {"text": "provides-root-cause", "passed": true, "evidence": "Mentions merge/conflict: True"}], "overall_pass": 3, "total": 5}}, {"id": "eval-0-duplicate-restart-without_skill", "prompt": "Fix docker-compose.yml with duplicate restart key in worker service after PR merge", "eval_id": 0, "outputs": [{"name": "analysis.md", "type": "text", "content": "# Docker Compose Parse Error Analysis\n\n## Root Cause\n\nThe `worker` service had a duplicate `restart` key. YAML does not allow the same mapping key to appear more than once within the same mapping block. The `restart: unless-stopped` directive was defined twice in the `worker` service:\n\n- First occurrence: line 31 (after `container_name`)\n- Second occurrence: line 47 (after `working_dir`)\n\nThis is a classic merge conflict artifact \u2014 the PR likely added `working_dir` and a second `restart` line was left in without removing the original.\n\n## Fix Applied\n\nRemoved the duplicate `restart: unless-stopped` entry at line 47 of the `worker` service. The single `restart: unless-stopped` at line 31 is retained, which is the correct and sufficient declaration.\n\n## Explanation\n\nDocker Compose files are parsed as YAML. The YAML spec (and most parsers) treat duplicate keys in a mapping as an error. When Docker Compose tried to parse the file, it detected that `restart` was defined twice within the `worker` service block and aborted with:\n\n```\nmapping key \"restart\" already defined at line 31\n```\n\nThe fix is simply to remove the duplicate key, leaving only one `restart` directive per service.\n"}, {"name": "fixed_docker-compose.yml", "type": "text", "content": "services:\n  api:\n    build:\n      context: .\n      dockerfile: Dockerfile\n    image: myapp:latest\n    container_name: myapp-api\n    restart: unless-stopped\n    ports:\n      - \"8000:8000\"\n    environment:\n      DATABASE_URL: postgres://db:5432/mydb\n      SECRET_KEY: changeme\n    volumes:\n      - ./logs:/app/logs\n    healthcheck:\n      test: [\"CMD\", \"curl\", \"-f\", \"http://localhost:8000/health\"]\n      interval: 30s\n      timeout: 10s\n      retries: 3\n\n  worker:\n    build:\n      context: .\n      dockerfile: Dockerfile\n    image: myapp:latest\n    container_name: myapp-worker\n    restart: unless-stopped\n    environment:\n      DATABASE_URL: postgres://db:5432/mydb\n    volumes:\n      - ./logs:/app/logs\n    working_dir: /app\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"print('ok')\"]\n      interval: 30s\n      timeout: 10s\n      retries: 3\n\n  db:\n    image: postgres:15\n    container_name: myapp-db\n    environment:\n      POSTGRES_DB: mydb\n      POSTGRES_USER: user\n      POSTGRES_PASSWORD: password\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n\nvolumes:\n  pgdata:\n"}], "grading": {"assertions": [{"text": "identifies-duplicate-restart", "passed": true, "evidence": "Analysis mentions duplicate+restart: True"}, {"text": "identifies-dual-build-problem", "passed": false, "evidence": "Analysis mentions dual-build race: False"}, {"text": "produces-valid-yaml", "passed": true, "evidence": "YAML parsed: True"}, {"text": "single-build-block", "passed": false, "evidence": "Services with build block: 2"}, {"text": "provides-root-cause", "passed": true, "evidence": "Mentions merge/conflict: True"}], "overall_pass": 3, "total": 5}}, {"id": "eval-1-arm64-volume-with_skill", "prompt": "Fix 40-minute build hang on Apple Silicon M2 and model weight volume shadowing", "eval_id": 1, "outputs": [{"name": "analysis.md", "type": "text", "content": "# Docker Compose Build Hang & Volume Issue \u2014 Root Cause Analysis\n\n## Problem 1: Build hangs for 40+ minutes on `pip install torch`\n\n### Root Cause\n\nThe machine is Apple Silicon M2, which runs Docker on the `linux/arm64` architecture natively. The PyTorch CPU index (`https://download.pytorch.org/whl/cpu`) **does not publish arm64 wheels** for the `+cpu` variant (e.g. `torch==2.6.0+cpu`).\n\nWhen pip finds no matching pre-built wheel, it falls back to:\n1. Scanning all other indexes (slow).\n2. Attempting to build torch from source (extremely slow \u2014 40+ minutes, eventually OOM or timeout).\n\nThe original Dockerfile has no `--platform` directive, so Docker builds a native `linux/arm64` image on M2, triggering this failure path.\n\n### Fix\n\nAdd `FROM --platform=linux/amd64 python:3.11-slim` to the Dockerfile and `platform: linux/amd64` to each service in docker-compose.yml.\n\nDocker Desktop on Apple Silicon uses Rosetta 2 to run `linux/amd64` containers transparently. The pre-built amd64 wheel for `torch==2.6.0+cpu` exists on the PyTorch index, so pip downloads and installs it in seconds rather than attempting a source build.\n\nAdditional improvement: add `--no-cache-dir` to all pip calls to prevent stale cache pollution and reduce layer size.\n\n### Before vs After\n\n| | Before | After |\n|---|---|---|\n| Platform | native arm64 (broken) | linux/amd64 via Rosetta |\n| torch wheel | not found \u2192 source build \u2192 hang | pre-built wheel \u2192 ~2 min |\n| Total build time | 40+ min (timeout) | ~4\u20135 min |\n\n---\n\n## Problem 2: Model weights in `outputs/models/` get wiped\n\n### Root Cause\n\nThe docker-compose.yml bind-mounts the host directory `./outputs` to `/app/outputs` inside the container:\n\n```yaml\nvolumes:\n  - ./outputs:/app/outputs\n```\n\nA bind-mount **completely replaces** the container path with the host path. If the host `./outputs/models/` directory is empty (e.g. on a fresh clone, CI machine, or after `rm -rf outputs/`), the container sees an empty `/app/outputs/models/` \u2014 any weights baked into the image or previously trained are invisible.\n\nWorse, if a developer runs `rm -rf outputs/` on the host thinking they are cleaning build artifacts, they permanently destroy the trained weights.\n\n### Fix\n\nIntroduce a **named Docker volume** (`model_weights`) mounted specifically at `/app/outputs/models`. Named volumes:\n\n- Are managed by Docker, not the host filesystem.\n- Persist across `docker compose down` (only destroyed by `docker compose down -v`).\n- Are **not** overwritten when the parent directory is bind-mounted, because Docker applies volume mounts in order \u2014 the named volume at `/app/outputs/models` shadows the bind-mount of `/app/outputs`.\n\n```yaml\nvolumes:\n  - ./outputs:/app/outputs              # bind-mount for logs, CSVs, etc.\n  - model_weights:/app/outputs/models   # named volume for weights \u2014 safe\n```\n\nBoth `api` and `worker` mount the same `model_weights` volume so they share the same weights at runtime.\n\n### Volume declaration\n\n```yaml\nvolumes:\n  model_weights:   # empty value = Docker-managed named volume\n```\n\n### Backup / restore model weights\n\n```bash\n# Backup\ndocker run --rm \\\n  -v <project>_model_weights:/src \\\n  -v $(pwd):/dst \\\n  alpine tar czf /dst/model_weights_backup.tar.gz -C /src .\n\n# Restore\ndocker run --rm \\\n  -v <project>_model_weights:/dst \\\n  -v $(pwd):/src \\\n  alpine tar xzf /src/model_weights_backup.tar.gz -C /dst\n```\n\n---\n\n## Summary of Changes\n\n### Dockerfile\n- Added `--platform=linux/amd64` to `FROM` directive.\n- Added `WORKDIR /app`.\n- Added `--no-cache-dir` to all `pip install` calls.\n\n### docker-compose.yml\n- Added `platform: linux/amd64` to both `api` and `worker` services.\n- Added `build.args.BUILDPLATFORM: linux/amd64` to the `api` build config.\n- Added `model_weights:/app/outputs/models` named volume to both services.\n- Declared `model_weights:` in the top-level `volumes:` block.\n- Added `depends_on: api` to `worker` so the image is built before worker starts.\n- Replaced empty `volumes: {}` with the named volume declaration.\n"}, {"name": "fixed_Dockerfile", "type": "binary", "mime": "application/octet-stream", "data_uri": "data:application/octet-stream;base64,IyBQaW4gdG8gbGludXgvYW1kNjQgc28gcGlwIGNhbiBmZXRjaCBwcmUtYnVpbHQgUHlUb3JjaCBDUFUgd2hlZWxzLgojIE9uIEFwcGxlIFNpbGljb24gKEFSTTY0L00xL00yKSwgdGhlIHB5dG9yY2gub3JnL3dobC9jcHUgaW5kZXggZG9lcyBOT1QKIyBwdWJsaXNoIGFybTY0IHdoZWVscyBmb3IgdGhlICtjcHUgdmFyaWFudCAoZS5nLiB0b3JjaD09Mi42LjArY3B1KS4KIyBXaXRob3V0IC0tcGxhdGZvcm0sIERvY2tlciBvbiBNMiBidWlsZHMgYSBuYXRpdmUgYXJtNjQgaW1hZ2UsIHBpcCBmaW5kcwojIG5vIG1hdGNoaW5nIHdoZWVsLCBhbmQgZWl0aGVyIGhhbmdzIHRyeWluZyBhbHRlcm5hdGl2ZSBzb3VyY2VzIG9yIHRpbWVzIG91dAojIGFmdGVyIDQwKyBtaW51dGVzIGF0dGVtcHRpbmcgYSBzb3VyY2UgYnVpbGQuCiMKIyBGb3JjaW5nIGxpbnV4L2FtZDY0IG1lYW5zIERvY2tlciB1c2VzIFJvc2V0dGEgMiBlbXVsYXRpb24sIGJ1dCB0aGUgaW1hZ2UKIyBydW5zIGNvcnJlY3RseSBhbmQgdGhlIGJ1aWxkIGNvbXBsZXRlcyBpbiB1bmRlciA1IG1pbnV0ZXMuCkZST00gLS1wbGF0Zm9ybT1saW51eC9hbWQ2NCBweXRob246My4xMS1zbGltCgpXT1JLRElSIC9hcHAKCkNPUFkgcmVxdWlyZW1lbnRzLnR4dCAuCgojIC0tbm8tY2FjaGUtZGlyIGtlZXBzIGltYWdlIGxheWVycyBzbWFsbGVyIGFuZCBhdm9pZHMgc3RhbGUgY2FjaGUgaXNzdWVzLgojIEluc3RhbGwgdG9yY2ggZmlyc3QgKGxhcmdlIHdoZWVsLCBzZXBhcmF0ZSBsYXllciBmb3IgYmV0dGVyIGNhY2hlIHJldXNlKSwKIyB0aGVuIGluc3RhbGwgcmVtYWluaW5nIHJlcXVpcmVtZW50cy4KUlVOIHB5dGhvbiAtbSBwaXAgaW5zdGFsbCAtLXVwZ3JhZGUgcGlwIC0tbm8tY2FjaGUtZGlyICYmIFwKICAgIHB5dGhvbiAtbSBwaXAgaW5zdGFsbCAtLW5vLWNhY2hlLWRpciBcCiAgICAgICAgLS1leHRyYS1pbmRleC11cmwgaHR0cHM6Ly9kb3dubG9hZC5weXRvcmNoLm9yZy93aGwvY3B1IFwKICAgICAgICAidG9yY2g9PTIuNi4wK2NwdSIgJiYgXAogICAgcHl0aG9uIC1tIHBpcCBpbnN0YWxsIC0tbm8tY2FjaGUtZGlyIC1yIHJlcXVpcmVtZW50cy50eHQKCkNPUFkgLiAuCgpDTUQgWyJ1dmljb3JuIiwgImFwcDptYWluIiwgIi0taG9zdCIsICIwLjAuMC4wIiwgIi0tcG9ydCIsICI4MDAwIl0K"}, {"name": "fixed_docker-compose.yml", "type": "text", "content": "services:\n  api:\n    build:\n      context: .\n      # Must match the platform pinned in the Dockerfile (linux/amd64).\n      # Without this, `docker compose build` on Apple Silicon would ignore\n      # the FROM --platform directive when building the service image.\n      args:\n        BUILDPLATFORM: linux/amd64\n    platform: linux/amd64\n    image: ml-app:local\n    container_name: ml_api\n    restart: unless-stopped\n    ports:\n      - \"8000:8000\"\n    volumes:\n      # outputs/logs are host-bind-mounted for easy access to non-model artifacts.\n      - ./outputs:/app/outputs\n      - ./logs:/app/logs\n      # Named volume for model weights \u2014 survives `docker compose down`,\n      # is NOT wiped when ./outputs is otherwise empty on the host, and\n      # is NOT overwritten by a bind-mount of the parent ./outputs directory.\n      # Mount it AFTER the parent bind-mount so it shadows ./outputs/models\n      # inside the container with the persistent named volume.\n      - model_weights:/app/outputs/models\n    environment:\n      MODEL_DIR: /app/outputs/models\n      PYTHONPATH: /app\n\n  worker:\n    image: ml-app:local\n    platform: linux/amd64\n    container_name: ml_worker\n    restart: unless-stopped\n    command: python -m myapp.worker\n    # worker depends on the api service so the shared image is built first\n    depends_on:\n      - api\n    volumes:\n      - ./outputs:/app/outputs\n      - ./logs:/app/logs\n      # Same named volume so the worker sees the same model weights.\n      - model_weights:/app/outputs/models\n    environment:\n      MODEL_DIR: /app/outputs/models\n      PYTHONPATH: /app\n\nvolumes:\n  # Named volume that persists model weights independently of the host bind-mount.\n  # To inspect: docker volume inspect <project>_model_weights\n  # To backup:  docker run --rm -v <project>_model_weights:/src -v $(pwd):/dst \\\n  #               alpine tar czf /dst/model_weights_backup.tar.gz -C /src .\n  model_weights:\n"}], "grading": {"assertions": [{"text": "identifies-arm64-torch-issue", "passed": true, "evidence": "Mentions arm64/torch hang cause: True"}, {"text": "provides-targetarch-fix", "passed": true, "evidence": "Has TARGETARCH or platform fix: True"}, {"text": "identifies-volume-shadowing", "passed": true, "evidence": "Warns about volume shadowing: True"}, {"text": "recommends-specific-mounts", "passed": true, "evidence": "Recommends specific mounts: True"}], "overall_pass": 4, "total": 4}}, {"id": "eval-1-arm64-volume-without_skill", "prompt": "Fix 40-minute build hang on Apple Silicon M2 and model weight volume shadowing", "eval_id": 1, "outputs": [{"name": "analysis.md", "type": "text", "content": "# Docker Build Hang & Volume Analysis\n\n## Problem 1: pip install hangs for 40+ minutes on Apple Silicon M2\n\n### Root Cause\n\nThe Dockerfile installs PyTorch with:\n\n```dockerfile\nRUN python -m pip install \\\n    --extra-index-url https://download.pytorch.org/whl/cpu \\\n    \"torch==2.6.0+cpu\"\n```\n\nThe `+cpu` version suffix and the `download.pytorch.org/whl/cpu` index only\npublish **x86_64 (amd64)** wheels. On Apple Silicon (M2), Docker Desktop\ndefaults to building `linux/arm64` images. When pip tries to resolve\n`torch==2.6.0+cpu` on arm64:\n\n- It finds no matching wheel at the PyTorch index.\n- It falls back to PyPI, which also has no `+cpu`-suffixed arm64 wheel.\n- pip then attempts to build torch **from source**, which can take 40+ minutes\n  and usually times out or runs out of memory.\n\n### Fix\n\n**Option A (recommended) \u2014 native arm64 build:** Remove the `--extra-index-url`\nand the `+cpu` suffix. PyPI ships `torch==2.6.0` with native arm64 wheels (CPU\nonly on non-CUDA Linux). This resolves instantly and builds natively on M2.\n\n```dockerfile\nRUN python -m pip install \"torch==2.6.0\" && \\\n    python -m pip install -r requirements.txt\n```\n\n**Option B \u2014 force amd64:** Add `platform: linux/amd64` to the `api` service in\n`docker-compose.yml`. Docker Desktop will use Rosetta 2 emulation to build an\nx86_64 image. The PyTorch whl/cpu index works correctly. However, emulation\nslows the build and runtime performance.\n\n```yaml\nbuild:\n  context: .\n  platform: linux/amd64\n```\n\nThe fixed files use Option A (plain PyPI torch) since it is faster and\narchitecturally correct for M2.\n\n---\n\n## Problem 2: Model weights getting wiped\n\n### Root Cause Clarification\n\nThe current `docker-compose.yml` already uses **bind mounts**:\n\n```yaml\nvolumes:\n  - ./outputs:/app/outputs\n```\n\nA bind mount mirrors a host directory into the container. Files written to\n`/app/outputs/models` inside the container appear at `outputs/models/` on your\nMac. Docker never manages or deletes these files \u2014 they live on your Mac's\nfilesystem.\n\n**Bind mounts are NOT wiped by:**\n- `docker compose down`\n- `docker compose down --volumes` (that flag only removes *named* Docker volumes)\n- Rebuilding the image\n- Recreating containers\n\nThey ARE deleted only if you manually delete the host directory (`rm -rf outputs/models/`).\n\n### When weights could actually be lost\n\n1. If you had used a **named Docker volume** (`model_weights:`) instead of a\n   bind mount, `docker compose down -v` would delete it.\n2. If the `COPY . .` instruction in the Dockerfile copies a stale/empty\n   `outputs/` directory into the image layer \u2014 but this only affects the image,\n   not the bind-mounted host path at runtime.\n\n### Recommendation\n\nYour existing bind-mount setup is correct for preserving weights. To make the\nintent explicit and prevent accidental overwrites, add `outputs/models/` to\n`.dockerignore` so the training artifacts are never baked into the image:\n\n```\n# .dockerignore\noutputs/models/\nlogs/\n```\n\nIf you prefer a fully Docker-managed named volume (portable, no host-path\ndependency), replace the bind mount in docker-compose.yml:\n\n```yaml\nvolumes:\n  - model_weights:/app/outputs/models\n\n# top-level:\nvolumes:\n  model_weights:\n```\n\nWith this setup, only `docker compose down -v` removes the data, and a plain\n`docker compose down` does not.\n\n---\n\n## Summary of Changes\n\n| File | Change |\n|------|--------|\n| `Dockerfile` | Removed `--extra-index-url` and `+cpu` suffix from torch install |\n| `docker-compose.yml` | Added explanatory comments; no structural changes needed (bind mounts already protect weights) |\n| *(recommended)* `.dockerignore` | Add `outputs/models/` and `logs/` |\n"}, {"name": "fixed_Dockerfile", "type": "binary", "mime": "application/octet-stream", "data_uri": "data:application/octet-stream;base64,RlJPTSBweXRob246My4xMS1zbGltCgpFTlYgUElQX05PX0NBQ0hFX0RJUj0wIFwKICAgIFBJUF9USU1FT1VUPTEyMAoKV09SS0RJUiAvYXBwCgpDT1BZIHJlcXVpcmVtZW50cy50eHQgLgoKUlVOIHB5dGhvbiAtbSBwaXAgaW5zdGFsbCAtLXVwZ3JhZGUgcGlwCgojIE9uIEFwcGxlIFNpbGljb24gKE0yKSwgRG9ja2VyIERlc2t0b3AgdXNlcyBsaW51eC9hcm02NCBieSBkZWZhdWx0LgojIFRoZSBweXRvcmNoLm9yZy93aGwvY3B1IGluZGV4IG9ubHkgcHVibGlzaGVzIHg4Nl82NCAoY3B1KSB3aGVlbHMuCiMgV2hlbiBwaXAgcmVzb2x2ZXMgdG9yY2ggb24gYXJtNjQgaXQgZmluZHMgbm90aGluZyBhdCB0aGF0IGluZGV4IGFuZAojIGVpdGhlciBoYW5ncyByZXRyeWluZyBvciB0aW1lcyBvdXQgYWZ0ZXIgNDArIG1pbnV0ZXMuCiMKIyBGaXg6IGluc3RhbGwgcGxhaW4gdG9yY2ggZnJvbSBQeVBJIOKAlCBQeVBJIHNoaXBzIG5hdGl2ZSBhcm02NCB3aGVlbHMKIyBmb3IgdG9yY2ggMi54IChubyBleHRyYSBpbmRleCBuZWVkZWQpLgpSVU4gcHl0aG9uIC1tIHBpcCBpbnN0YWxsICJ0b3JjaD09Mi42LjAiICYmIFwKICAgIHB5dGhvbiAtbSBwaXAgaW5zdGFsbCAtciByZXF1aXJlbWVudHMudHh0CgpDT1BZIC4gLgoKQ01EIFsidXZpY29ybiIsICJhcHA6bWFpbiIsICItLWhvc3QiLCAiMC4wLjAuMCIsICItLXBvcnQiLCAiODAwMCJdCg=="}, {"name": "fixed_docker-compose.yml", "type": "text", "content": "services:\n  api:\n    build:\n      context: .\n      # Explicitly target linux/amd64 if you need the pytorch whl/cpu index\n      # (x86_64-only). Remove this line if you switch to plain PyPI torch\n      # (arm64-native) so Docker can build natively on M2 without Rosetta.\n      # platform: linux/amd64\n    image: ml-app:local\n    container_name: ml_api\n    restart: unless-stopped\n    ports:\n      - \"8000:8000\"\n    volumes:\n      - ./outputs:/app/outputs\n      - ./logs:/app/logs\n    environment:\n      MODEL_DIR: /app/outputs/models\n      PYTHONPATH: /app\n\n  worker:\n    image: ml-app:local\n    container_name: ml_worker\n    restart: unless-stopped\n    command: python -m myapp.worker\n    volumes:\n      - ./outputs:/app/outputs\n      - ./logs:/app/logs\n    environment:\n      MODEL_DIR: /app/outputs/models\n      PYTHONPATH: /app\n\n# Named volume for model weights so they are NOT wiped on `docker compose down -v`\n# or when containers are recreated.  The host directory ./outputs/models is kept\n# in sync via a bind mount, so the weights live on your Mac AND inside Docker.\n#\n# Current setup already uses a bind mount (./outputs -> /app/outputs), which\n# means model weights written to /app/outputs/models inside the container are\n# immediately visible at outputs/models/ on your Mac \u2014 they will NOT be deleted\n# by Docker unless you manually delete the host directory.\n#\n# If you ever want a pure Docker-managed volume instead of a bind mount, replace\n# the bind mount above with:\n#   - model_weights:/app/outputs/models\n# and uncomment the named-volume block below:\n#\n# volumes:\n#   model_weights:\n\nvolumes: {}\n"}], "grading": {"assertions": [{"text": "identifies-arm64-torch-issue", "passed": true, "evidence": "Mentions arm64/torch hang cause: True"}, {"text": "provides-targetarch-fix", "passed": true, "evidence": "Has TARGETARCH or platform fix: True"}, {"text": "identifies-volume-shadowing", "passed": true, "evidence": "Warns about volume shadowing: True"}, {"text": "recommends-specific-mounts", "passed": true, "evidence": "Recommends specific mounts: True"}], "overall_pass": 4, "total": 4}}, {"id": "eval-2-anchor-conflict-with_skill", "prompt": "Audit compose file for post-merge issues with anchor/image tag inconsistency", "eval_id": 2, "outputs": [{"name": "analysis.md", "type": "text", "content": "# Docker Compose Audit \u2014 Anchor Conflict Analysis\n\n## Summary\n\nThe file had two root-cause issues that together cause `docker compose config` to fail after a merge conflict resolution:\n\n1. **YAML merge keys (`<<: *anchor`) are not supported in Docker Compose v2 service definitions** \u2014 this is the primary error.\n2. **The `x-common` anchor included an `image:` field**, creating an implicit conflict when `web` declared both `build:` and its own `image:`, and leaving `celery`/`celery-beat` pointing at a different image tag (`backend:local`) than what `web` actually builds (`backend:dev`).\n\n---\n\n## Issues Found\n\n### Issue 1 (Critical): YAML Merge Keys Unsupported in Compose v2\n\n**Location:** `web`, `celery`, `celery-beat` services\n\n```yaml\n# BROKEN \u2014 not supported in Docker Compose v2+\ncelery:\n  <<: *common\n  ...\n```\n\nDocker Compose v1 (Python-based `docker-compose`) supported YAML merge keys (`<<:`) inside `services:` blocks. Docker Compose v2 (Go-based, the current `docker compose` plugin) **does not support merge keys within service definitions**. This is the direct cause of the `docker compose config` error.\n\nYAML anchors and aliases (`&anchor` / `*anchor`) are still valid in `x-` extension blocks, but the merge key syntax is rejected when applied inside `services:`.\n\n**Fix:** Expand all merged fields explicitly into each service definition.\n\n---\n\n### Issue 2 (Correctness): `image:` Field Inside the Common Anchor\n\n**Location:** `x-common` anchor\n\n```yaml\nx-common: &common\n  image: backend:local   # <-- problematic\n  ...\n```\n\nThe anchor defined `image: backend:local`. The `web` service overrode this with `image: backend:dev` (the built image tag), which is correct. But `celery` and `celery-beat` inherited `backend:local` \u2014 a different tag than what the build produces. This means after a fresh build, `celery` and `celery-beat` would try to pull or run a stale/wrong image.\n\n**Fix:** Remove `image:` from the common anchor. Set `image: backend:dev` explicitly in all three backend services so they all use the same built image.\n\n---\n\n### Issue 3 (Minor): `celery` and `celery-beat` Had No `depends_on` for `db`\n\nThese services use `DATABASE_URL` pointing at `db`, but had no `depends_on: db` health condition. They could start before the database was ready.\n\n**Fix:** Added `depends_on: db: condition: service_healthy` to both.\n\n---\n\n### Issue 4 (Minor): `db` Service Had No `restart` Policy\n\nThe `db` service had no `restart: unless-stopped`, unlike the other services.\n\n**Fix:** Added `restart: unless-stopped` to `db`.\n\n---\n\n## What Was Changed\n\n| Location | Before | After |\n|---|---|---|\n| `x-common` anchor | Included `image: backend:local` | `image:` removed from anchor |\n| `web`, `celery`, `celery-beat` | `<<: *common` merge key | All fields expanded inline |\n| `celery`, `celery-beat` | `image: backend:local` (via anchor) | `image: backend:dev` (explicit) |\n| `celery`, `celery-beat` | No `depends_on` | `depends_on: db: condition: service_healthy` |\n| `db` | No `restart` | `restart: unless-stopped` |\n\n---\n\n## Root Cause of the Merge Conflict\n\nThe merge conflict likely introduced `<<: *common` syntax into the service blocks (possibly from a branch that was tested with `docker-compose` v1). When merged into a codebase using Docker Compose v2, the syntax became invalid. The `image:` field in the anchor is a secondary artifact of whoever wrote the anchor not accounting for the `web` service needing a different image tag.\n\n---\n\n## Validation\n\nThe fixed file:\n- Uses no YAML merge keys inside `services:`\n- Has consistent `image: backend:dev` across all three backend services\n- Ensures `celery` and `celery-beat` wait for a healthy `db` before starting\n- Passes `docker compose config` validation\n"}, {"name": "fixed_docker-compose.yml", "type": "text", "content": "x-common: &common\n  env_file: .env\n  environment:\n    APP_ENV: production\n    DATABASE_URL: postgresql://postgres:secret@db:5432/appdb\n  volumes:\n    - ./uploads:/app/uploads\n\nservices:\n  web:\n    build:\n      context: .\n    image: backend:dev\n    container_name: web_server\n    restart: unless-stopped\n    env_file: .env\n    environment:\n      APP_ENV: production\n      DATABASE_URL: postgresql://postgres:secret@db:5432/appdb\n    volumes:\n      - ./uploads:/app/uploads\n    ports:\n      - \"3000:3000\"\n    depends_on:\n      db:\n        condition: service_healthy\n    command: [\"python\", \"-m\", \"uvicorn\", \"main:app\", \"--port\", \"3000\"]\n\n  celery:\n    image: backend:dev\n    container_name: celery_worker\n    restart: unless-stopped\n    env_file: .env\n    environment:\n      APP_ENV: production\n      DATABASE_URL: postgresql://postgres:secret@db:5432/appdb\n    volumes:\n      - ./uploads:/app/uploads\n    command: celery -A tasks worker --loglevel=info\n    depends_on:\n      db:\n        condition: service_healthy\n\n  celery-beat:\n    image: backend:dev\n    container_name: celery_beat\n    restart: unless-stopped\n    env_file: .env\n    environment:\n      APP_ENV: production\n      DATABASE_URL: postgresql://postgres:secret@db:5432/appdb\n    volumes:\n      - ./uploads:/app/uploads\n    command: celery -A tasks beat --loglevel=info\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:15-alpine\n    container_name: postgres_db\n    restart: unless-stopped\n    environment:\n      POSTGRES_DB: appdb\n      POSTGRES_USER: postgres\n      POSTGRES_PASSWORD: secret\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U postgres\"]\n      interval: 10s\n      timeout: 5s\n      retries: 5\n\nvolumes:\n  pgdata:\n    driver: local\n"}], "grading": {"assertions": [{"text": "identifies-image-name-conflict", "passed": true, "evidence": "Catches backend:dev vs backend:local conflict: True"}, {"text": "produces-clean-yaml", "passed": true, "evidence": "YAML parsed: True"}, {"text": "preserves-all-services", "passed": true, "evidence": "Services in output: ['web', 'celery', 'celery-beat', 'db']"}, {"text": "preserves-healthcheck", "passed": true, "evidence": "db healthcheck present: True"}], "overall_pass": 4, "total": 4}}, {"id": "eval-2-anchor-conflict-without_skill", "prompt": "Audit compose file for post-merge issues with anchor/image tag inconsistency", "eval_id": 2, "outputs": [{"name": "analysis.md", "type": "text", "content": "# Docker Compose Audit \u2014 Analysis\n\n## Problem Summary\n\nAfter the merge, `docker compose config` was failing due to a key ordering issue\nin the `celery-beat` service. The `restart` key appeared **after** the `command`\nkey in the original file. While this is technically valid YAML, some versions of\nDocker Compose's internal validator are sensitive to key ordering when combined\nwith anchor merges (`<<: *common`), and a bad merge can silently reorder or\nduplicate keys, causing parse failures.\n\nMore specifically, the confirmed issue in the submitted file is:\n\n### Issue 1: Key order in `celery-beat` after merge conflict resolution\n\nIn the original file:\n```yaml\n  celery-beat:\n    <<: *common\n    container_name: celery_beat\n    command: celery -A tasks beat --loglevel=info\n    restart: unless-stopped\n```\n\nAfter the anchor `*common` is merged, `restart` appears after `command`. This\nitself is not a YAML error, but during a merge conflict resolution it is common\nto accidentally introduce duplicate keys (e.g., `restart` appearing twice \u2014 once\nfrom the merge and once explicitly). Docker Compose will error on duplicate keys\neven if one was intended to override.\n\n**Fix applied**: Moved `restart: unless-stopped` before `command` to match the\npattern used in the `celery` service and eliminate any ambiguity about which\nvalue takes precedence.\n\n### Issue 2: `x-common` anchor includes `image: backend:local`\n\nThe `web` service correctly overrides this with `image: backend:dev` (explicit\nkeys override anchor-merged keys in YAML). The `celery` and `celery-beat`\nservices correctly inherit `image: backend:local`. No change needed here, but\nthis is a common source of confusion after merges.\n\n## Changes Made\n\n| Location | Change |\n|---|---|\n| `celery-beat` service | Moved `restart: unless-stopped` before `command` to normalize key order and eliminate potential duplicate-key artifacts from the merge |\n\n## Validation\n\nThe fixed file passes `docker compose config` validation. All services correctly:\n- Inherit shared config from the `x-common` anchor\n- `web` overrides `image` to `backend:dev` and adds `build`\n- `celery` and `celery-beat` use `backend:local` from the anchor\n- `db` healthcheck is properly configured for `depends_on: condition: service_healthy`\n- Named volume `pgdata` is declared in the top-level `volumes` block\n"}, {"name": "fixed_docker-compose.yml", "type": "text", "content": "x-common: &common\n  image: backend:local\n  env_file: .env\n  environment:\n    APP_ENV: production\n    DATABASE_URL: postgresql://postgres:secret@db:5432/appdb\n  volumes:\n    - ./uploads:/app/uploads\n\nservices:\n  web:\n    <<: *common\n    build:\n      context: .\n    image: backend:dev\n    container_name: web_server\n    restart: unless-stopped\n    ports:\n      - \"3000:3000\"\n    depends_on:\n      db:\n        condition: service_healthy\n    command: [\"python\", \"-m\", \"uvicorn\", \"main:app\", \"--port\", \"3000\"]\n\n  celery:\n    <<: *common\n    container_name: celery_worker\n    restart: unless-stopped\n    command: celery -A tasks worker --loglevel=info\n\n  celery-beat:\n    <<: *common\n    container_name: celery_beat\n    restart: unless-stopped\n    command: celery -A tasks beat --loglevel=info\n\n  db:\n    image: postgres:15-alpine\n    container_name: postgres_db\n    environment:\n      POSTGRES_DB: appdb\n      POSTGRES_USER: postgres\n      POSTGRES_PASSWORD: secret\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U postgres\"]\n      interval: 10s\n      timeout: 5s\n      retries: 5\n\nvolumes:\n  pgdata:\n    driver: local\n"}], "grading": {"assertions": [{"text": "identifies-image-name-conflict", "passed": true, "evidence": "Catches backend:dev vs backend:local conflict: True"}, {"text": "produces-clean-yaml", "passed": true, "evidence": "YAML parsed: True"}, {"text": "preserves-all-services", "passed": true, "evidence": "Services in output: ['web', 'celery', 'celery-beat', 'db']"}, {"text": "preserves-healthcheck", "passed": true, "evidence": "db healthcheck present: True"}], "overall_pass": 4, "total": 4}}], "previous_feedback": {}, "previous_outputs": {}, "benchmark": {"skill_name": "docker-compose-debugger", "iteration": 1, "configurations": ["with_skill", "without_skill"], "evals": [{"run_id": "eval-0-duplicate-restart-with_skill", "eval_id": 0, "eval_name": "duplicate-restart-after-merge", "configuration": "with_skill", "pass_rate": 0.6, "passed": 3, "total": 5, "duration_seconds": 34.5, "total_tokens": 13826, "assertions": [{"text": "identifies-duplicate-restart", "passed": true, "evidence": "Analysis mentions duplicate+restart: True"}, {"text": "identifies-dual-build-problem", "passed": false, "evidence": "Analysis mentions dual-build race: False"}, {"text": "produces-valid-yaml", "passed": true, "evidence": "YAML parsed: True"}, {"text": "single-build-block", "passed": false, "evidence": "Services with build block: 2"}, {"text": "provides-root-cause", "passed": true, "evidence": "Mentions merge/conflict: True"}]}, {"run_id": "eval-0-duplicate-restart-without_skill", "eval_id": 0, "eval_name": "duplicate-restart-after-merge", "configuration": "without_skill", "pass_rate": 0.6, "passed": 3, "total": 5, "duration_seconds": 23.3, "total_tokens": 11834, "assertions": [{"text": "identifies-duplicate-restart", "passed": true, "evidence": "Analysis mentions duplicate+restart: True"}, {"text": "identifies-dual-build-problem", "passed": false, "evidence": "Analysis mentions dual-build race: False"}, {"text": "produces-valid-yaml", "passed": true, "evidence": "YAML parsed: True"}, {"text": "single-build-block", "passed": false, "evidence": "Services with build block: 2"}, {"text": "provides-root-cause", "passed": true, "evidence": "Mentions merge/conflict: True"}]}, {"run_id": "eval-1-arm64-volume-with_skill", "eval_id": 1, "eval_name": "arm64-torch-hang-and-volume-shadowing", "configuration": "with_skill", "pass_rate": 1.0, "passed": 4, "total": 4, "duration_seconds": 195.5, "total_tokens": 22127, "assertions": [{"text": "identifies-arm64-torch-issue", "passed": true, "evidence": "Mentions arm64/torch hang cause: True"}, {"text": "provides-targetarch-fix", "passed": true, "evidence": "Has TARGETARCH or platform fix: True"}, {"text": "identifies-volume-shadowing", "passed": true, "evidence": "Warns about volume shadowing: True"}, {"text": "recommends-specific-mounts", "passed": true, "evidence": "Recommends specific mounts: True"}]}, {"run_id": "eval-1-arm64-volume-without_skill", "eval_id": 1, "eval_name": "arm64-torch-hang-and-volume-shadowing", "configuration": "without_skill", "pass_rate": 1.0, "passed": 4, "total": 4, "duration_seconds": 63.6, "total_tokens": 13521, "assertions": [{"text": "identifies-arm64-torch-issue", "passed": true, "evidence": "Mentions arm64/torch hang cause: True"}, {"text": "provides-targetarch-fix", "passed": true, "evidence": "Has TARGETARCH or platform fix: True"}, {"text": "identifies-volume-shadowing", "passed": true, "evidence": "Warns about volume shadowing: True"}, {"text": "recommends-specific-mounts", "passed": true, "evidence": "Recommends specific mounts: True"}]}, {"run_id": "eval-2-anchor-conflict-with_skill", "eval_id": 2, "eval_name": "anchor-image-tag-conflict", "configuration": "with_skill", "pass_rate": 1.0, "passed": 4, "total": 4, "duration_seconds": 97.7, "total_tokens": 16688, "assertions": [{"text": "identifies-image-name-conflict", "passed": true, "evidence": "Catches backend:dev vs backend:local conflict: True"}, {"text": "produces-clean-yaml", "passed": true, "evidence": "YAML parsed: True"}, {"text": "preserves-all-services", "passed": true, "evidence": "Services in output: ['web', 'celery', 'celery-beat', 'db']"}, {"text": "preserves-healthcheck", "passed": true, "evidence": "db healthcheck present: True"}]}, {"run_id": "eval-2-anchor-conflict-without_skill", "eval_id": 2, "eval_name": "anchor-image-tag-conflict", "configuration": "without_skill", "pass_rate": 1.0, "passed": 4, "total": 4, "duration_seconds": 60.9, "total_tokens": 13542, "assertions": [{"text": "identifies-image-name-conflict", "passed": true, "evidence": "Catches backend:dev vs backend:local conflict: True"}, {"text": "produces-clean-yaml", "passed": true, "evidence": "YAML parsed: True"}, {"text": "preserves-all-services", "passed": true, "evidence": "Services in output: ['web', 'celery', 'celery-beat', 'db']"}, {"text": "preserves-healthcheck", "passed": true, "evidence": "db healthcheck present: True"}]}], "summary": {"with_skill": {"avg_pass_rate": 0.867, "avg_tokens": 17547, "avg_duration_seconds": 109.2}, "without_skill": {"avg_pass_rate": 0.867, "avg_tokens": 12966, "avg_duration_seconds": 49.3}}}};
+
+    // ---- State ----
+    let feedbackMap = {};  // run_id -> feedback text
+    let currentIndex = 0;
+    let visitedRuns = new Set();
+
+    // ---- Init ----
+    async function init() {
+      // Load saved feedback from server — but only if this isn't a fresh
+      // iteration (indicated by previous_feedback being present). When
+      // previous feedback exists, the feedback.json on disk is stale from
+      // the prior iteration and should not pre-fill the textareas.
+      const hasPrevious = Object.keys(EMBEDDED_DATA.previous_feedback || {}).length > 0
+        || Object.keys(EMBEDDED_DATA.previous_outputs || {}).length > 0;
+      if (!hasPrevious) {
+        try {
+          const resp = await fetch("/api/feedback");
+          const data = await resp.json();
+          if (data.reviews) {
+            for (const r of data.reviews) feedbackMap[r.run_id] = r.feedback;
+          }
+        } catch { /* first run, no feedback yet */ }
+      }
+
+      document.getElementById("skill-name").textContent = EMBEDDED_DATA.skill_name;
+      showRun(0);
+
+      // Wire up feedback auto-save
+      const textarea = document.getElementById("feedback");
+      let saveTimeout = null;
+      textarea.addEventListener("input", () => {
+        clearTimeout(saveTimeout);
+        document.getElementById("feedback-status").textContent = "";
+        saveTimeout = setTimeout(() => saveCurrentFeedback(), 800);
+      });
+    }
+
+    // ---- Navigation ----
+    function navigate(delta) {
+      const newIndex = currentIndex + delta;
+      if (newIndex >= 0 && newIndex < EMBEDDED_DATA.runs.length) {
+        saveCurrentFeedback();
+        showRun(newIndex);
+      }
+    }
+
+    function updateNavButtons() {
+      document.getElementById("prev-btn").disabled = currentIndex === 0;
+      document.getElementById("next-btn").disabled =
+        currentIndex === EMBEDDED_DATA.runs.length - 1;
+    }
+
+    // ---- Show a run ----
+    function showRun(index) {
+      currentIndex = index;
+      const run = EMBEDDED_DATA.runs[index];
+
+      // Progress
+      document.getElementById("progress").textContent =
+        `${index + 1} of ${EMBEDDED_DATA.runs.length}`;
+
+      // Prompt
+      document.getElementById("prompt-text").textContent = run.prompt;
+
+      // Config badge
+      const badge = document.getElementById("config-badge");
+      const configMatch = run.id.match(/(with_skill|without_skill|new_skill|old_skill)/);
+      if (configMatch) {
+        const config = configMatch[1];
+        const isBaseline = config === "without_skill" || config === "old_skill";
+        badge.textContent = config.replace(/_/g, " ");
+        badge.className = "config-badge " + (isBaseline ? "config-baseline" : "config-primary");
+        badge.style.display = "inline-block";
+      } else {
+        badge.style.display = "none";
+      }
+
+      // Outputs
+      renderOutputs(run);
+
+      // Previous outputs
+      renderPrevOutputs(run);
+
+      // Grades
+      renderGrades(run);
+
+      // Previous feedback
+      const prevFb = (EMBEDDED_DATA.previous_feedback || {})[run.id];
+      const prevEl = document.getElementById("prev-feedback");
+      if (prevFb) {
+        document.getElementById("prev-feedback-text").textContent = prevFb;
+        prevEl.style.display = "block";
+      } else {
+        prevEl.style.display = "none";
+      }
+
+      // Feedback
+      document.getElementById("feedback").value = feedbackMap[run.id] || "";
+      document.getElementById("feedback-status").textContent = "";
+
+      updateNavButtons();
+
+      // Track visited runs and promote done button when all visited
+      visitedRuns.add(index);
+      const doneBtn = document.getElementById("done-btn");
+      if (visitedRuns.size >= EMBEDDED_DATA.runs.length) {
+        doneBtn.classList.add("ready");
+      }
+
+      // Scroll main content to top
+      document.querySelector(".main").scrollTop = 0;
+    }
+
+    // ---- Render outputs ----
+    function renderOutputs(run) {
+      const container = document.getElementById("outputs-body");
+      container.innerHTML = "";
+
+      const outputs = run.outputs || [];
+      if (outputs.length === 0) {
+        container.innerHTML = '<div class="empty-state">No output files</div>';
+        return;
+      }
+
+      for (const file of outputs) {
+        const fileDiv = document.createElement("div");
+        fileDiv.className = "output-file";
+
+        // Always show file header with download link
+        const header = document.createElement("div");
+        header.className = "output-file-header";
+        const nameSpan = document.createElement("span");
+        nameSpan.textContent = file.name;
+        header.appendChild(nameSpan);
+        const dlBtn = document.createElement("a");
+        dlBtn.className = "dl-btn";
+        dlBtn.textContent = "Download";
+        dlBtn.download = file.name;
+        dlBtn.href = getDownloadUri(file);
+        header.appendChild(dlBtn);
+        fileDiv.appendChild(header);
+
+        const content = document.createElement("div");
+        content.className = "output-file-content";
+
+        if (file.type === "text") {
+          const pre = document.createElement("pre");
+          pre.textContent = file.content;
+          content.appendChild(pre);
+        } else if (file.type === "image") {
+          const img = document.createElement("img");
+          img.src = file.data_uri;
+          img.alt = file.name;
+          content.appendChild(img);
+        } else if (file.type === "pdf") {
+          const iframe = document.createElement("iframe");
+          iframe.src = file.data_uri;
+          content.appendChild(iframe);
+        } else if (file.type === "xlsx") {
+          renderXlsx(content, file.data_b64);
+        } else if (file.type === "binary") {
+          const a = document.createElement("a");
+          a.className = "download-link";
+          a.href = file.data_uri;
+          a.download = file.name;
+          a.textContent = "Download " + file.name;
+          content.appendChild(a);
+        } else if (file.type === "error") {
+          const pre = document.createElement("pre");
+          pre.textContent = file.content;
+          pre.style.color = "var(--red)";
+          content.appendChild(pre);
+        }
+
+        fileDiv.appendChild(content);
+        container.appendChild(fileDiv);
+      }
+    }
+
+    // ---- XLSX rendering via SheetJS ----
+    function renderXlsx(container, b64Data) {
+      try {
+        const raw = Uint8Array.from(atob(b64Data), c => c.charCodeAt(0));
+        const wb = XLSX.read(raw, { type: "array" });
+
+        for (let i = 0; i < wb.SheetNames.length; i++) {
+          const sheetName = wb.SheetNames[i];
+          const ws = wb.Sheets[sheetName];
+
+          if (wb.SheetNames.length > 1) {
+            const sheetLabel = document.createElement("div");
+            sheetLabel.style.cssText =
+              "font-weight:600; font-size:0.8rem; color:#b0aea5; margin-top:0.5rem; margin-bottom:0.25rem;";
+            sheetLabel.textContent = "Sheet: " + sheetName;
+            container.appendChild(sheetLabel);
+          }
+
+          const htmlStr = XLSX.utils.sheet_to_html(ws, { editable: false });
+          const wrapper = document.createElement("div");
+          wrapper.innerHTML = htmlStr;
+          container.appendChild(wrapper);
+        }
+      } catch (err) {
+        container.textContent = "Error rendering spreadsheet: " + err.message;
+      }
+    }
+
+    // ---- Grades ----
+    function renderGrades(run) {
+      const section = document.getElementById("grades-section");
+      const content = document.getElementById("grades-content");
+
+      if (!run.grading) {
+        section.style.display = "none";
+        return;
+      }
+
+      const grading = run.grading;
+      section.style.display = "block";
+      // Reset to collapsed
+      content.classList.remove("open");
+      document.getElementById("grades-arrow").classList.remove("open");
+
+      const summary = grading.summary || {};
+      const expectations = grading.expectations || [];
+
+      let html = '<div style="padding: 1rem;">';
+
+      // Summary line
+      const passRate = summary.pass_rate != null
+        ? Math.round(summary.pass_rate * 100) + "%"
+        : "?";
+      const badgeClass = summary.pass_rate >= 0.8 ? "grade-pass" : summary.pass_rate >= 0.5 ? "" : "grade-fail";
+      html += '<div class="grades-summary">';
+      html += '<span class="grade-badge ' + badgeClass + '">' + passRate + '</span>';
+      html += '<span>' + (summary.passed || 0) + ' passed, ' + (summary.failed || 0) + ' failed of ' + (summary.total || 0) + '</span>';
+      html += '</div>';
+
+      // Assertions list
+      html += '<ul class="assertion-list">';
+      for (const exp of expectations) {
+        const statusClass = exp.passed ? "pass" : "fail";
+        const statusIcon = exp.passed ? "\u2713" : "\u2717";
+        html += '<li class="assertion-item">';
+        html += '<span class="assertion-status ' + statusClass + '">' + statusIcon + '</span>';
+        html += '<span>' + escapeHtml(exp.text) + '</span>';
+        if (exp.evidence) {
+          html += '<div class="assertion-evidence">' + escapeHtml(exp.evidence) + '</div>';
+        }
+        html += '</li>';
+      }
+      html += '</ul>';
+
+      html += '</div>';
+      content.innerHTML = html;
+    }
+
+    function toggleGrades() {
+      const content = document.getElementById("grades-content");
+      const arrow = document.getElementById("grades-arrow");
+      content.classList.toggle("open");
+      arrow.classList.toggle("open");
+    }
+
+    // ---- Previous outputs (collapsible) ----
+    function renderPrevOutputs(run) {
+      const section = document.getElementById("prev-outputs-section");
+      const content = document.getElementById("prev-outputs-content");
+      const prevOutputs = (EMBEDDED_DATA.previous_outputs || {})[run.id];
+
+      if (!prevOutputs || prevOutputs.length === 0) {
+        section.style.display = "none";
+        return;
+      }
+
+      section.style.display = "block";
+      // Reset to collapsed
+      content.classList.remove("open");
+      document.getElementById("prev-outputs-arrow").classList.remove("open");
+
+      // Render the files into the content area
+      content.innerHTML = "";
+      const wrapper = document.createElement("div");
+      wrapper.style.padding = "1rem";
+
+      for (const file of prevOutputs) {
+        const fileDiv = document.createElement("div");
+        fileDiv.className = "output-file";
+
+        const header = document.createElement("div");
+        header.className = "output-file-header";
+        const nameSpan = document.createElement("span");
+        nameSpan.textContent = file.name;
+        header.appendChild(nameSpan);
+        const dlBtn = document.createElement("a");
+        dlBtn.className = "dl-btn";
+        dlBtn.textContent = "Download";
+        dlBtn.download = file.name;
+        dlBtn.href = getDownloadUri(file);
+        header.appendChild(dlBtn);
+        fileDiv.appendChild(header);
+
+        const fc = document.createElement("div");
+        fc.className = "output-file-content";
+
+        if (file.type === "text") {
+          const pre = document.createElement("pre");
+          pre.textContent = file.content;
+          fc.appendChild(pre);
+        } else if (file.type === "image") {
+          const img = document.createElement("img");
+          img.src = file.data_uri;
+          img.alt = file.name;
+          fc.appendChild(img);
+        } else if (file.type === "pdf") {
+          const iframe = document.createElement("iframe");
+          iframe.src = file.data_uri;
+          fc.appendChild(iframe);
+        } else if (file.type === "xlsx") {
+          renderXlsx(fc, file.data_b64);
+        } else if (file.type === "binary") {
+          const a = document.createElement("a");
+          a.className = "download-link";
+          a.href = file.data_uri;
+          a.download = file.name;
+          a.textContent = "Download " + file.name;
+          fc.appendChild(a);
+        }
+
+        fileDiv.appendChild(fc);
+        wrapper.appendChild(fileDiv);
+      }
+
+      content.appendChild(wrapper);
+    }
+
+    function togglePrevOutputs() {
+      const content = document.getElementById("prev-outputs-content");
+      const arrow = document.getElementById("prev-outputs-arrow");
+      content.classList.toggle("open");
+      arrow.classList.toggle("open");
+    }
+
+    // ---- Feedback (saved to server -> feedback.json) ----
+    function saveCurrentFeedback() {
+      const run = EMBEDDED_DATA.runs[currentIndex];
+      const text = document.getElementById("feedback").value;
+
+      if (text.trim() === "") {
+        delete feedbackMap[run.id];
+      } else {
+        feedbackMap[run.id] = text;
+      }
+
+      // Build reviews array from map
+      const reviews = [];
+      for (const [run_id, feedback] of Object.entries(feedbackMap)) {
+        if (feedback.trim()) {
+          reviews.push({ run_id, feedback, timestamp: new Date().toISOString() });
+        }
+      }
+
+      fetch("/api/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reviews, status: "in_progress" }),
+      }).then(() => {
+        document.getElementById("feedback-status").textContent = "Saved";
+      }).catch(() => {
+        // Static mode or server unavailable — no-op on auto-save,
+        // feedback will be downloaded on final submit
+        document.getElementById("feedback-status").textContent = "Will download on submit";
+      });
+    }
+
+    // ---- Done ----
+    function showDoneDialog() {
+      // Save current textarea to feedbackMap (but don't POST yet)
+      const run = EMBEDDED_DATA.runs[currentIndex];
+      const text = document.getElementById("feedback").value;
+      if (text.trim() === "") {
+        delete feedbackMap[run.id];
+      } else {
+        feedbackMap[run.id] = text;
+      }
+
+      // POST once with status: complete — include ALL runs so the model
+      // can distinguish "no feedback" (looks good) from "not reviewed"
+      const reviews = [];
+      const ts = new Date().toISOString();
+      for (const r of EMBEDDED_DATA.runs) {
+        reviews.push({ run_id: r.id, feedback: feedbackMap[r.id] || "", timestamp: ts });
+      }
+      const payload = JSON.stringify({ reviews, status: "complete" }, null, 2);
+      fetch("/api/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: payload,
+      }).then(() => {
+        document.getElementById("done-overlay").classList.add("visible");
+      }).catch(() => {
+        // Server not available (static mode) — download as file
+        const blob = new Blob([payload], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "feedback.json";
+        a.click();
+        URL.revokeObjectURL(url);
+        document.getElementById("done-overlay").classList.add("visible");
+      });
+    }
+
+    function closeDoneDialog() {
+      // Reset status back to in_progress
+      saveCurrentFeedback();
+      document.getElementById("done-overlay").classList.remove("visible");
+    }
+
+    // ---- Toast ----
+    function showToast(message) {
+      const toast = document.getElementById("toast");
+      toast.textContent = message;
+      toast.classList.add("visible");
+      setTimeout(() => toast.classList.remove("visible"), 2000);
+    }
+
+    // ---- Keyboard nav ----
+    document.addEventListener("keydown", (e) => {
+      // Don't capture when typing in textarea
+      if (e.target.tagName === "TEXTAREA") return;
+
+      if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+        e.preventDefault();
+        navigate(-1);
+      } else if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+        e.preventDefault();
+        navigate(1);
+      }
+    });
+
+    // ---- Util ----
+    function getDownloadUri(file) {
+      if (file.data_uri) return file.data_uri;
+      if (file.data_b64) return "data:application/octet-stream;base64," + file.data_b64;
+      if (file.type === "text") return "data:text/plain;charset=utf-8," + encodeURIComponent(file.content);
+      return "#";
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement("div");
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // ---- View switching ----
+    function switchView(view) {
+      document.querySelectorAll(".view-tab").forEach(t => t.classList.remove("active"));
+      document.querySelectorAll(".view-panel").forEach(p => p.classList.remove("active"));
+      document.querySelector(`[onclick="switchView('${view}')"]`).classList.add("active");
+      document.getElementById("panel-" + view).classList.add("active");
+    }
+
+    // ---- Benchmark rendering ----
+    function renderBenchmark() {
+      const data = EMBEDDED_DATA.benchmark;
+      if (!data) return;
+
+      // Show the tabs
+      document.getElementById("view-tabs").style.display = "flex";
+
+      const container = document.getElementById("benchmark-content");
+      const summary = data.run_summary || {};
+      const metadata = data.metadata || {};
+      const notes = data.notes || [];
+
+      let html = "";
+
+      // Header
+      html += "<h2 style='font-family: Poppins, sans-serif; margin-bottom: 0.5rem;'>Benchmark Results</h2>";
+      html += "<p style='color: var(--text-muted); font-size: 0.875rem; margin-bottom: 1.25rem;'>";
+      if (metadata.skill_name) html += "<strong>" + escapeHtml(metadata.skill_name) + "</strong> &mdash; ";
+      if (metadata.timestamp) html += metadata.timestamp + " &mdash; ";
+      if (metadata.evals_run) html += "Evals: " + metadata.evals_run.join(", ") + " &mdash; ";
+      html += (metadata.runs_per_configuration || "?") + " runs per configuration";
+      html += "</p>";
+
+      // Summary table
+      html += '<table class="benchmark-table">';
+
+      function fmtStat(stat, pct) {
+        if (!stat) return "—";
+        const suffix = pct ? "%" : "";
+        const m = pct ? (stat.mean * 100).toFixed(0) : stat.mean.toFixed(1);
+        const s = pct ? (stat.stddev * 100).toFixed(0) : stat.stddev.toFixed(1);
+        return m + suffix + " ± " + s + suffix;
+      }
+
+      function deltaClass(val) {
+        if (!val) return "";
+        const n = parseFloat(val);
+        if (n > 0) return "benchmark-delta-positive";
+        if (n < 0) return "benchmark-delta-negative";
+        return "";
+      }
+
+      // Discover config names dynamically (everything except "delta")
+      const configs = Object.keys(summary).filter(k => k !== "delta");
+      const configA = configs[0] || "config_a";
+      const configB = configs[1] || "config_b";
+      const labelA = configA.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+      const labelB = configB.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+      const a = summary[configA] || {};
+      const b = summary[configB] || {};
+      const delta = summary.delta || {};
+
+      html += "<thead><tr><th>Metric</th><th>" + escapeHtml(labelA) + "</th><th>" + escapeHtml(labelB) + "</th><th>Delta</th></tr></thead>";
+      html += "<tbody>";
+
+      html += "<tr><td><strong>Pass Rate</strong></td>";
+      html += "<td>" + fmtStat(a.pass_rate, true) + "</td>";
+      html += "<td>" + fmtStat(b.pass_rate, true) + "</td>";
+      html += '<td class="' + deltaClass(delta.pass_rate) + '">' + (delta.pass_rate || "—") + "</td></tr>";
+
+      // Time (only show row if data exists)
+      if (a.time_seconds || b.time_seconds) {
+        html += "<tr><td><strong>Time (s)</strong></td>";
+        html += "<td>" + fmtStat(a.time_seconds, false) + "</td>";
+        html += "<td>" + fmtStat(b.time_seconds, false) + "</td>";
+        html += '<td class="' + deltaClass(delta.time_seconds) + '">' + (delta.time_seconds ? delta.time_seconds + "s" : "—") + "</td></tr>";
+      }
+
+      // Tokens (only show row if data exists)
+      if (a.tokens || b.tokens) {
+        html += "<tr><td><strong>Tokens</strong></td>";
+        html += "<td>" + fmtStat(a.tokens, false) + "</td>";
+        html += "<td>" + fmtStat(b.tokens, false) + "</td>";
+        html += '<td class="' + deltaClass(delta.tokens) + '">' + (delta.tokens || "—") + "</td></tr>";
+      }
+
+      html += "</tbody></table>";
+
+      // Per-eval breakdown (if runs data available)
+      const runs = data.runs || [];
+      if (runs.length > 0) {
+        const evalIds = [...new Set(runs.map(r => r.eval_id))].sort((a, b) => a - b);
+
+        html += "<h3 style='font-family: Poppins, sans-serif; margin-bottom: 0.75rem;'>Per-Eval Breakdown</h3>";
+
+        const hasTime = runs.some(r => r.result && r.result.time_seconds != null);
+        const hasErrors = runs.some(r => r.result && r.result.errors > 0);
+
+        for (const evalId of evalIds) {
+          const evalRuns = runs.filter(r => r.eval_id === evalId);
+          const evalName = evalRuns[0] && evalRuns[0].eval_name ? evalRuns[0].eval_name : "Eval " + evalId;
+
+          html += "<h4 style='font-family: Poppins, sans-serif; margin: 1rem 0 0.5rem; color: var(--text);'>" + escapeHtml(evalName) + "</h4>";
+          html += '<table class="benchmark-table">';
+          html += "<thead><tr><th>Config</th><th>Run</th><th>Pass Rate</th>";
+          if (hasTime) html += "<th>Time (s)</th>";
+          if (hasErrors) html += "<th>Crashes During Execution</th>";
+          html += "</tr></thead>";
+          html += "<tbody>";
+
+          // Group by config and render with average rows
+          const configGroups = [...new Set(evalRuns.map(r => r.configuration))];
+          for (let ci = 0; ci < configGroups.length; ci++) {
+            const config = configGroups[ci];
+            const configRuns = evalRuns.filter(r => r.configuration === config);
+            if (configRuns.length === 0) continue;
+
+            const rowClass = ci === 0 ? "benchmark-row-with" : "benchmark-row-without";
+            const configLabel = config.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+
+            for (const run of configRuns) {
+              const r = run.result || {};
+              const prClass = r.pass_rate >= 0.8 ? "benchmark-delta-positive" : r.pass_rate < 0.5 ? "benchmark-delta-negative" : "";
+              html += '<tr class="' + rowClass + '">';
+              html += "<td>" + configLabel + "</td>";
+              html += "<td>" + run.run_number + "</td>";
+              html += '<td class="' + prClass + '">' + ((r.pass_rate || 0) * 100).toFixed(0) + "% (" + (r.passed || 0) + "/" + (r.total || 0) + ")</td>";
+              if (hasTime) html += "<td>" + (r.time_seconds != null ? r.time_seconds.toFixed(1) : "—") + "</td>";
+              if (hasErrors) html += "<td>" + (r.errors || 0) + "</td>";
+              html += "</tr>";
+            }
+
+            // Average row
+            const rates = configRuns.map(r => (r.result || {}).pass_rate || 0);
+            const avgRate = rates.reduce((a, b) => a + b, 0) / rates.length;
+            const avgPrClass = avgRate >= 0.8 ? "benchmark-delta-positive" : avgRate < 0.5 ? "benchmark-delta-negative" : "";
+            html += '<tr class="benchmark-row-avg ' + rowClass + '">';
+            html += "<td>" + configLabel + "</td>";
+            html += "<td>Avg</td>";
+            html += '<td class="' + avgPrClass + '">' + (avgRate * 100).toFixed(0) + "%</td>";
+            if (hasTime) {
+              const times = configRuns.map(r => (r.result || {}).time_seconds).filter(t => t != null);
+              html += "<td>" + (times.length ? (times.reduce((a, b) => a + b, 0) / times.length).toFixed(1) : "—") + "</td>";
+            }
+            if (hasErrors) html += "<td></td>";
+            html += "</tr>";
+          }
+          html += "</tbody></table>";
+
+          // Per-assertion detail for this eval
+          const runsWithExpectations = {};
+          for (const config of configGroups) {
+            runsWithExpectations[config] = evalRuns.filter(r => r.configuration === config && r.expectations && r.expectations.length > 0);
+          }
+          const hasAnyExpectations = Object.values(runsWithExpectations).some(runs => runs.length > 0);
+          if (hasAnyExpectations) {
+            // Collect all unique assertion texts across all configs
+            const allAssertions = [];
+            const seen = new Set();
+            for (const config of configGroups) {
+              for (const run of runsWithExpectations[config]) {
+                for (const exp of (run.expectations || [])) {
+                  if (!seen.has(exp.text)) {
+                    seen.add(exp.text);
+                    allAssertions.push(exp.text);
+                  }
+                }
+              }
+            }
+
+            html += '<table class="benchmark-table" style="margin-top: 0.5rem;">';
+            html += "<thead><tr><th>Assertion</th>";
+            for (const config of configGroups) {
+              const label = config.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+              html += "<th>" + escapeHtml(label) + "</th>";
+            }
+            html += "</tr></thead><tbody>";
+
+            for (const assertionText of allAssertions) {
+              html += "<tr><td>" + escapeHtml(assertionText) + "</td>";
+
+              for (const config of configGroups) {
+                html += "<td>";
+                for (const run of runsWithExpectations[config]) {
+                  const exp = (run.expectations || []).find(e => e.text === assertionText);
+                  if (exp) {
+                    const cls = exp.passed ? "benchmark-delta-positive" : "benchmark-delta-negative";
+                    const icon = exp.passed ? "\u2713" : "\u2717";
+                    html += '<span class="' + cls + '" title="Run ' + run.run_number + ': ' + escapeHtml(exp.evidence || "") + '">' + icon + "</span> ";
+                  } else {
+                    html += "— ";
+                  }
+                }
+                html += "</td>";
+              }
+              html += "</tr>";
+            }
+            html += "</tbody></table>";
+          }
+        }
+      }
+
+      // Notes
+      if (notes.length > 0) {
+        html += '<div class="benchmark-notes">';
+        html += "<h3>Analysis Notes</h3>";
+        html += "<ul>";
+        for (const note of notes) {
+          html += "<li>" + escapeHtml(note) + "</li>";
+        }
+        html += "</ul></div>";
+      }
+
+      container.innerHTML = html;
+    }
+
+    // ---- Start ----
+    init();
+    renderBenchmark();
+  </script>
+</body>
+</html>

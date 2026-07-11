@@ -45,6 +45,9 @@ pandas>=2.0.0,<3.0
 scipy>=1.10.0
 scikit-learn>=1.3.0,<2.0
 statsmodels>=0.14.0
+# GARCH(1,1) conditional-volatility estimation for the volatility feature family
+# (Realized_Vol_20 / EWMA_Vol_30 / GARCH_Cond_Vol) in Feature_Engineering.py.
+arch>=6.0.0
 joblib>=1.3.0
 
 

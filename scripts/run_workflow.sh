@@ -3,16 +3,16 @@
 # run_workflow.sh — Stock Market Automation workflow runner
 #
 # Usage:
-#   ./run_workflow.sh                        # full run, all stocks
-#   ./run_workflow.sh --stock RELIANCE       # single stock
-#   ./run_workflow.sh --stock "RELIANCE,TCS" # multiple stocks
-#   ./run_workflow.sh --force                # force even if no sheet changes
-#   ./run_workflow.sh --dry-run              # validate without writing
-#   ./run_workflow.sh --cli                  # run via Docker CLI (not API)
-#   ./run_workflow.sh --local                # run directly with local Python
-#   ./run_workflow.sh status                 # print last-run status and exit
-#   ./run_workflow.sh health                 # health-check only
-#   ./run_workflow.sh logs                   # tail live container logs
+#   ./scripts/run_workflow.sh                        # full run, all stocks
+#   ./scripts/run_workflow.sh --stock RELIANCE       # single stock
+#   ./scripts/run_workflow.sh --stock "RELIANCE,TCS" # multiple stocks
+#   ./scripts/run_workflow.sh --force                # force even if no sheet changes
+#   ./scripts/run_workflow.sh --dry-run              # validate without writing
+#   ./scripts/run_workflow.sh --cli                  # run via Docker CLI (not API)
+#   ./scripts/run_workflow.sh --local                # run directly with local Python
+#   ./scripts/run_workflow.sh status                 # print last-run status and exit
+#   ./scripts/run_workflow.sh health                 # health-check only
+#   ./scripts/run_workflow.sh logs                   # tail live container logs
 # =============================================================================
 
 set -euo pipefail
@@ -21,7 +21,7 @@ set -euo pipefail
 API_URL="${API_BASE_URL:-http://localhost:8000}"
 TIMEOUT=1800          # seconds before giving up waiting for a run to finish
 POLL_INTERVAL=5       # seconds between status polls
-COMPOSE_PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+COMPOSE_PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 VENV_PYTHON="${COMPOSE_PROJECT_DIR}/venv/bin/python"
 
 # ── Colours ───────────────────────────────────────────────────────────────────

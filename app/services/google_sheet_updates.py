@@ -41,7 +41,12 @@ _OVERWRITE_NULL_VALUES = {"nan", "none", "nat", "inf", "-inf", ""}
 
 
 def _clean_cell_for_sheets(value: Any) -> Any:
-    """Convert a value to something safe for Google Sheets API."""
+    """Convert a value to something safe for Google Sheets API.
+
+    gspread serialises cell values with json.dumps, so every value must be
+    a JSON-native type (str / int / float / bool / None).  pandas Timestamp,
+    numpy scalars, and NaT/NaN all require explicit handling.
+    """
     if value is None:
         return ""
     if isinstance(value, float) and not math.isfinite(value):
@@ -52,8 +57,15 @@ def _clean_cell_for_sheets(value: Any) -> Any:
         return "" if not np.isfinite(value) else float(value)
     if isinstance(value, bool):
         return int(value)  # 0 / 1 rather than True / False
+    # pd.Timestamp / datetime.datetime / datetime.date → ISO-8601 string so
+    # gspread's json.dumps doesn't raise "Timestamp is not JSON serializable".
+    import datetime as _dt
+    if isinstance(value, pd.Timestamp):
+        return "" if pd.isna(value) else value.isoformat()
+    if isinstance(value, (_dt.datetime, _dt.date)):
+        return value.isoformat()
     text = str(value).strip()
-    return "" if text.lower() in _OVERWRITE_NULL_VALUES else value
+    return "" if text.lower() in _OVERWRITE_NULL_VALUES else text
 
 
 def overwrite_worksheet_with_engineered_data(

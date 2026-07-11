@@ -161,6 +161,9 @@ def is_transient_error(exc: BaseException) -> bool:
         "timeout", "timed out", "temporarily", "unavailable",
         "connection", "broken pipe", "reset by peer", "ssl",
         "deadline", "internal error", "backenderror",
+        # WorkflowError raised by _run_subprocess when stderr contains a quota
+        # marker — the wrapper message itself says "transient failure".
+        "transient failure",
     )
     return any(marker in text for marker in transient_markers)
 
@@ -922,39 +925,54 @@ class WorkflowOrchestrator:
         The pipeline is Google-Sheets-sourced, so the 'local workbook' is a
         deterministic on-disk mirror used for integrity checks (stage 6) and
         feature engineering (stage 7). Writes are atomic.
+
+        Pacing: a 1.5-second inter-request sleep is inserted between each
+        worksheet read to avoid bursting Google Sheets' "Read requests per
+        minute per user" quota after Stage 3 (Data_update.py) has already
+        consumed a large portion of the budget.
         """
         import pandas as pd  # local import keeps orchestrator import-light
         ws_objs = self.ctx.get("_worksheet_objs", {})
         store: Dict[str, Any] = {}
         snap_dir = self.cfg.data_store_dir
         total_rows = 0
-        for title in self.ctx["worksheets"]:
-            ws = ws_objs.get(title)
-            if ws is None:
-                store[title] = {"status": "missing_worksheet"}
-                continue
-            values = retry_with_backoff(
-                ws.get_all_values, label=f"{title}: snapshot",
-                attempts=self.cfg.google_retries, base_delay=self.cfg.retry_backoff,
-                logger=self.log, component="sheets",
-            )
-            if not values:
-                store[title] = {"status": "empty"}
-                continue
-            headers = [str(h).strip() for h in values[0]]
-            width = len(headers)
-            rows = [list(row) + [""] * (width - len(row)) for row in values[1:]]
-            df = pd.DataFrame([row[:width] for row in rows], columns=headers)
-            csv_path = snap_dir / f"{title}.csv"
-            tmp = csv_path.with_suffix(".csv.tmp")
-            df.to_csv(tmp, index=False)
-            os.replace(tmp, csv_path)
-            total_rows += len(df)
-            store[title] = {
-                "status": "snapshotted", "rows": len(df),
-                "columns": len(headers), "path": str(csv_path),
-            }
-        self.ctx["data_store"] = store
+        # Always publish whatever partial results we have so Stage 6 can work
+        # with the worksheets that did succeed even if we error mid-loop.
+        try:
+            for idx, title in enumerate(self.ctx["worksheets"]):
+                # Pace requests: skip delay on first worksheet, then wait 1.5 s
+                # between each subsequent call (~40 req/min, well inside quota).
+                if idx > 0:
+                    time.sleep(1.5)
+                ws = ws_objs.get(title)
+                if ws is None:
+                    store[title] = {"status": "missing_worksheet"}
+                    continue
+                values = retry_with_backoff(
+                    ws.get_all_values, label=f"{title}: snapshot",
+                    attempts=self.cfg.google_retries, base_delay=self.cfg.retry_backoff,
+                    logger=self.log, component="sheets",
+                )
+                if not values:
+                    store[title] = {"status": "empty"}
+                    continue
+                headers = [str(h).strip() for h in values[0]]
+                width = len(headers)
+                rows = [list(row) + [""] * (width - len(row)) for row in values[1:]]
+                df = pd.DataFrame([row[:width] for row in rows], columns=headers)
+                csv_path = snap_dir / f"{title}.csv"
+                tmp = csv_path.with_suffix(".csv.tmp")
+                df.to_csv(tmp, index=False)
+                os.replace(tmp, csv_path)
+                total_rows += len(df)
+                store[title] = {
+                    "status": "snapshotted", "rows": len(df),
+                    "columns": len(headers), "path": str(csv_path),
+                }
+        finally:
+            # Persist partial results so Stage 6 can validate whichever
+            # worksheets were snapshotted before any error occurred.
+            self.ctx["data_store"] = store
         r.details = {"store_dir": str(snap_dir),
                      "worksheets_snapshotted": sum(
                          1 for v in store.values() if v.get("status") == "snapshotted"),
@@ -1009,6 +1027,20 @@ class WorkflowOrchestrator:
     def stage_06_validate_integrity(self, r: StageResult) -> None:
         import pandas as pd
         store = self.ctx["data_store"]
+
+        # If Stage 4 failed entirely (no snapshots at all), skip integrity
+        # validation here — Stage 4's own failure already blocks the pipeline.
+        # Raising a second StageFailure would obscure the real root cause.
+        snapshotted = [t for t in self.ctx["worksheets"]
+                       if store.get(t, {}).get("status") == "snapshotted"]
+        if not snapshotted:
+            r.status = "skipped"
+            r.details = {"skipped_reason": "Stage 4 produced no snapshots — "
+                                           "integrity check deferred to next run"}
+            self.log.event("sheets", "WARNING", "integrity_skipped",
+                           "no snapshots available from Stage 4; skipping integrity gate")
+            return
+
         report: Dict[str, Any] = {}
         problems: List[str] = []
         healthy = 0
@@ -1021,10 +1053,26 @@ class WorkflowOrchestrator:
                 continue
             df = pd.read_csv(csv_path)
             cols_lower = {str(c).strip().lower(): c for c in df.columns}
-            missing = [c for c in REQUIRED_SHEET_COLUMNS
-                       if c.lower() not in cols_lower]
-            date_col = next((cols_lower[k] for k in ("date", "date_str", "datetime")
-                             if k in cols_lower), None)
+
+            # Flexible OHLCV detection — mirrors Feature_Engineering.find_ohlcv_columns.
+            # Sheets may use prefixed names like Open_RELIANCE.NS or Date_str
+            # rather than the plain canonical names, so we check with prefix matching.
+            def _has_col(key: str) -> bool:
+                """True if any column exactly matches *key* or starts with *key*_."""
+                lk = key.lower()
+                return lk in cols_lower or any(
+                    lc == lk or lc.startswith(f"{lk}_")
+                    for lc in cols_lower
+                )
+
+            missing = [c for c in REQUIRED_SHEET_COLUMNS if not _has_col(c)]
+
+            # Date column: accept date, date_str, datetime, or any date_* variant.
+            date_col = next(
+                (cols_lower[k] for k in cols_lower
+                 if k == "date" or k in ("date_str", "datetime") or k.startswith("date_")),
+                None,
+            )
             issues: List[str] = []
             if missing:
                 issues.append(f"missing columns {missing}")
@@ -1169,23 +1217,59 @@ class WorkflowOrchestrator:
                 problems.append(f"{title}: engineered file unreadable")
                 continue
             cols = set(map(str, df.columns))
-            missing_feats = [c for c in required_features if c not in cols]
+            # Build lowercase → actual-name map for prefix-aware matching.
+            # The FE output retains the Google Sheet's prefixed column names
+            # (e.g. Open_RELIANCE.NS) instead of plain "Open" / "High" etc.
+            # We mirror the same tolerance used in Stage 6's integrity check.
+            cols_lower: Dict[str, str] = {str(c).lower(): str(c) for c in df.columns}
+
+            def _has_feat(key: str) -> bool:
+                lk = key.lower()
+                return lk in cols_lower or any(
+                    lc == lk or lc.startswith(f"{lk}_")
+                    for lc in cols_lower
+                )
+
+            def _actual_col(key: str) -> Optional[str]:
+                """Return the real DataFrame column name for a logical feature key."""
+                lk = key.lower()
+                if lk in cols_lower:
+                    return cols_lower[lk]
+                return next(
+                    (cols_lower[lc] for lc in cols_lower if lc.startswith(f"{lk}_")),
+                    None,
+                )
+
+            missing_feats = [c for c in required_features if not _has_feat(c)]
             has_labels = any(c in cols for c in label_cols) if label_cols else None
-            # column is "alive" if its last 5 rows contain at least one finite value
+
+            # Check whether each required feature has at least one finite value
+            # in its last 5 rows.  Long-period indicators (e.g. SMA_50, EMA_50)
+            # will be entirely NaN when the window holds fewer rows than the
+            # indicator's look-back period — this is mathematically expected and
+            # the inference stage handles it via imputation.  We therefore treat
+            # NaN-tail as a WARNING (degraded) rather than a hard block, and
+            # only escalate to FAILED when columns are outright missing.
             stale_cols = []
             for c in required_features:
-                if c in cols:
-                    tail = pd.to_numeric(df[c].tail(5), errors="coerce")
+                actual = _actual_col(c)
+                if actual is not None:
+                    tail = pd.to_numeric(df[actual].tail(5), errors="coerce")
                     if tail.notna().sum() == 0:
                         stale_cols.append(c)
-            issues = []
+
+            # Blocking issues abort this worksheet; stale-tail issues are warnings.
+            blocking_issues = []
+            warning_issues = []
             if missing_feats:
-                issues.append(f"missing feature columns: {missing_feats}")
-            if stale_cols:
-                issues.append(f"all-NaN tail in: {stale_cols}")
+                blocking_issues.append(f"missing feature columns: {missing_feats}")
             if len(df) == 0:
-                issues.append("engineered frame is empty")
-            ok = not issues
+                blocking_issues.append("engineered frame is empty")
+            if stale_cols:
+                warning_issues.append(f"all-NaN tail in: {stale_cols}")
+
+            issues = blocking_issues + warning_issues
+            ok = not blocking_issues        # NaN-tail alone does NOT block
             report[title] = {
                 "ok": ok, "rows": int(len(df)),
                 "feature_columns_present": len(required_features) - len(missing_feats),
@@ -1196,7 +1280,10 @@ class WorkflowOrchestrator:
             if ok:
                 valid += 1
             else:
-                problems.extend(f"{title}: {i}" for i in issues)
+                problems.extend(f"{title}: {i}" for i in blocking_issues)
+            for w in warning_issues:
+                self.log.event("feature_engineering", "WARNING",
+                               "feature_nan_tail", f"{title}: {w}")
         r.details = {"required_feature_count": len(required_features),
                      "valid_worksheets": valid, "problems": problems,
                      "per_worksheet": report}
@@ -1478,9 +1565,13 @@ class WorkflowOrchestrator:
         if summary.get("status") == "error":
             problems.append("model pipeline status=error")
 
-        # incomplete-workflow detection: every non-skipped stage finished
+        # incomplete-workflow detection: every non-skipped stage finished.
+        # Exclude Stage 14 itself — its own StageResult is still "pending"
+        # while this function runs, which would cause a self-referential false
+        # positive ("unfinished stages: ['Validate final outputs']") on every run.
         unfinished = [s.name for s in self.stages
-                      if s.status not in ("ok", "skipped", "degraded")]
+                      if s.status not in ("ok", "skipped", "degraded")
+                      and s.index != r.index]
         checks["unfinished_stages"] = unfinished
         if unfinished:
             problems.append(f"unfinished stages: {unfinished}")

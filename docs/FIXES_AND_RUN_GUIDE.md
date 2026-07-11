@@ -4,14 +4,14 @@
 
 ```bash
 cd ~/Documents/Stock_Market
-./run_workflow.sh           # full run (Docker API, all sheets)
-./run_workflow.sh --local   # direct Python (no Docker)
+./scripts/run_workflow.sh           # full run (Docker API, all sheets)
+./scripts/run_workflow.sh --local   # direct Python (no Docker)
 ```
 
 Or via the direct orchestrator:
 ```bash
-./run_full_workflow.sh          # dry-run (default)
-./run_full_workflow.sh --live   # real end-to-end run
+./scripts/run_full_workflow.sh          # dry-run (default)
+./scripts/run_full_workflow.sh --live   # real end-to-end run
 ```
 
 ---
@@ -143,7 +143,7 @@ sync_decision_features()
 
 ## Validation Checklist
 
-After running `./run_workflow.sh` (or `./run_full_workflow.sh --live`), verify:
+After running `./scripts/run_workflow.sh` (or `./scripts/run_full_workflow.sh --live`), verify:
 
 1. **No silent skip:** The workflow log should NOT contain `"should_run": false`
    or `"route": "SKIP"`.
