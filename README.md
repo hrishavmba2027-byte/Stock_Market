@@ -58,20 +58,23 @@ cd Stock_Market
 #    beyond filling in your own secrets/IDs.
 cp .env.example .env
 
-# 2. Google service-account JSON (gitignored). Download it from the GCP
-#    console (IAM → Service Accounts → Keys), then copy it into credentials/.
-#    ⚠ "~/Downloads/your-service-account.json" below is a PLACEHOLDER —
-#    replace it with the actual name/location of the file you downloaded.
-#    Skip this step if credentials/ already has your JSON files.
+# 2. Credentials (gitignored) — the Google service-account JSON and the
+#    Firebase Admin SDK JSON must both end up inside credentials/.
+#
+#    EXACT copy-paste (fresh clone on THIS Mac — copies the working
+#    credentials and .env from the existing checkout):
 mkdir -p credentials
-cp ~/Downloads/your-service-account.json credentials/
-#  …then point GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_CREDENTIALS in .env at it.
-
-# 2b. Firebase Admin SDK JSON (gitignored) — stores ingested news + sentiment
-#     analysis in your Firebase project's Firestore. Download from Firebase
-#     console → Project settings → Service accounts → "Generate new private
-#     key" (again: replace the ~/Downloads path with your actual file):
-cp ~/Downloads/your-firebase-adminsdk.json credentials/Firebase_Credentials.json
+cp /Users/hrishavmajumder/Documents/Stock_Market/credentials/Credentials_New.json credentials/
+cp /Users/hrishavmajumder/Documents/Stock_Market/credentials/Firebase_Credentials.json credentials/
+cp /Users/hrishavmajumder/Documents/Stock_Market/credentials/service-account.json credentials/
+cp /Users/hrishavmajumder/Documents/Stock_Market/.env .env
+#
+#    On a brand-new computer instead: download the two keys first
+#    (GCP console → IAM → Service Accounts → Keys, and Firebase console →
+#    Project settings → Service accounts → "Generate new private key"),
+#    then copy them from wherever the browser saved them, e.g.:
+#      cp ~/Downloads/<your-gcp-key>.json      credentials/Credentials_New.json
+#      cp ~/Downloads/<your-firebase-key>.json credentials/Firebase_Credentials.json
 
 # 3a. Python environment (manual)
 python3.11 -m venv venv
