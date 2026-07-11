@@ -1,9 +1,12 @@
 # Stock Market ML Automation
 
+Repository: <https://github.com/hrishavmba2027-byte/Stock_Market>
+
 End-to-end NSE stock forecasting pipeline: OHLCV + news/social ingestion → feature
 engineering (29 indicators + forward-return labels) → a PyTorch ensemble
 (Dense / LSTM / Transformer) producing multi-horizon quantile forecasts → results
-written back to Google Sheets. Ships with a FastAPI server, a Google-Sheets
+written back to Google Sheets. Ingested news and its sentiment analysis are
+stored in Firebase (Firestore). Ships with a FastAPI server, a Google-Sheets
 polling watcher, Docker Compose services, and scheduled GitHub Actions.
 
 ## Directory layout
@@ -34,7 +37,7 @@ Stock_Market/
 ├── tests/                     ← pytest suite
 ├── Data/                      ← local workbooks / parquet artifacts
 ├── outputs/                   ← models, metadata, inference results
-├── credentials/               ← service-account JSON (gitignored)
+├── credentials/               ← Google + Firebase service-account JSONs (gitignored)
 ├── state/, logs/, cache/      ← runtime state
 ├── Dockerfile, docker-compose.yml
 ├── requirements.txt           ← runtime deps (+ requirements-dev.txt, -lock.txt)
@@ -48,7 +51,7 @@ path, and they import each other as top-level modules.
 ## Setup (fresh machine)
 
 ```bash
-git clone <repo-url> Stock_Market
+git clone https://github.com/hrishavmba2027-byte/Stock_Market.git
 cd Stock_Market
 
 # 1. Environment file — all paths inside are relative, so no edits needed
@@ -59,6 +62,12 @@ cp .env.example .env
 #    GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_CREDENTIALS entries in .env at it:
 mkdir -p credentials
 cp /path/to/your-service-account.json credentials/
+
+# 2b. Firebase Admin SDK JSON (gitignored) — used to store ingested news and
+#     its sentiment analysis in your Firebase project's Firestore.
+#     Download it from Firebase console → Project settings → Service accounts
+#     → "Generate new private key", then point FIREBASE_CREDENTIALS in .env at it:
+cp /path/to/your-firebase-adminsdk.json credentials/Firebase_Credentials.json
 
 # 3a. Python environment (manual)
 python3.11 -m venv venv
@@ -159,18 +168,48 @@ Or the interactive runner (talks to a running API / Docker stack):
 ./scripts/run_workflow.sh logs                       # tail container logs
 ```
 
-### Ingestion & feature jobs
+### Ingestion & feature jobs (news → Firebase)
+
+News, sentiment analysis, Reddit, X, and fundamentals are stored in the
+Firebase project pointed at by `FIREBASE_CREDENTIALS` in `.env` (Firestore
+collections `news`, `sentiment_latest`, `fundamentals`, …). If that variable
+is unset, writes fall back to the `GOOGLE_CREDENTIALS` service account.
+Every module loads `.env` itself, so these run directly from the repo root
+with the venv active — no Docker needed. Verified live:
+
+```bash
+python -m ingestion.news_ingest --tickers RELIANCE,TCS,INFY   # news → Firestore `news`
+python -m features.sentiment                          # FinBERT analysis → `sentiment_latest`
+```
+
+The local `Data/archive/*.parquet` files are only upload retry-queues — they
+are deleted once their rows reach Firestore. Sentiment therefore reads the
+news back from the Firestore `news` collection when the local file is absent,
+so the two commands above work standalone in any order.
+
+All jobs:
 
 ```bash
 python -m ingestion.collect_all                      # everything in one shot
 python -m ingestion.collect_all --no-sentiment
 python -m ingestion.collect_all --tickers RELIANCE,TCS
-python -m ingestion.news_ingest                      # yfinance news
-python -m ingestion.reddit_ingest                    # Reddit (needs REDDIT_* in .env)
+python -m ingestion.news_ingest                      # yfinance news (all NIFTY-50 tickers)
+python -m ingestion.reddit_ingest                    # Reddit (anonymous scrape)
 python -m ingestion.x_ingest                         # X/Twitter scrape
 python -m ingestion.fundamentals --lookback-quarters 4
 python -m features.cross_sectional                   # NIFTY/VIX index cache
-python -m features.sentiment                         # FinBERT sentiment features
+```
+
+Check what landed in Firebase at any time:
+
+```bash
+python -c "
+from dotenv import load_dotenv; load_dotenv()
+from ingestion._firestore import init_firestore_client
+c = init_firestore_client()
+print('project:', c.project)
+for d in c.collection('news').stream(): print(' news doc:', d.id)
+"
 ```
 
 ### MLOps & utilities
@@ -189,47 +228,49 @@ pytest -q                                            # full suite
 pytest tests/test_monthly_finetune.py -q             # single module
 ```
 
-## Docker
+## Running live in phases (no Docker — recommended locally)
+
+The local venv is the lightest way to run live: no image builds, no container
+memory overhead, and PyTorch uses Apple-Silicon MPS automatically. Run stages
+sequentially for a limited worksheet batch (verified live end-to-end):
+
+```bash
+source venv/bin/activate
+
+# Phase 1 — append fresh OHLCV rows to the operational sheet (LIVE write)
+python Data_update.py --worksheets RELIANCE
+
+# Phase 2 — ensemble forecasts written back to the sheet (LIVE write)
+python main.py --worksheets RELIANCE
+
+# Phase 3 — news + sentiment analysis stored in Firebase (LIVE write)
+python -m ingestion.news_ingest --tickers RELIANCE,TCS,INFY
+python -m features.sentiment
+
+# Repeat phases 1–2 for the next worksheet batch:
+python Data_update.py --worksheets TCS,INFY
+python main.py --worksheets TCS,INFY
+```
+
+## Docker (optional — for deployment parity)
 
 ```bash
 docker compose build                                 # build the image
-docker compose up -d                                 # start api (:8000) + watcher
+docker compose up -d api                             # API only (add watcher when needed)
 docker compose ps                                    # service status
 docker compose logs -f                               # follow logs
 docker compose down                                  # stop everything
 ```
 
-### Running in phases on memory-constrained machines
-
-Docker (torch + FinBERT) is memory-hungry. Instead of `docker compose up -d`
-(which starts api **and** watcher together), bring services up one at a time
-and stop them when done:
-
-```bash
-docker compose up -d api                             # API only, no watcher
-docker compose stop api                              # free the memory when done
-```
-
-For live runs, split the work into sequential one-shot containers instead of
-one big `run_full_workflow.py --live` pass — data update first, then inference,
-each for a limited worksheet batch. This exact sequence is verified end-to-end
-(sheet append → forecasts written → rolling 60-row cleanup → archive):
+Docker (torch + FinBERT) is memory-hungry — prefer the local venv above on
+laptops, start services one at a time, and stop them when done
+(`docker compose stop api`). The containerized equivalents of the phased
+live run (verified earlier) are:
 
 ```bash
-# Phase 1 — append fresh OHLCV rows to the operational sheet (LIVE write)
 docker compose --profile tools run --rm pipeline python Data_update.py --worksheets RELIANCE
-
-# Phase 2 — ensemble forecasts written back to the sheet (LIVE write)
 docker compose --profile tools run --rm pipeline python main.py --worksheets RELIANCE --device cpu
-
-# Repeat both phases for the next batch:
-docker compose --profile tools run --rm pipeline python Data_update.py --worksheets TCS,INFY
-docker compose --profile tools run --rm pipeline python main.py --worksheets TCS,INFY --device cpu
 ```
-
-Each `run --rm` container exits and frees its memory before the next starts.
-Prediction CSV/metrics land in `outputs/main_inference/` on the host via the
-compose bind mounts (a plain `docker run` without those mounts would lose them).
 
 One-shot jobs run through the `pipeline` service (opt-in `tools` profile):
 
@@ -290,6 +331,8 @@ Copy `.env.example` → `.env` and fill in. Highlights:
 | `TRAIN_END`, `TEST_END`, `BACK_TEST_START`, `BACK_TEST_END` | Train/test/backtest split dates |
 | `FORECAST_DAYS`, `ROLLING_OPERATIONAL_ROWS` | Forecast horizon & sheet retention |
 | `DEVICE` | `auto` (CUDA → MPS → CPU), `cpu`, `cuda`, `mps` |
+| `FIREBASE_CREDENTIALS` | Firebase Admin SDK JSON for the news + sentiment-analysis Firestore project; all Firestore writes prefer this, falling back to `GOOGLE_CREDENTIALS` when unset |
+| `FIREBASE_PROJECT` | Optional explicit Firebase project id (default: read from the credentials JSON) |
 | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` / `REDDIT_USER_AGENT` | Reddit ingestion |
 | `CREDENTIALS_FILE` | Credentials filename used by the docker-compose mount |
 

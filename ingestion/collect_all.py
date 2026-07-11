@@ -240,7 +240,8 @@ def _firestore_enabled(args: argparse.Namespace) -> bool:
     if args.no_firestore:
         return False
     return bool(
-        os.environ.get("GOOGLE_CREDENTIALS")
+        os.environ.get("FIREBASE_CREDENTIALS")
+        or os.environ.get("GOOGLE_CREDENTIALS")
         or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     )
 

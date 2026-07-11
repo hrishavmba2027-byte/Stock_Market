@@ -33,6 +33,8 @@ x-app-shared: &app-shared
     BASE_DIR: /app
     GOOGLE_CREDENTIALS: /app/credentials/Credentials_New.json
     GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/Credentials_New.json
+    # Dedicated Firebase project for news + sentiment-analysis storage.
+    FIREBASE_CREDENTIALS: /app/credentials/Firebase_Credentials.json
     WORKFLOW_STATE_PATH: /app/state/workflow_state.json
     MONTHLY_FINETUNE_STATE_FILE: /app/state/monthly_finetune_state.json
     LOGS_DIR: /app/logs
@@ -49,6 +51,8 @@ x-app-shared: &app-shared
     RETRY_BACKOFF_SECONDS: "15.0"
   volumes:
     - ./credentials/Credentials_New.json:/app/credentials/Credentials_New.json:ro
+    # Firebase Admin SDK service account (news + analysis Firestore project).
+    - ./credentials/Firebase_Credentials.json:/app/credentials/Firebase_Credentials.json:ro
     - ./logs:/app/logs
     - ./state:/app/state
     - ./Data:/app/Data

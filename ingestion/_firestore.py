@@ -2,11 +2,33 @@
 
 Centralizes credential resolution so every ingest module (fundamentals,
 news, X) loads the same service account the same way.
+
+Credential precedence:
+  1. ``FIREBASE_CREDENTIALS``            — dedicated Firebase service account
+     (news + analysis storage project), preferred when set.
+  2. ``GOOGLE_CREDENTIALS`` / ``GOOGLE_APPLICATION_CREDENTIALS`` — the Sheets
+     service account, kept as a fallback so existing deployments keep working.
+
+Relative paths resolve against the repo root, matching utils/google_auth.py.
 """
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple
+
+# ingestion/_firestore.py lives at <project_root>/ingestion/_firestore.py
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _resolve_path(candidate: Optional[str]) -> Optional[str]:
+    """Expand a credentials path; relative paths anchor to the repo root."""
+    if not candidate:
+        return None
+    p = Path(candidate).expanduser()
+    if not p.is_absolute():
+        p = (_PROJECT_ROOT / p).resolve()
+    return str(p)
 
 
 def init_firestore_client(
@@ -15,9 +37,11 @@ def init_firestore_client(
 ) -> Any:
     """Construct a Firestore client.
 
-    Reuses the existing Google service account via ``GOOGLE_CREDENTIALS`` or
-    ``GOOGLE_APPLICATION_CREDENTIALS``. ``FIRESTORE_PROJECT`` is optional —
-    the project is read from the service-account JSON by default.
+    Prefers the dedicated Firebase service account (``FIREBASE_CREDENTIALS``),
+    falling back to the Sheets account (``GOOGLE_CREDENTIALS`` /
+    ``GOOGLE_APPLICATION_CREDENTIALS``). ``FIREBASE_PROJECT`` /
+    ``FIRESTORE_PROJECT`` are optional — the project is read from the
+    service-account JSON by default.
     """
     try:
         from google.cloud import firestore
@@ -27,13 +51,15 @@ def init_firestore_client(
             "Install via requirements.txt."
         ) from exc
 
-    credentials_path = (
+    credentials_path = _resolve_path(
         credentials_path
+        or os.environ.get("FIREBASE_CREDENTIALS")
         or os.environ.get("GOOGLE_CREDENTIALS")
         or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     )
     project = (
         project
+        or os.environ.get("FIREBASE_PROJECT")
         or os.environ.get("FIRESTORE_PROJECT")
         or os.environ.get("GOOGLE_CLOUD_PROJECT")
     )

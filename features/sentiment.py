@@ -57,6 +57,14 @@ import pandas as pd
 from ingestion._firestore import batch_write, init_firestore_client, wipe_collection
 from ingestion.aliases import load_aliases
 
+# Load .env so standalone runs (python -m ...) see the same configuration as
+# Docker / collect_all. Existing environment variables always win.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "Data" / "archive" / "sentiment_features.parquet"
 NEWS_PATH = Path(__file__).resolve().parents[1] / "Data" / "archive" / "news.parquet"
 REDDIT_PATH = Path(__file__).resolve().parents[1] / "Data" / "archive" / "reddit_posts.parquet"
@@ -451,6 +459,46 @@ def write_sentiment_to_firestore(
     return batch_write(client, collection, docs)
 
 
+NEWS_FIRESTORE_COLLECTION = os.environ.get("NEWS_FIRESTORE_COLLECTION", "news")
+
+
+def _news_from_firestore(client: Optional[Any] = None) -> pd.DataFrame:
+    """Read articles back from the Firestore ``news`` collection.
+
+    Returns a frame shaped like the news staging parquet (``ticker``, ``ts``,
+    ``title``), or an empty frame when Firestore is unreachable / empty.
+    """
+    try:
+        client = client or init_firestore_client()
+    except Exception as exc:
+        _log(f"[sentiment] Firestore news fallback unavailable: {exc}")
+        return pd.DataFrame()
+    rows: List[dict] = []
+    try:
+        for doc in client.collection(NEWS_FIRESTORE_COLLECTION).stream():
+            data = doc.to_dict() or {}
+            ticker = data.get("ticker")
+            rows.extend(
+                {
+                    "ticker": ticker,
+                    "ts": entry.get("date_of_news"),
+                    "title": entry.get("headline"),
+                    "source": "firestore",
+                }
+                for entry in (data.get("articles") or {}).values()
+            )
+    except Exception as exc:
+        _log(f"[sentiment] Firestore news fallback failed: {exc}")
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+    df = df.dropna(subset=["ts"]).reset_index(drop=True)
+    _log(f"[sentiment] loaded {len(df)} news articles from Firestore fallback")
+    return df
+
+
 def refresh_sentiment(
     output_path: Path = DEFAULT_OUTPUT,
     news_path: Path = NEWS_PATH,
@@ -465,13 +513,19 @@ def refresh_sentiment(
 
     if news_path.exists():
         news_df = pd.read_parquet(news_path)
+    else:
+        # The staging parquet is a retry queue — it is deleted once its rows
+        # are uploaded, so Firestore is the canonical news store. Standalone
+        # runs (after a successful news_ingest) read the articles back here.
+        news_df = _news_from_firestore(firestore_client)
+    if not news_df.empty:
         prepared = _prepare_news(news_df)
         agg = score_source(prepared, scorer, source="news")
         if not agg.empty:
             frames.append(agg)
             _log(f"[sentiment] news: {len(agg)} (ticker, date) rows")
     else:
-        _log(f"[sentiment] no news at {news_path}")
+        _log(f"[sentiment] no news at {news_path} and none in Firestore")
 
     if reddit_path.exists():
         reddit_df = pd.read_parquet(reddit_path)
@@ -557,7 +611,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     scorer = FinBertScorer(model_name=args.model)
     write_firestore = not args.no_firestore and bool(
-        os.environ.get("GOOGLE_CREDENTIALS") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        os.environ.get("FIREBASE_CREDENTIALS") or os.environ.get("GOOGLE_CREDENTIALS") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     )
     df = refresh_sentiment(
         output_path=Path(args.output),

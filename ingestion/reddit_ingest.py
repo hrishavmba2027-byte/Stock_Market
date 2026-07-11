@@ -41,6 +41,14 @@ from ingestion._archive import (
 from ingestion._firestore import init_firestore_client
 from ingestion.aliases import find_tickers_in_text, load_aliases
 
+# Load .env so standalone runs (python -m ...) see the same configuration as
+# Docker / collect_all. Existing environment variables always win.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "Data" / "archive" / "reddit_posts.parquet"
 DEFAULT_BACKFILL_DAYS = 7
 DEFAULT_SUBREDDITS = (
@@ -390,7 +398,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     subs = [s.strip() for s in args.subreddits.split(",") if s.strip()]
     write_firestore = not args.no_firestore and bool(
-        os.environ.get("GOOGLE_CREDENTIALS") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        os.environ.get("FIREBASE_CREDENTIALS") or os.environ.get("GOOGLE_CREDENTIALS") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     )
 
     df = refresh_reddit(

@@ -24,6 +24,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# Load .env so standalone runs (python -m ...) see the same configuration as
+# Docker / collect_all. Existing environment variables always win.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 DEFAULT_INDEX_CACHE = Path(__file__).resolve().parents[1] / "Data" / "archive" / "indices.parquet"
 NIFTY_SYMBOL = "^NSEI"
 VIX_SYMBOL = "^INDIAVIX"

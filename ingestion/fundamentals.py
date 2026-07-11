@@ -46,6 +46,14 @@ from ingestion._archive import (
 from ingestion._firestore import init_firestore_client
 from ingestion.aliases import list_tickers, load_aliases, sector_for
 
+# Load .env so standalone runs (python -m ...) see the same configuration as
+# Docker / collect_all. Existing environment variables always win.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # Quarterly records destined for Firestore (one row per (ticker, quarter) with
 # a JSON-encoded ``financials_json`` column). This is a temporary staging file:
 # successful Firestore uploads delete it; failed/skipped uploads retain it.
