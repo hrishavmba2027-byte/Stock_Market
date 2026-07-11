@@ -86,6 +86,23 @@ All scripts are meant to be run **from the repo root** with the venv activated.
 Relative paths in `.env` (e.g. `./credentials/...`) resolve against the repo
 root, so the same `.env` works on any machine.
 
+> **Note:** run `git clone` from *outside* any existing checkout — cloning from
+> inside the repo root creates a nested `Stock_Market/Stock_Market/` copy
+> (harmless, gitignored, but delete it: `rm -rf Stock_Market/`).
+
+### Verify a fresh clone (smoke test)
+
+After the setup steps above, these three commands prove the clone works
+end-to-end — Sheets auth, Firebase news storage, and model inference (the
+only live write is the news upload; inference runs with `--dry-run`):
+
+```bash
+source venv/bin/activate
+python Data_update.py --worksheets RELIANCE          # Sheets round-trip
+python -m ingestion.news_ingest --tickers RELIANCE   # news → Firebase `news`
+python main.py --worksheets RELIANCE --dry-run       # models load + 15-day forecast
+```
+
 ## Running the pipeline
 
 ### Full end-to-end workflow (15 stages)
