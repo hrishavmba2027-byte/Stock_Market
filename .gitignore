@@ -225,11 +225,14 @@ $RECYCLE.BIN/
 # ---------------------------------------------------------------------------
 # Local diagnostic / debug artifacts (never commit)
 # ---------------------------------------------------------------------------
-DIAGNOSTIC_REPORT.md
-ENVIRONMENT_REPAIR_GUIDE.md
-fix_environment.sh
+# (DIAGNOSTIC_REPORT.md, ENVIRONMENT_REPAIR_GUIDE.md and fix_environment.sh
+#  are now organized project files under docs/ and scripts/ — tracked.)
 Scripts/debug_auth.py
 Scripts/setup_venv.sh
+
+# Never track a nested clone of this repo (created by running `git clone`
+# from inside the repo root).
+Stock_Market/
 
 # ---------------------------------------------------------------------------
 # Claude / agent local state
