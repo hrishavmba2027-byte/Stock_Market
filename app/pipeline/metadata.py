@@ -72,33 +72,46 @@ INFERENCE_REQUIRED_KEYS: Tuple[str, ...] = (
 # weight matrices and confirmed against historical metrics.json files.
 #
 # Model architecture evidence:
-#   Dense.pt    data/0: 74,240 params = 580 × 128   → dense_input_size=580
-#   LSTM.pt     data/0:  7,424 params = 4 × 64 × 29 → feature_count=29
-#   Transformer data/1:  3,712 params = 128 × 29    → input_size=29
+#   Dense.pt       fc1.weight: 128 × 640                → dense_input_size=640
+#   LSTM.pt        lstm.weight_ih_l0: 256 × 32          → feature_count=32
+#   Transformer.pt input_projection.weight: 128 × 32    → feature_count=32
 #   All outputs: 15 params = 3 quantiles × 5 horizons
-#   metrics.json predictor_count: 580 = 20 × 29     → seq_len=20
+#   predictor_count: 640 = 20 × 32                      → seq_len=20
 # ---------------------------------------------------------------------------
 FEATURE_COLUMNS: List[str] = [
-    # OHLCV (5)
-    "Open", "High", "Low", "Close", "Volume",
-    # Momentum (4)
-    "RSI_14", "MACD_12_26", "MACD_Signal_9", "MACD_Histogram",
-    # Stochastic (2)
-    "Stochastic_%K", "Stochastic_%D",
-    # Moving averages (6)
-    "SMA_5", "SMA_20", "SMA_50",
-    "EMA_12", "EMA_26", "EMA_50",
-    # Trend / volatility (7)
     "ADX_14",
-    "BB_Upper_20", "BB_Middle_20", "BB_Lower_20",
     "ATR_14",
-    # Volume-based (2)
-    "OBV", "VWAP",
-    # Return / rate-of-change (3)
-    "Daily_Return_%", "Log_Return_%", "ROC_12",
-    # Oscillators (2)
-    "Williams_%R", "CCI_20",
-]  # len = 29
+    "BB_Lower_20",
+    "BB_Middle_20",
+    "BB_Upper_20",
+    "CCI_20",
+    "Daily_Return_%",
+    "EMA_12",
+    "EMA_26",
+    "EMA_50",
+    "EWMA_Vol_30",
+    "GARCH_Cond_Vol",
+    "High",
+    "Log_Return_%",
+    "Low",
+    "MACD_12_26",
+    "MACD_Histogram",
+    "MACD_Signal_9",
+    "MFI_14",
+    "OBV",
+    "Open",
+    "ROC_12",
+    "RSI_14",
+    "Realized_Vol_20",
+    "SMA_20",
+    "SMA_5",
+    "SMA_50",
+    "Stochastic_%D",
+    "Stochastic_%K",
+    "VWAP",
+    "Volume",
+    "Williams_%R",
+]  # len = 32
 
 # Forward-return label columns produced by Feature_Engineering.py.
 # These must NEVER appear in feature_columns (leakage guard in validate_metadata).
@@ -118,8 +131,8 @@ _DEFAULT_METADATA: Dict[str, Any] = {
     # ── model architecture ──────────────────────────────────────────────────
     "feature_columns": FEATURE_COLUMNS,
     "seq_len": 20,
-    "feature_count": len(FEATURE_COLUMNS),   # 29
-    "dense_input_size": 20 * len(FEATURE_COLUMNS),  # 580
+    "feature_count": len(FEATURE_COLUMNS),   # 32
+    "dense_input_size": 20 * len(FEATURE_COLUMNS),  # 640
     "horizons": [1, 2, 3, 4, 5],
     "quantiles": [0.1, 0.5, 0.9],
     "target_type": "multi_horizon_quantile_log_return",
@@ -273,9 +286,19 @@ def safe_save_metadata(path: Path, data: Dict[str, Any]) -> None:
 
     tmp = _tmp_path(path)
     try:
-        # Write to tmp, then atomically replace
+        # Preferred path: write to sibling .tmp, then atomically replace.
+        # Falls back to a direct in-place write when os.replace() raises EBUSY
+        # or EXDEV — which happens on Docker hosts where pipeline_metadata.json
+        # is a single-file bind-mount (overlay device ≠ host device).
         tmp.write_text(payload, encoding="utf-8")
-        os.replace(tmp, path)
+        try:
+            os.replace(tmp, path)
+        except OSError as replace_err:
+            logger.warning(
+                "[metadata] os.replace failed (%s); falling back to direct write",
+                replace_err,
+            )
+            path.write_text(payload, encoding="utf-8")
 
         # Update backup
         try:

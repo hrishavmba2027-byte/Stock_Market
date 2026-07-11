@@ -12,18 +12,18 @@
 #   * fail safely with a clear, non-zero exit code on any error
 #
 # Usage:
-#   ./run_full_workflow.sh                      # dry-run (default, no writes)
-#   ./run_full_workflow.sh --live               # real end-to-end run
-#   ./run_full_workflow.sh --worksheets RELIANCE,TCS
-#   ./run_full_workflow.sh --live --worksheets RELIANCE
+#   ./scripts/run_full_workflow.sh                      # dry-run (default, no writes)
+#   ./scripts/run_full_workflow.sh --live               # real end-to-end run
+#   ./scripts/run_full_workflow.sh --worksheets RELIANCE,TCS
+#   ./scripts/run_full_workflow.sh --live --worksheets RELIANCE
 #
 # Exit codes:  0 success / success_with_warnings   1 failure
 # =============================================================================
 
 set -Eeuo pipefail
 
-# ── Resolve project root (this script's directory) ──────────────────────────
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ── Resolve project root (parent of this script's scripts/ directory) ───────
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 # ── Colours / logging helpers ───────────────────────────────────────────────

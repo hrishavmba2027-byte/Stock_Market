@@ -14,6 +14,13 @@ from google.oauth2.service_account import Credentials as _GoogleCredentials
 
 
 DEFAULT_SHEET_ID = "1uekPHyvJj4p6YjxNwlBBIAI71SWRye-xxFu47Kgpf9o"
+
+# Retry / rate-limit settings — read from env so docker-compose can override.
+# Google Sheets "Read requests per minute per user" quota = 60 req/min.
+# With exponential backoff (delay * attempt): 15 + 30 + 45 + 60 + 75 = 225 s
+# across 5 attempts, which covers multiple 60-s quota windows.
+_RETRY_ATTEMPTS: int = int(os.environ.get("GOOGLE_RETRIES", "5"))
+_RETRY_BACKOFF: float = float(os.environ.get("RETRY_BACKOFF_SECONDS", "15.0"))
 DEFAULT_START_DATE = "2015-01-01"
 REQUIRED_COLUMNS = ["Date", "Date_str", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
 NUMERIC_COLUMNS = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
@@ -65,7 +72,17 @@ def print_json(payload: Dict[str, Any]) -> None:
     print(json.dumps(payload, separators=(",", ":"), allow_nan=False))
 
 
-def with_retry(operation, description: str, attempts: int = 3, backoff: float = 1.0):
+def with_retry(
+    operation,
+    description: str,
+    attempts: int = _RETRY_ATTEMPTS,
+    backoff: float = _RETRY_BACKOFF,
+):
+    """Retry *operation* with linear backoff (delay = backoff × attempt).
+
+    Defaults read from env vars GOOGLE_RETRIES and RETRY_BACKOFF_SECONDS so
+    docker-compose.yml values are respected without code changes.
+    """
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -74,8 +91,12 @@ def with_retry(operation, description: str, attempts: int = 3, backoff: float = 
             last_error = exc
             if attempt == attempts:
                 break
-            log(f"{description} failed on attempt {attempt}/{attempts}: {exc}")
-            time_module.sleep(backoff * attempt)
+            delay = backoff * attempt
+            log(
+                f"{description} failed on attempt {attempt}/{attempts}: {exc} "
+                f"— retrying in {delay:.1f}s"
+            )
+            time_module.sleep(delay)
     assert last_error is not None
     raise last_error
 
@@ -86,13 +107,29 @@ def authorize_gspread(credentials_path: Optional[str]) -> Any:
     except ImportError as exc:
         raise RuntimeError("Google Sheets support requires gspread") from exc
 
-    credential_file = (
-        credentials_path
-        or os.environ.get("GOOGLE_CREDENTIALS")
-        or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    # Resolve credential file in preference order:
+    #   1. Explicit --google-credentials argument (highest priority)
+    #   2. Project-local credentials/Credentials_New.json (always correct for this project)
+    #   3. GOOGLE_CREDENTIALS env var
+    #   4. GOOGLE_APPLICATION_CREDENTIALS env var (lowest — may point to a different project)
+    import pathlib as _pathlib
+    _script_dir = _pathlib.Path(__file__).resolve().parent
+    _project_local = _script_dir / "credentials" / "Credentials_New.json"
+    _candidates = [
+        credentials_path,
+        str(_project_local) if _project_local.exists() else None,
+        os.environ.get("GOOGLE_CREDENTIALS"),
+        os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
+    ]
+    credential_file = next(
+        (c for c in _candidates if c and _pathlib.Path(c).is_file()), None
     )
     if not credential_file:
-        raise RuntimeError("Google service-account credentials path is required")
+        checked = [c for c in _candidates if c]
+        raise RuntimeError(
+            "Google service-account credentials path is required. Checked:\n"
+            + "\n".join(f"  {p}" for p in checked)
+        )
 
     print(f"[google_auth] Using credentials : {credential_file}", flush=True)
     credentials = _GoogleCredentials.from_service_account_file(

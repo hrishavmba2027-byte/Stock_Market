@@ -1,0 +1,205 @@
+name: run-full-workflow
+
+# Master 15-stage ML pipeline:
+#   Stage 1  — Startup validation
+#   Stage 2  — Check YFinance for new data
+#   Stage 3  — Download / append new market data
+#   Stage 4  — Update local workbook / data store
+#   Stage 5  — Sync new rows into Google Sheets
+#   Stage 6  — Validate workbook / sheet integrity
+#   Stage 7  — Run Feature Engineering (Feature_Engineering.py)
+#   Stage 8  — Validate engineered features
+#   Stage 9  — Update metadata
+#   Stage 10 — Run model pipeline (main.py)
+#   Stage 11 — Generate forecasts / predictions
+#   Stage 12 — Push forecast results to Google Sheets
+#   Stage 13 — Train/test sheet rollover
+#   Stage 14 — Validate final outputs
+#   Stage 15 — Log workflow summary
+#
+# Runs at 11:00 UTC = 16:30 IST (NSE closes 15:30; data settled by 16:00 IST).
+# Manual trigger is available via the "Run workflow" button in the Actions tab;
+# you can set dry_run=true there to do a no-write diagnostic pass.
+
+on:
+  schedule:
+    - cron: "0 11 * * 1-5"   # 11:00 UTC = 16:30 IST, Mon–Fri only
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run (no Google Sheet writes)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      worksheets:
+        description: "Comma-separated worksheet names to process (leave blank for all)"
+        required: false
+        default: ""
+
+concurrency:
+  group: run-full-workflow
+  cancel-in-progress: false   # never kill a running pipeline mid-stage
+
+permissions:
+  contents: read   # release downloads only
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. Source code ────────────────────────────────────────────────────────
+      - uses: actions/checkout@v4
+
+      # ── 2. Python environment ─────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install runtime dependencies (CPU-only PyTorch)
+        run: |
+          pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            "torch==2.6.0+cpu"
+          pip install \
+            "pandas>=2.0,<3.0" \
+            "numpy>=1.24,<2.0" \
+            "pyarrow>=14.0" \
+            "scikit-learn>=1.3,<2.0" \
+            "openpyxl>=3.1" \
+            "yfinance>=0.2.38" \
+            "gspread>=6.0" \
+            "oauth2client>=4.1" \
+            "google-auth>=2.28" \
+            "pydantic>=1.10,<3" \
+            "python-dotenv>=1.0" \
+            "requests>=2.31" \
+            "plotly>=5.20" \
+            "ta>=0.11" \
+            "pandas-ta>=0.3"
+
+      # ── 3. Google service-account credentials ─────────────────────────────────
+      - name: Restore Google credentials
+        env:
+          GCP_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          mkdir -p credentials
+          printf '%s' "$GCP_JSON" > credentials/Credentials_New.json
+          chmod 600 credentials/Credentials_New.json
+
+      # ── 4. Model artifacts from 'models-current' GitHub Release ───────────────
+      - name: Download model artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p outputs/Saved_Models outputs
+          if gh release view models-current >/dev/null 2>&1; then
+            gh release download models-current \
+              --pattern "*.pt" \
+              --dir outputs/Saved_Models \
+              --clobber
+            gh release download models-current \
+              --pattern "pipeline_metadata.json" \
+              --dir outputs \
+              --clobber
+            echo "Restored model artifacts from models-current release."
+          else
+            echo "::warning::models-current release not found — skipping model download."
+          fi
+
+      # ── 5. Required runtime directories ───────────────────────────────────────
+      - name: Prepare output directories
+        run: |
+          mkdir -p logs/workflow state outputs/main_inference
+
+      # ── 6. Run the 15-stage orchestrator ──────────────────────────────────────
+      - name: Run full workflow
+        env:
+          # Google credentials
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/credentials/Credentials_New.json
+          GOOGLE_CREDENTIALS: ${{ github.workspace }}/credentials/Credentials_New.json
+
+          # Spreadsheet IDs (stored as repository secrets)
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          OPERATIONAL_SHEET_ID: ${{ secrets.SHEET_ID }}
+          HISTORICAL_TRAINING_SHEET_ID: ${{ secrets.HISTORICAL_TRAINING_SHEET_ID }}
+
+          # Pipeline paths
+          BASE_DIR: ${{ github.workspace }}
+          MODEL_DIR: ${{ github.workspace }}/outputs/Saved_Models
+          OUTPUT_DIR: ${{ github.workspace }}/outputs/main_inference
+          METADATA_PATH: ${{ github.workspace }}/outputs/pipeline_metadata.json
+          DEVICE: cpu
+          PYTHONPATH: ${{ github.workspace }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+
+          # Decide live vs dry-run:
+          #   • Scheduled runs → always --live
+          #   • Manual trigger → respect the dry_run input (default false → --live)
+          DRY_RUN_INPUT="${{ github.event.inputs.dry_run || 'false' }}"
+          if [[ "${{ github.event_name }}" == "schedule" || "$DRY_RUN_INPUT" == "false" ]]; then
+            MODE_FLAG="--live"
+            echo "Mode: LIVE — Google Sheets will be updated."
+          else
+            MODE_FLAG="--dry-run"
+            echo "Mode: DRY-RUN — no Google Sheet writes."
+          fi
+
+          # Optional worksheet filter
+          WORKSHEETS="${{ github.event.inputs.worksheets || '' }}"
+          SHEET_ARG=""
+          if [[ -n "$WORKSHEETS" ]]; then
+            SHEET_ARG="--worksheets $WORKSHEETS"
+          fi
+
+          python run_full_workflow.py \
+            $MODE_FLAG \
+            $SHEET_ARG \
+            --google-credentials "$GOOGLE_APPLICATION_CREDENTIALS"
+
+      # ── 7. Upload logs as artifacts (always, even on failure) ─────────────────
+      - name: Upload workflow logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-logs-${{ github.run_id }}
+          path: |
+            logs/workflow/
+            outputs/workflow/run_summary_latest.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Upload inference outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inference-outputs-${{ github.run_id }}
+          path: |
+            outputs/main_inference/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # ── 8. Optional Slack notification ────────────────────────────────────────
+      - name: Slack notification
+        if: always() && env.SLACK_WEBHOOK != ''
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          STATUS: ${{ job.status }}
+        run: |
+          if [ "$STATUS" = "success" ]; then
+            emoji=":white_check_mark:"
+          else
+            emoji=":x:"
+          fi
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"${emoji} *run-full-workflow* ${STATUS} | ${GITHUB_REPOSITORY} run <https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|#${GITHUB_RUN_NUMBER}>\"}" \
+            "$SLACK_WEBHOOK"

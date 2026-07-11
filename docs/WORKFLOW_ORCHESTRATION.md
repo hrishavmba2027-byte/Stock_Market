@@ -201,7 +201,7 @@ your Mac: it has no network route to Google APIs, cannot `pip install`
 
 **Static checks — PASS**
 - `python3 -m py_compile run_full_workflow.py` → compiles cleanly.
-- `bash -n run_full_workflow.sh` → no syntax errors.
+- `bash -n scripts/run_full_workflow.sh` → no syntax errors.
 - `--help` renders the full CLI.
 
 **Live orchestrator run (dry-run) — PASS for all reachable stages**
@@ -239,13 +239,13 @@ and the Docker run (requires Docker on your Mac). Run these on your machine:
 
 ```bash
 # 1. dry-run end-to-end (no sheet writes) — recommended first
-./run_full_workflow.sh
+./scripts/run_full_workflow.sh
 
 # 2. live end-to-end (writes to your real sheets)
-./run_full_workflow.sh --live
+./scripts/run_full_workflow.sh --live
 
 # 3. single stock
-./run_full_workflow.sh --live --worksheets RELIANCE
+./scripts/run_full_workflow.sh --live --worksheets RELIANCE
 
 # 4. inside Docker
 docker compose --profile tools run --rm pipeline python run_full_workflow.py --live
@@ -448,13 +448,13 @@ The workflow is deterministic and production-safe by construction:
 
 ```bash
 # default: dry-run, all worksheets, no sheet writes
-./run_full_workflow.sh
+./scripts/run_full_workflow.sh
 
 # live end-to-end run
-./run_full_workflow.sh --live
+./scripts/run_full_workflow.sh --live
 
 # live run, selected stocks
-./run_full_workflow.sh --live --worksheets "RELIANCE,TCS"
+./scripts/run_full_workflow.sh --live --worksheets "RELIANCE,TCS"
 
 # direct invocation (bypass the launcher)
 python run_full_workflow.py --live

@@ -25,9 +25,14 @@ from app.services.sheet_archival import (
     DEFAULT_HISTORICAL_TRAINING_SHEET_ID,
     DEFAULT_OPERATIONAL_SHEET_ID,
     DEFAULT_ROLLING_OPERATIONAL_ROWS,
+    ROW_FINETUNED_COL,
     ArchivalWorksheetResult,
     archive_old_rows_for_worksheet,
+    column_number_to_letter as _archival_col_letter,
+    find_date_header_index,
     find_worksheet_by_title,
+    header_key,
+    pad_rows,
     parse_positive_int,
 )
 from Feature_Engineering import compute_indicators
@@ -36,6 +41,10 @@ from Feature_Engineering import compute_indicators
 DEFAULT_TRAINING_SHEET_ID = DEFAULT_HISTORICAL_TRAINING_SHEET_ID
 DEFAULT_OUTPUT_DIR = Path("outputs") / "monthly_finetune"
 DEFAULT_STATE_FILE = Path("state") / "monthly_finetune_state.json"
+# Date up to which the model was initially trained externally.  All historical
+# rows on or before this date are assumed to have been used in that initial
+# training run and receive Row_finetuned = 1 on the first write.
+INITIAL_TRAINING_CUTOFF_DEFAULT = "2025-04-28"
 DEFAULT_RECENT_DAYS = 45
 DEFAULT_REPLAY_SAMPLES_PER_SYMBOL = 12
 DEFAULT_VALIDATION_TARGETS_PER_SYMBOL = 5
@@ -75,6 +84,10 @@ class SymbolDatasetSummary:
     last_finetuned_date: str = ""
     latest_processed_date: str = ""
     skipped_reason: str = ""
+    # Sorted list of date strings (YYYY-MM-DD) for every row that appeared in
+    # train_positions (new rows + replay buffer).  Empty when training was
+    # skipped for this symbol.
+    train_dates: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -249,6 +262,187 @@ def latest_historical_dates(spreadsheet: Any, requested: Optional[Set[str]]) -> 
             continue
         latest[symbol] = latest_frame_date(frame)
     return latest
+
+
+def write_finetuned_flags(
+    worksheet: Any,
+    train_dates: Set[str],
+    initial_cutoff: Optional[pd.Timestamp],
+    *,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Write (or update) the ``Row_finetuned`` column in a historical worksheet.
+
+    For every data row the rule is:
+    * date <= initial_cutoff → 1  (part of the pre-existing / initial training)
+    * date in train_dates    → 1  (used in the current fine-tuning run)
+    * otherwise              → 0
+
+    The function is idempotent: it only issues Sheets API writes for cells whose
+    value actually needs to change, so repeated calls are cheap.
+
+    Parameters
+    ----------
+    worksheet:
+        gspread Worksheet object pointing at the *historical* sheet.
+    train_dates:
+        Set of YYYY-MM-DD date strings whose rows were used as training examples
+        in the current fine-tuning run.  Pass an empty set when fine-tuning was
+        skipped (the pre-cutoff backfill still runs).
+    initial_cutoff:
+        Rows on or before this date receive ``Row_finetuned = 1`` because they
+        were part of the initial (external) model training.  Typically equal to
+        the per-symbol fine-tune checkpoint date from the state file.
+    dry_run:
+        When True, compute updates but do not write to the sheet.
+    """
+    title = str(getattr(worksheet, "title", ""))
+    values = read_worksheet_values(worksheet)
+    if not values or len(values) < 2:
+        return {"worksheet": title, "status": "skipped", "reason": "empty_worksheet"}
+
+    padded, _width = pad_rows(values)
+    raw_headers: List[str] = [str(h).strip() for h in padded[0]]
+
+    date_idx = find_date_header_index(raw_headers)
+    if date_idx is None:
+        return {"worksheet": title, "status": "skipped", "reason": "no_date_column"}
+
+    rf_key = header_key(ROW_FINETUNED_COL)
+    rf_idx: Optional[int] = next(
+        (i for i, h in enumerate(raw_headers) if header_key(h) == rf_key),
+        None,
+    )
+    new_column = rf_idx is None
+    if new_column:
+        rf_idx = len(raw_headers)
+        updated_headers = raw_headers + [ROW_FINETUNED_COL]
+    else:
+        updated_headers = raw_headers
+
+    assert rf_idx is not None  # satisfies type-checker
+    cutoff_str: Optional[str] = initial_cutoff.strftime("%Y-%m-%d") if initial_cutoff is not None else None
+    col_letter = column_number_to_letter(rf_idx + 1)  # 1-indexed column letter
+    data_rows = padded[1:]
+
+    updates: List[Dict[str, Any]] = []
+    if new_column:
+        # Extend the header row in the sheet.
+        end_col = column_number_to_letter(len(updated_headers))
+        updates.append({"range": f"A1:{end_col}1", "values": [updated_headers]})
+
+    # Build run-length-encoded cell updates for the Row_finetuned column.
+    run_start: Optional[int] = None
+    run_values: List[List[int]] = []
+    rows_written = 0
+
+    for i, row in enumerate(data_rows):
+        sheet_row = i + 2  # 1-indexed; row 1 is the header
+        date_val = row[date_idx] if date_idx < len(row) else ""
+        parsed = parse_sheet_date(date_val)
+        date_str: Optional[str] = parsed.strftime("%Y-%m-%d") if parsed is not None else None
+
+        if date_str is None:
+            desired = 0
+        elif cutoff_str is not None and date_str <= cutoff_str:
+            desired = 1
+        elif date_str in train_dates:
+            desired = 1
+        else:
+            desired = 0
+
+        # Skip write if the cell already holds the correct value.
+        should_write = True
+        if not new_column:
+            existing_raw = row[rf_idx] if rf_idx < len(row) else ""
+            existing_text = str(existing_raw).strip()
+            try:
+                existing_int = int(float(existing_text)) if existing_text else -1
+            except (ValueError, TypeError):
+                existing_int = -1
+            if existing_int == desired:
+                should_write = False
+
+        if should_write:
+            rows_written += 1
+            if run_start is None:
+                run_start = sheet_row
+            run_values.append([desired])
+        else:
+            # Flush the pending run before the gap.
+            if run_start is not None:
+                end_run = run_start + len(run_values) - 1
+                updates.append({
+                    "range": f"{col_letter}{run_start}:{col_letter}{end_run}",
+                    "values": run_values,
+                })
+                run_start = None
+                run_values = []
+
+    # Flush the final run.
+    if run_start is not None:
+        end_run = run_start + len(run_values) - 1
+        updates.append({
+            "range": f"{col_letter}{run_start}:{col_letter}{end_run}",
+            "values": run_values,
+        })
+
+    if not updates:
+        return {"worksheet": title, "status": "unchanged", "rows_updated": 0, "new_column": False}
+
+    if dry_run:
+        return {
+            "worksheet": title,
+            "status": "dry_run",
+            "rows_to_update": rows_written,
+            "new_column": new_column,
+            "updates_planned": len(updates),
+        }
+
+    Data_update.with_retry(
+        lambda: worksheet.batch_update(updates, raw=True),
+        f"{title}: write_finetuned_flags",
+    )
+    return {
+        "worksheet": title,
+        "status": "ok",
+        "rows_updated": rows_written,
+        "new_column": new_column,
+    }
+
+
+def _write_all_finetuned_flags_to_history(
+    worksheets: List[Any],
+    arrays: "FineTuneArrays",
+    cutoffs: Dict[str, Optional[pd.Timestamp]],
+    args: argparse.Namespace,
+) -> List[Dict[str, Any]]:
+    """Write Row_finetuned for every worksheet in the historical spreadsheet.
+
+    This is called both when fine-tuning ran successfully (train_dates populated)
+    and when it was skipped (train_dates empty — only the pre-cutoff backfill
+    runs, ensuring rows <= cutoff still get Row_finetuned = 1).
+    """
+    train_dates_by_symbol: Dict[str, Set[str]] = {
+        s.symbol.upper(): set(s.train_dates)
+        for s in arrays.summaries
+    }
+    results: List[Dict[str, Any]] = []
+    for ws in worksheets:
+        symbol = ws.title.strip().upper()
+        result = write_finetuned_flags(
+            ws,
+            train_dates_by_symbol.get(symbol, set()),
+            cutoffs.get(symbol),
+            dry_run=bool(args.dry_run),
+        )
+        log(
+            f"{symbol}: Row_finetuned — {result.get('status')} "
+            f"(rows_updated={result.get('rows_updated', result.get('rows_to_update', 0))}, "
+            f"new_column={result.get('new_column', False)})"
+        )
+        results.append(result)
+    return results
 
 
 def finetune_cutoffs_from_state(
@@ -833,6 +1027,14 @@ def build_symbol_examples(
 
     X_train_list, y_train_list, _ = collect(train_positions)
     X_val_list, y_val_list, anchor_val_list = collect(val_positions)
+    # Collect the calendar dates for every position that was included in
+    # train_positions (new rows + replay buffer).  These are used later to
+    # write Row_finetuned = 1 to the corresponding historical-sheet rows.
+    train_dates_set: List[str] = sorted({
+        position_to_date[pos].strftime("%Y-%m-%d")
+        for pos in train_positions
+        if pos in position_to_date
+    })
     summary = SymbolDatasetSummary(
         symbol=symbol,
         rows=len(frame),
@@ -842,6 +1044,7 @@ def build_symbol_examples(
         replay_samples=len(replay_positions),
         last_finetuned_date=cutoff_text,
         latest_processed_date=max(position_to_date[position] for position in new_positions).strftime("%Y-%m-%d"),
+        train_dates=train_dates_set,
     )
     return (
         np.asarray(X_train_list, dtype=np.float32).reshape(-1, seq_len, feature_count),
@@ -1213,6 +1416,9 @@ def run_monthly_finetune(args: argparse.Namespace) -> Dict[str, Any]:
                 "full_dataset_retrain": False,
             },
         }
+        # Still initialise Row_finetuned on the historical sheet even when
+        # fine-tuning is skipped — this backfills pre-cutoff rows to 1.
+        _write_all_finetuned_flags_to_history(worksheets, arrays, cutoffs, args)
         (output_dir / "monthly_finetune_metrics.json").write_text(json.dumps(payload, indent=2, default=str, allow_nan=False))
         return payload
     if len(arrays.X_val) == 0:
@@ -1237,6 +1443,11 @@ def run_monthly_finetune(args: argparse.Namespace) -> Dict[str, Any]:
             metadata_path=metadata_path,
         )
         save_finetune_state(state_path, state, dry_run=bool(args.dry_run))
+        # Write Row_finetuned = 1 for pre-cutoff rows and all train-position rows.
+        # cutoffs here are the *pre-run* checkpoints (before update_finetune_state
+        # advanced them), so rows <= cutoff correctly map to "was in the prior
+        # training set".
+        _write_all_finetuned_flags_to_history(worksheets, arrays, cutoffs, args)
         status = "dry_run_ok" if args.dry_run else "ok"
     except Exception:
         for name, state in original_states.items():
@@ -1277,6 +1488,13 @@ def run_monthly_finetune(args: argparse.Namespace) -> Dict[str, Any]:
         "training": training,
         "evaluation": evaluation,
         "checkpoint_overwrite_status": overwrite_status,
+        "row_finetuned": {
+            "column": ROW_FINETUNED_COL,
+            "cutoff_used_per_symbol": {
+                symbol: value.strftime("%Y-%m-%d") if value is not None else ""
+                for symbol, value in cutoffs.items()
+            },
+        },
         "incremental_finetuning": {
             "only_new_historical_rows": bool(args.fine_tune_batch_only_new_data),
             "replay_buffer_enabled": int(args.replay_samples_per_symbol) > 0,

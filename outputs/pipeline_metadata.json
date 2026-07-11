@@ -1,43 +1,49 @@
 {
-  "schema_version": 1,
-  "created_at": "2026-05-22T20:28:08.624080+00:00",
-  "last_modified_at": "2026-05-22T20:28:08.626709+00:00",
-  "pipeline_version": "1.0.0",
-  "feature_engineering_version": "1.0.0",
+  "data_path": "/Users/hrishavmajumder/Documents/Stock_Market/Data/nse_stock_data_train.xlsx",
+  "seq_len": 20,
+  "feature_count": 32,
+  "dense_input_size": 640,
   "feature_columns": [
-    "Open",
-    "High",
-    "Low",
-    "Close",
-    "Volume",
-    "RSI_14",
-    "MACD_12_26",
-    "MACD_Signal_9",
-    "MACD_Histogram",
-    "Stochastic_%K",
-    "Stochastic_%D",
-    "SMA_5",
-    "SMA_20",
-    "SMA_50",
+    "ADX_14",
+    "ATR_14",
+    "BB_Lower_20",
+    "BB_Middle_20",
+    "BB_Upper_20",
+    "CCI_20",
+    "Daily_Return_%",
     "EMA_12",
     "EMA_26",
     "EMA_50",
-    "ADX_14",
-    "BB_Upper_20",
-    "BB_Middle_20",
-    "BB_Lower_20",
-    "ATR_14",
-    "OBV",
-    "VWAP",
-    "Daily_Return_%",
+    "EWMA_Vol_30",
+    "GARCH_Cond_Vol",
+    "High",
     "Log_Return_%",
+    "Low",
+    "MACD_12_26",
+    "MACD_Histogram",
+    "MACD_Signal_9",
+    "MFI_14",
+    "OBV",
+    "Open",
     "ROC_12",
-    "Williams_%R",
-    "CCI_20"
+    "RSI_14",
+    "Realized_Vol_20",
+    "SMA_20",
+    "SMA_5",
+    "SMA_50",
+    "Stochastic_%D",
+    "Stochastic_%K",
+    "VWAP",
+    "Volume",
+    "Williams_%R"
   ],
-  "seq_len": 20,
-  "feature_count": 29,
-  "dense_input_size": 580,
+  "label_columns": [
+    "y_logret_h1",
+    "y_logret_h2",
+    "y_logret_h3",
+    "y_logret_h4",
+    "y_logret_h5"
+  ],
   "horizons": [
     1,
     2,
@@ -51,58 +57,1239 @@
     0.9
   ],
   "target_type": "multi_horizon_quantile_log_return",
-  "label_columns": [
-    "y_logret_h1",
-    "y_logret_h2",
-    "y_logret_h3",
-    "y_logret_h4",
-    "y_logret_h5",
-    "y_logret_h6",
-    "y_logret_h7",
-    "y_logret_h8",
-    "y_logret_h9",
-    "y_logret_h10",
-    "y_logret_h11",
-    "y_logret_h12",
-    "y_logret_h13",
-    "y_logret_h14",
-    "y_logret_h15",
-    "y_logret_h16",
-    "y_logret_h17",
-    "y_logret_h18",
-    "y_logret_h19",
-    "y_logret_h20",
-    "y_logret_h21",
-    "y_logret_h22",
-    "y_logret_h23",
-    "y_logret_h24",
-    "y_logret_h25",
-    "y_logret_h26",
-    "y_logret_h27",
-    "y_logret_h28",
-    "y_logret_h29",
-    "y_logret_h30",
-    "has_labels"
+  "target_base_col": "Close",
+  "label_anchor": "previous_close",
+  "forecast_horizon_count": 5,
+  "forecast_column_names": [
+    "Forecast_Close_T+1",
+    "Forecast_Close_T+2",
+    "Forecast_Close_T+3",
+    "Forecast_Close_T+4",
+    "Forecast_Close_T+5"
   ],
+  "forecasting_strategy": {
+    "recursive_horizons": [
+      1,
+      2,
+      3
+    ],
+    "direct_horizons": [
+      4,
+      5
+    ],
+    "direct_recursive_blend": 0.15,
+    "recursive_return_clip": [
+      -0.08,
+      0.08
+    ]
+  },
+  "forecast_stabilization": {
+    "rolling_window_length": 20,
+    "use_volatility_normalization": false,
+    "feature_stabilization": "recursive close update; previous-close open fallback; smoothed volume; bounded high/low"
+  },
+  "scheduled_sampling": {
+    "enabled": true,
+    "recursive_horizons": 3,
+    "start_probability": 0.0,
+    "end_probability": 0.15,
+    "warmup_epochs": 50,
+    "aux_loss_weight": 0.25,
+    "return_clip": [
+      -0.08,
+      0.08
+    ],
+    "seed": 20042
+  },
+  "model_capacity": {
+    "Dense": {
+      "hidden_size": 128,
+      "dropout": 0.3
+    },
+    "LSTM": {
+      "hidden_size": 64,
+      "num_layers": 2,
+      "dropout": 0.3
+    },
+    "Transformer": {
+      "hidden_size": 128,
+      "num_heads": 4,
+      "num_layers": 2,
+      "feedforward_dim": 512,
+      "dropout": 0.3
+    }
+  },
+  "optuna": {
+    "status": "disabled",
+    "best_score": null,
+    "best_trial_number": null,
+    "best_params": {
+      "sequence_length": 20,
+      "batch_size": 256,
+      "learning_rate": 0.001,
+      "weight_decay": 1e-05,
+      "dropout": 0.3,
+      "dense_width": 128,
+      "lstm_hidden_size": 64,
+      "lstm_layers": 2,
+      "transformer_hidden_size": 128,
+      "transformer_heads": 4,
+      "transformer_layers": 2,
+      "transformer_feedforward_multiplier": 4,
+      "transformer_feedforward_dim": 512,
+      "recursive_horizon_cutoff": 3,
+      "direct_recursive_blend": 0.15,
+      "return_clip_threshold": 0.08,
+      "rolling_window_length": 20,
+      "use_volatility_normalization": false,
+      "scheduled_sampling_end_probability": 0.15,
+      "scheduled_sampling_aux_weight": 0.25,
+      "horizon_weight_tilt": 1.0,
+      "ensemble_weights": {
+        "Dense": 0.2,
+        "LSTM": 0.3,
+        "Transformer": 0.5
+      }
+    },
+    "horizon_metrics": [],
+    "validation_methodology": "chronological train tail with embargo; validation scored in walk-forward date windows"
+  },
+  "splits": {
+    "train_start": "2013-12-31",
+    "train_end": "2023-12-31",
+    "test_start": "2024-01-01",
+    "test_end": "2025-06-30",
+    "back_test_start": "2025-07-01",
+    "back_test_end": "2025-12-31",
+    "embargo_trading_rows": 5
+  },
+  "sample_counts": {
+    "train_fit": 92750,
+    "validation": 10739,
+    "test": 18081,
+    "backtest": 6174,
+    "test_metric_horizons": 89915,
+    "backtest_metric_horizons": 30380
+  },
+  "valid_stocks": [
+    "ADANIENT",
+    "ADANIPORTS",
+    "APOLLOHOSP",
+    "ASIANPAINT",
+    "AXISBANK",
+    "BAJAJ-AUTO",
+    "BAJAJFINSV",
+    "BAJFINANCE",
+    "BHARTIARTL",
+    "BPCL",
+    "BRITANNIA",
+    "CIPLA",
+    "COALINDIA",
+    "DIVISLAB",
+    "DRREDDY",
+    "EICHERMOT",
+    "GRASIM",
+    "HCLTECH",
+    "HDFCBANK",
+    "HDFCLIFE",
+    "HEROMOTOCO",
+    "HINDALCO",
+    "HINDUNILVR",
+    "ICICIBANK",
+    "INDUSINDBK",
+    "INFY",
+    "IOC",
+    "ITC",
+    "JSWSTEEL",
+    "KOTAKBANK",
+    "LT",
+    "MARUTI",
+    "NESTLEIND",
+    "NTPC",
+    "ONGC",
+    "POWERGRID",
+    "RELIANCE",
+    "SBILIFE",
+    "SBIN",
+    "SHREECEM",
+    "SUNPHARMA",
+    "TATACONSUM",
+    "TATASTEEL",
+    "TCS",
+    "TECHM",
+    "TITAN",
+    "ULTRACEMCO",
+    "UPL",
+    "WIPRO"
+  ],
+  "skipped_stocks": {},
+  "sequence_failures": {},
+  "sequence_filter_stats": {
+    "RELIANCE": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "TCS": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "INFY": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "HDFCBANK": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "ICICIBANK": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "SBIN": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "LT": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "ITC": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "HINDUNILVR": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "AXISBANK": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "KOTAKBANK": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "BAJFINANCE": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "ASIANPAINT": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "BHARTIARTL": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "MARUTI": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "SUNPHARMA": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "ULTRACEMCO": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "NTPC": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "POWERGRID": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "TITAN": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "BAJAJFINSV": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "NESTLEIND": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "ONGC": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "TECHM": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "HCLTECH": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "WIPRO": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "ADANIENT": {
+      "fit": {
+        "dropped_nonfinite_window": 90,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "ADANIPORTS": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "JSWSTEEL": {
+      "fit": {
+        "dropped_nonfinite_window": 91,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "TATASTEEL": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "INDUSINDBK": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "HDFCLIFE": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "SBILIFE": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "DIVISLAB": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "DRREDDY": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "BRITANNIA": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "EICHERMOT": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "HEROMOTOCO": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "BAJAJ-AUTO": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "CIPLA": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "COALINDIA": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "GRASIM": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "APOLLOHOSP": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "SHREECEM": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "TATACONSUM": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "UPL": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "BPCL": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "IOC": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    },
+    "HINDALCO": {
+      "fit": {
+        "dropped_nonfinite_window": 50,
+        "dropped_label": 0
+      },
+      "validation": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "test": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "backtest": {
+        "dropped_nonfinite_window": 0,
+        "dropped_label": 0
+      },
+      "embargo_rows": 5
+    }
+  },
+  "model_failures": {},
   "ensemble_weights": {
     "Dense": 0.2,
     "LSTM": 0.3,
     "Transformer": 0.5
   },
-  "model_capacity": {
-    "Dense": {
-      "hidden_size": 128
+  "metrics_scaled": {
+    "Train": {
+      "n": 463750,
+      "MSE": 0.0011831437902728415,
+      "RMSE": 0.03439685727319927,
+      "MAE": 0.02346855819511708,
+      "R2": 0.00790475236545618,
+      "Adjusted_R2": 0.006533712375980438,
+      "MAPE": 113.96052350325327
     },
-    "LSTM": {
-      "hidden_size": 64,
-      "num_layers": 2
+    "Validation": {
+      "n": 53695,
+      "MSE": 0.0007277379491210242,
+      "RMSE": 0.026976618563508366,
+      "MAE": 0.017256807923564453,
+      "R2": -0.021736378609049867,
+      "Adjusted_R2": -0.034061769386555696,
+      "MAPE": 114.49713182023005
     },
-    "Transformer": {
-      "hidden_size": 128,
-      "num_heads": 4,
-      "num_layers": 2
+    "Test": {
+      "n": 89915,
+      "MSE": 0.0008217187380256592,
+      "RMSE": 0.028665636885052095,
+      "MAE": 0.0203381792652923,
+      "R2": -0.00808729128207708,
+      "Adjusted_R2": -0.01531420915761239,
+      "MAPE": 117.0119968224578
     }
   },
+  "test_price_metrics": {
+    "n": 89915,
+    "MSE": 18934.415631372685,
+    "RMSE": 137.60238236081773,
+    "MAE": 54.26184653146575,
+    "R2": 0.9989969016390394,
+    "Adjusted_R2": 0.9989897104865089,
+    "MAPE": 2.030765557609906
+  },
+  "test_horizon_metrics": [
+    {
+      "horizon": 1,
+      "n": 18081,
+      "pinball": 0.004018902701015274,
+      "mae_q50": 0.01175567228347063,
+      "coverage_q10_q90": 0.881367181018749,
+      "spearman_ic": 0.018387189746749955,
+      "spearman_groups": 369
+    },
+    {
+      "horizon": 2,
+      "n": 18032,
+      "pinball": 0.005658669086794059,
+      "mae_q50": 0.016891051083803177,
+      "coverage_q10_q90": 0.871561668145519,
+      "spearman_ic": 0.0249794809228039,
+      "spearman_groups": 368
+    },
+    {
+      "horizon": 3,
+      "n": 17983,
+      "pinball": 0.006974365096539259,
+      "mae_q50": 0.021106215193867683,
+      "coverage_q10_q90": 0.8625368403492187,
+      "spearman_ic": 0.036007618306178046,
+      "spearman_groups": 367
+    },
+    {
+      "horizon": 4,
+      "n": 17934,
+      "pinball": 0.008053924422711134,
+      "mae_q50": 0.024532577022910118,
+      "coverage_q10_q90": 0.8507304561168729,
+      "spearman_ic": 0.03992445877282098,
+      "spearman_groups": 366
+    },
+    {
+      "horizon": 5,
+      "n": 17885,
+      "pinball": 0.009002343596269688,
+      "mae_q50": 0.027512069791555405,
+      "coverage_q10_q90": 0.850545149566676,
+      "spearman_ic": 0.04874252166620072,
+      "spearman_groups": 365
+    }
+  ],
+  "test_decile_lift": [
+    {
+      "horizon": 1,
+      "n": 18081,
+      "top_decile_mean": 0.001085878349840641,
+      "bottom_decile_mean": -0.00023543673160020262,
+      "overall_mean": 0.0004197753733024001,
+      "top_vs_overall": 0.0006661029765382409,
+      "top_vs_bottom": 0.0013213150814408436
+    },
+    {
+      "horizon": 5,
+      "n": 17885,
+      "top_decile_mean": 0.0024986646603792906,
+      "bottom_decile_mean": -0.0011645692866295576,
+      "overall_mean": 0.0020380690693855286,
+      "top_vs_overall": 0.000460595590993762,
+      "top_vs_bottom": 0.003663233947008848
+    }
+  ],
+  "backtest_decile_lift": [
+    {
+      "horizon": 1,
+      "n": 6174,
+      "top_decile_mean": 0.00019123826260107545,
+      "bottom_decile_mean": 0.0010162385114863691,
+      "overall_mean": 0.00039564448341450147,
+      "top_vs_overall": -0.00020440622081342602,
+      "top_vs_bottom": -0.0008250002488852937
+    },
+    {
+      "horizon": 5,
+      "n": 5978,
+      "top_decile_mean": 0.000724074016225271,
+      "bottom_decile_mean": 0.0026661539254211933,
+      "overall_mean": 0.0017474227890949905,
+      "top_vs_overall": -0.0010233487728697195,
+      "top_vs_bottom": -0.0019420799091959223
+    }
+  ],
+  "pipeline_version": "1.0.0",
+  "feature_engineering_version": "1.0.0",
   "last_successful_run": null,
   "last_run_status": null,
   "last_run_at": null,
@@ -115,5 +1302,64 @@
     "Dense": "outputs/Saved_Models/Dense.pt",
     "LSTM": "outputs/Saved_Models/LSTM.pt",
     "Transformer": "outputs/Saved_Models/Transformer.pt"
-  }
+  },
+  "created_at": "2026-05-30T11:34:50.096225+00:00",
+  "schema_version": 1,
+  "workflow": {
+    "last_run_id": "wf-20260531T070051Z-1",
+    "last_feature_engineering_at": "2026-05-31T07:05:10.888401+00:00",
+    "feature_engineering_worksheets": [
+      "RELIANCE",
+      "TCS",
+      "INFY",
+      "HDFCBANK",
+      "ICICIBANK",
+      "SBIN",
+      "LT",
+      "ITC",
+      "HINDUNILVR",
+      "AXISBANK",
+      "KOTAKBANK",
+      "BAJFINANCE",
+      "ASIANPAINT",
+      "BHARTIARTL",
+      "MARUTI",
+      "SUNPHARMA",
+      "ULTRACEMCO",
+      "NTPC",
+      "POWERGRID",
+      "TITAN",
+      "BAJAJFINSV",
+      "NESTLEIND",
+      "ONGC",
+      "TECHM",
+      "HCLTECH",
+      "WIPRO",
+      "ADANIENT",
+      "ADANIPORTS",
+      "JSWSTEEL",
+      "TATASTEEL",
+      "INDUSINDBK",
+      "HDFCLIFE",
+      "SBILIFE",
+      "DIVISLAB",
+      "DRREDDY",
+      "BRITANNIA",
+      "EICHERMOT",
+      "HEROMOTOCO",
+      "BAJAJ-AUTO",
+      "CIPLA",
+      "COALINDIA",
+      "GRASIM",
+      "APOLLOHOSP",
+      "SHREECEM",
+      "TATACONSUM",
+      "UPL",
+      "BPCL",
+      "IOC",
+      "HINDALCO"
+    ],
+    "mode": "live"
+  },
+  "last_modified_at": "2026-05-31T07:05:10.888711+00:00"
 }

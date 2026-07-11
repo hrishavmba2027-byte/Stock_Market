@@ -43,6 +43,10 @@ x-app-shared: &app-shared
     HF_HOME: /app/.cache/huggingface
     DEVICE: cpu
     API_BASE_URL: http://api:8000
+    # Google Sheets quota: give retries enough time to outlast a 60-s rate-limit
+    # window. With 5 retries + 15 s base: waits 15, 30, 60, 60 s (capped).
+    GOOGLE_RETRIES: "5"
+    RETRY_BACKOFF_SECONDS: "15.0"
   volumes:
     - ./credentials/Credentials_New.json:/app/credentials/Credentials_New.json:ro
     - ./logs:/app/logs
@@ -115,6 +119,11 @@ services:
   #
   # Usage pattern:
   #   docker compose --profile tools run --rm pipeline <full-command>
+  #
+  # ── Full 15-stage ML pipeline (run_full_workflow.py) ──────────────────────
+  #   docker compose --profile tools run --rm pipeline python run_full_workflow.py
+  #   docker compose --profile tools run --rm pipeline python run_full_workflow.py --live
+  #   docker compose --profile tools run --rm pipeline python run_full_workflow.py --live --worksheets RELIANCE,TCS
   #
   # Common invocations:
   #   docker compose --profile tools run --rm pipeline python -m ingestion.collect_all

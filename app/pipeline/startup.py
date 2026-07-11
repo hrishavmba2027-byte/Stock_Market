@@ -102,6 +102,7 @@ def run_startup_checks(settings: Any, *, strict: bool = False) -> None:
     _check_metadata(Path(settings.metadata_path), issues)
     _check_env_vars(issues)
     _check_write_test(Path(settings.outputs_dir), issues)
+    _check_arch_package(issues)
 
     # ── report ───────────────────────────────────────────────────────────────
     criticals = [(s, m) for s, m in issues if s == "CRITICAL"]
@@ -266,4 +267,32 @@ def _check_write_test(outputs_dir: Path, issues: List[Tuple[str, str]]) -> None:
             "CRITICAL",
             f"outputs/ directory is NOT writable: {exc}. "
             "Check Docker volume mount permissions.",
+        ))
+
+
+def _check_arch_package(issues: List[Tuple[str, str]]) -> None:
+    """Verify the 'arch' package (GARCH estimation) is importable.
+
+    When arch is absent Feature_Engineering.py silently falls back to EWMA
+    for GARCH_Cond_Vol.  This is acceptable at inference time (series are
+    always < 100 rows anyway), but creates a train/inference feature
+    distribution mismatch if models were trained with real GARCH values.
+    Recording the discrepancy here lets operators catch it before a retrain.
+    """
+    try:
+        import arch  # noqa: F401
+        import importlib.metadata as _meta
+        try:
+            ver = _meta.version("arch")
+        except Exception:
+            ver = "unknown"
+        issues.append(("INFO", f"arch package OK (version={ver}) — GARCH_Cond_Vol will use real GARCH for long series"))
+    except ImportError:
+        issues.append((
+            "WARNING",
+            "Optional package 'arch' is not installed. "
+            "GARCH_Cond_Vol will fall back to EWMA for all series lengths. "
+            "This is fine for inference (short series) but causes a train/inference "
+            "feature mismatch if models were trained with 'arch' available. "
+            "Fix: pip install 'arch>=6.0.0'",
         ))

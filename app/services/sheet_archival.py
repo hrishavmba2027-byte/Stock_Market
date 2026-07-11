@@ -12,7 +12,11 @@ import Data_update
 
 DEFAULT_OPERATIONAL_SHEET_ID = "1uekPHyvJj4p6YjxNwlBBIAI71SWRye-xxFu47Kgpf9o"
 DEFAULT_HISTORICAL_TRAINING_SHEET_ID = "1_gpRclY80tH3r54b9R5HTXqKF7R7bnMoWugF9Fy-boI"
-DEFAULT_ROLLING_OPERATIONAL_ROWS = 30
+DEFAULT_ROLLING_OPERATIONAL_ROWS = 60  # SMA_50 needs 51+ rows (50 periods + 1-step lag); 60 gives a 9-row safety buffer
+
+# Tracks whether a row has been used as a fine-tuning training sample.
+# 1 = used in fine-tuning (or initial training), 0 = not yet.
+ROW_FINETUNED_COL = "Row_finetuned"
 
 
 @dataclass
@@ -22,7 +26,7 @@ class ArchivalWorksheetResult:
     rows_seen: int = 0
     valid_rows: int = 0
     malformed_rows: int = 0
-    rolling_limit: int = DEFAULT_ROLLING_OPERATIONAL_ROWS
+    rolling_limit: int = DEFAULT_ROLLING_OPERATIONAL_ROWS  # updated to 60
     candidate_rows: int = 0
     rows_appended: int = 0
     duplicate_rows_skipped: int = 0
@@ -378,6 +382,15 @@ def archive_old_rows_for_worksheet(
         result.reason = "historical archive worksheet unavailable; operational cleanup skipped"
         return result
 
+    # ── Ensure Row_finetuned column always lands in the destination sheet ────
+    # We inject the column name into the *source* headers so that
+    # ensure_destination_headers propagates it to the historical sheet's header
+    # row.  Actual cell values are set to 0 below (un-fine-tuned on arrival);
+    # monthly_finetune.py will flip them to 1 for rows used in training.
+    _rf_key = header_key(ROW_FINETUNED_COL)
+    if not any(header_key(h) == _rf_key for h in headers):
+        headers = list(headers) + [ROW_FINETUNED_COL]
+
     destination, destination_headers, schema_changed, header_reason = ensure_destination_headers(
         archive_spreadsheet,
         archive_worksheet,
@@ -406,7 +419,20 @@ def archive_old_rows_for_worksheet(
         (key, parsed_date, row)
         for key, (parsed_date, _, row) in sorted(unique_by_date.items(), key=lambda item: (item[1][0], item[1][1]))
     ]
-    rows_to_append = [align_row_to_headers(row, headers, destination_headers) for _, _, row in ordered_new]
+    # Find the Row_finetuned column index in the *destination* headers so we
+    # can force its value to 0 for every newly archived row.  Rows that end up
+    # being used for fine-tuning will have the column updated to 1 later by
+    # monthly_finetune.write_finetuned_flags().
+    _rf_dest_idx: Optional[int] = next(
+        (i for i, h in enumerate(destination_headers) if header_key(h) == _rf_key),
+        None,
+    )
+    rows_to_append: List[List[Any]] = []
+    for _, _, row in ordered_new:
+        aligned = align_row_to_headers(row, headers, destination_headers)
+        if _rf_dest_idx is not None:
+            aligned[_rf_dest_idx] = 0  # newly archived rows start un-fine-tuned
+        rows_to_append.append(aligned)
     result.rows_appended = len(rows_to_append)
     result.duplicate_rows_skipped = duplicate_rows
     if ordered_new:

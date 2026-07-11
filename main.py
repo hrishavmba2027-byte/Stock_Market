@@ -59,7 +59,7 @@ MAX_FORECAST_HORIZON = 5
 RECURSIVE_FORECAST_HORIZONS = 5
 RECURSIVE_RETURN_CLIP = (-0.08, 0.08)
 ROLLING_STABILIZATION_WINDOW = 20
-LATEST_SHEET_ROWS_TO_KEEP = 30
+LATEST_SHEET_ROWS_TO_KEEP = 60  # SMA_50 needs 51+ rows (50 periods + 1-step lag); 60 gives a 9-row safety buffer
 SHEET_ROW_COL = "__sheet_row_number"
 SORT_POSITION_COL = "__sort_position"
 STATUS_OK = "ok"
@@ -734,13 +734,13 @@ def prepare_stock_part(
     # regardless of its current predicted / forecast state.  This powers the
     # full-sheet overwrite path where we re-predict every row on every run.
     if force_all_rows:
-        valid_indices = np.where(candidate_positions > first_valid_position)[0]
+        valid_indices = np.where(candidate_positions >= first_valid_position)[0]
     else:
         # Forecast columns are refreshed when present so older long-horizon
         # outputs are replaced by the 5-day hybrid forecast without changing
         # processed flags.
         valid_indices = np.where(
-            (candidate_positions > first_valid_position)
+            (candidate_positions >= first_valid_position)
             & ((predicted_values == 0) | forecast_missing_values | refresh_existing_forecasts)
         )[0]
     if latest_only and len(valid_indices) > 0:
@@ -831,6 +831,18 @@ def prepare_stock_part(
             f"({len(engineered)} rows, elapsed={fe_elapsed:.3f}s)"
         )
 
+    # Hard-check: any feature_column that is also a model input AND completely
+    # absent from the engineered output will be silently zeroed by reindex().
+    # Zero is not a valid value for most indicators (e.g. RSI=0 or VWAP=0 are
+    # nonsensical) so we raise early rather than feed garbage to the model.
+    _missing_model_features = [c for c in feature_columns if c not in engineered.columns]
+    if _missing_model_features:
+        raise ValueError(
+            f"[FE] {payload.name}: {len(_missing_model_features)} model feature(s) "
+            f"completely absent from engineered output — cannot proceed: "
+            f"{_missing_model_features}"
+        )
+
     leakage_columns = forward_label_like_columns(engineered.columns, metadata)
     overlap = sorted(forward_label_like_columns(feature_columns, metadata))
     if overlap:
@@ -863,7 +875,10 @@ def prepare_stock_part(
     target_scaler = MinMaxScaler()
     target_scaler.fit(target_values)
 
-    feature_frame = engineered.reindex(columns=feature_columns, fill_value=0)
+    # Use fill_value=np.nan so that sparse NaNs inside a present column are
+    # forward-filled by to_numeric_frame() rather than hard-zeroed.  Completely
+    # absent columns are blocked earlier by the _missing_model_features check.
+    feature_frame = engineered.reindex(columns=feature_columns, fill_value=np.nan)
     feature_frame = to_numeric_frame(feature_frame)
     feature_scaler = MinMaxScaler()
     feature_scaler.fit(feature_frame.loc[historical_mask])
@@ -1247,7 +1262,9 @@ def scaled_latest_feature_row(
     engineered = engineered.drop(columns=leakage_columns, errors="ignore")
     if engineered.empty:
         raise ValueError(f"{part.symbol}: recursive feature engineering produced no rows")
-    feature_frame = engineered.reindex(columns=feature_columns, fill_value=0)
+    # Use NaN so sparse indicator gaps are forward-filled by to_numeric_frame,
+    # not hard-zeroed.  Absent columns were already caught upstream.
+    feature_frame = engineered.reindex(columns=feature_columns, fill_value=np.nan)
     feature_frame = to_numeric_frame(feature_frame)
     scaled = part.feature_scaler.transform(feature_frame).astype(np.float32)
     latest = scaled[-1]
@@ -1509,14 +1526,26 @@ def run_inference(
 
     result_frames: List[pd.DataFrame] = []
     weights_used: Dict[str, float] = {}
+    skipped_symbols: List[str] = []
     for part in prediction_parts:
         count = len(part.X)
-        stock_price_matrix, stock_scaled_h1, first_model_scaled, part_weights = recursive_forecast_part(
-            part,
-            models,
-            metadata,
-            device,
-        )
+        try:
+            stock_price_matrix, stock_scaled_h1, first_model_scaled, part_weights = recursive_forecast_part(
+                part,
+                models,
+                metadata,
+                device,
+            )
+        except (ValueError, RuntimeError) as exc:
+            # A single-symbol inference failure (e.g. non-finite values from
+            # a short-history indicator like SMA_50 propagating through the
+            # model) must not abort the entire 49-stock run.  Log, skip, continue.
+            print(
+                f"[inference] WARNING: {part.symbol} skipped — {exc}",
+                file=sys.stderr, flush=True,
+            )
+            skipped_symbols.append(part.symbol)
+            continue
         if part_weights:
             weights_used = part_weights
         if stock_price_matrix.shape != (count, len(forecast_columns)):
@@ -1552,6 +1581,19 @@ def run_inference(
             result[f"{model_name}_Scaled"] = predictions
         result_frames.append(result)
 
+    if not result_frames:
+        print(
+            f"[inference] WARNING: all {len(prediction_parts)} symbol(s) were skipped "
+            f"({', '.join(skipped_symbols)}); returning empty results",
+            file=sys.stderr, flush=True,
+        )
+        return empty_results_frame(), weights_used
+    if skipped_symbols:
+        print(
+            f"[inference] INFO: {len(skipped_symbols)} symbol(s) skipped due to inference errors: "
+            f"{', '.join(skipped_symbols)}",
+            file=sys.stderr, flush=True,
+        )
     results = pd.concat(result_frames, ignore_index=True)
     results.insert(0, "Sample_Index", np.arange(len(results)))
     results["Absolute_Error"] = np.where(
@@ -1849,11 +1891,23 @@ def authorize_gspread(credentials_path: Optional[str]) -> Any:
     except ImportError as exc:
         raise RuntimeError("Google Sheets support requires gspread and google-auth packages") from exc
 
-    credential_file = (
-        credentials_path
-        or os.environ.get("GOOGLE_CREDENTIALS")
-        or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    # Resolve credential file in preference order:
+    #   1. Explicit --google-credentials argument (highest priority)
+    #   2. Project-local credentials/Credentials_New.json (always correct for this project)
+    #   3. GOOGLE_CREDENTIALS env var
+    #   4. GOOGLE_APPLICATION_CREDENTIALS env var (lowest — may point to a different project)
+    _script_dir = Path(__file__).resolve().parent
+    _project_local = _script_dir / "credentials" / "Credentials_New.json"
+    _candidates = [
+        credentials_path,
+        str(_project_local) if _project_local.exists() else None,
+        os.environ.get("GOOGLE_CREDENTIALS"),
+        os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
+    ]
+    credential_file = next(
+        (c for c in _candidates if c and Path(c).is_file()), None
     )
+
     if credential_file:
         print(f"[google_auth] Using credentials : {credential_file}", flush=True)
         creds = Credentials.from_service_account_file(credential_file, scopes=GOOGLE_SCOPES)
@@ -1874,11 +1928,37 @@ def load_google_payloads(
     requested = worksheet_filters or ({worksheet_filter.upper()} if worksheet_filter else None)
     payloads: List[SheetPayload] = []
 
+    paced_reads = 0
     for worksheet in spreadsheet.worksheets():
         if requested and worksheet.title.upper() not in requested:
             continue
-        values = worksheet.get_all_values()
+        # Pace reads to ≈40/min (1.5 s gap) so we stay inside Google Sheets'
+        # 60-reads/min-per-user quota.  The same pacing is used by the
+        # orchestrator's Stage 4 snapshot loop.
+        if paced_reads > 0:
+            time.sleep(1.5)
+        # Per-worksheet 429 retry: earlier pipeline stages (Stages 2–5) can
+        # exhaust the Sheets read quota before Stage 10 starts.  Rather than
+        # crashing the whole process and forcing a full restart (which wastes
+        # the quota-recovery window), back off and retry at the worksheet level.
+        _429_delays = [30, 60, 120]  # seconds: wait 30 s, then 60 s, then 120 s
+        for _attempt, _delay in enumerate([0] + _429_delays):
+            if _delay:
+                print(
+                    f"[google_sheets] {worksheet.title}: 429 quota hit "
+                    f"(attempt {_attempt}/{len(_429_delays)}) — sleeping {_delay}s",
+                    flush=True,
+                )
+                time.sleep(_delay)
+            try:
+                values = worksheet.get_all_values()
+                break  # success
+            except Exception as _exc:
+                if "429" in str(_exc) and _attempt < len(_429_delays):
+                    continue  # back off and retry
+                raise  # non-429 or retries exhausted — propagate
         payloads.append(values_to_payload(worksheet.title, values, worksheet=worksheet))
+        paced_reads += 1
 
     if requested and not payloads:
         raise RuntimeError(f"Worksheet(s) not found: {', '.join(sorted(requested))}")
