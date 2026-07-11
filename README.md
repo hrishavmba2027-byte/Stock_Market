@@ -58,16 +58,20 @@ cd Stock_Market
 #    beyond filling in your own secrets/IDs.
 cp .env.example .env
 
-# 2. Google service-account JSON (gitignored) — place it here and point the
-#    GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_CREDENTIALS entries in .env at it:
+# 2. Google service-account JSON (gitignored). Download it from the GCP
+#    console (IAM → Service Accounts → Keys), then copy it into credentials/.
+#    ⚠ "~/Downloads/your-service-account.json" below is a PLACEHOLDER —
+#    replace it with the actual name/location of the file you downloaded.
+#    Skip this step if credentials/ already has your JSON files.
 mkdir -p credentials
-cp /path/to/your-service-account.json credentials/
+cp ~/Downloads/your-service-account.json credentials/
+#  …then point GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_CREDENTIALS in .env at it.
 
-# 2b. Firebase Admin SDK JSON (gitignored) — used to store ingested news and
-#     its sentiment analysis in your Firebase project's Firestore.
-#     Download it from Firebase console → Project settings → Service accounts
-#     → "Generate new private key", then point FIREBASE_CREDENTIALS in .env at it:
-cp /path/to/your-firebase-adminsdk.json credentials/Firebase_Credentials.json
+# 2b. Firebase Admin SDK JSON (gitignored) — stores ingested news + sentiment
+#     analysis in your Firebase project's Firestore. Download from Firebase
+#     console → Project settings → Service accounts → "Generate new private
+#     key" (again: replace the ~/Downloads path with your actual file):
+cp ~/Downloads/your-firebase-adminsdk.json credentials/Firebase_Credentials.json
 
 # 3a. Python environment (manual)
 python3.11 -m venv venv
