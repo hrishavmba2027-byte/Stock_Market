@@ -210,18 +210,26 @@ docker compose up -d api                             # API only, no watcher
 docker compose stop api                              # free the memory when done
 ```
 
-For one-shot jobs, cap the container memory and run stages separately instead
-of one big `run_full_workflow.py --live` pass — e.g. data update first, then
-inference for a few worksheets at a time:
+For live runs, split the work into sequential one-shot containers instead of
+one big `run_full_workflow.py --live` pass — data update first, then inference,
+each for a limited worksheet batch. This exact sequence is verified end-to-end
+(sheet append → forecasts written → rolling 60-row cleanup → archive):
 
 ```bash
-docker run --rm --memory=3g --env-file .env \
-  -v ./credentials:/app/credentials:ro \
-  stock-market-automation:local python Data_update.py
+# Phase 1 — append fresh OHLCV rows to the operational sheet (LIVE write)
+docker compose --profile tools run --rm pipeline python Data_update.py --worksheets RELIANCE
 
-docker compose --profile tools run --rm pipeline python main.py --worksheets RELIANCE,TCS
-docker compose --profile tools run --rm pipeline python main.py --worksheets INFY,HDFCBANK
+# Phase 2 — ensemble forecasts written back to the sheet (LIVE write)
+docker compose --profile tools run --rm pipeline python main.py --worksheets RELIANCE --device cpu
+
+# Repeat both phases for the next batch:
+docker compose --profile tools run --rm pipeline python Data_update.py --worksheets TCS,INFY
+docker compose --profile tools run --rm pipeline python main.py --worksheets TCS,INFY --device cpu
 ```
+
+Each `run --rm` container exits and frees its memory before the next starts.
+Prediction CSV/metrics land in `outputs/main_inference/` on the host via the
+compose bind mounts (a plain `docker run` without those mounts would lose them).
 
 One-shot jobs run through the `pipeline` service (opt-in `tools` profile):
 
