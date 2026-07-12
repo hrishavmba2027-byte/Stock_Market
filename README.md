@@ -236,6 +236,35 @@ for d in c.collection('news').stream(): print(' news doc:', d.id)
 "
 ```
 
+### GLM trade suggestions (LLM decision layer)
+
+Combines each stock's latest 15-day forecast path (operational sheet) with
+its news-sentiment snapshot (Firestore `sentiment_latest`) and asks GLM-4.7
+(Ollama Cloud, key in `GLM_API_KEY`) for a BUY / HOLD / AVOID call with sell
+timing and a stop-loss. Suggestions are stored in Firestore
+`trade_suggestions` (one doc per ticker). Runs are incremental: each doc
+records the input fingerprint it was generated from, so a stock is re-sent
+to the LLM only when its forecast or sentiment actually changed.
+
+```bash
+python -m features.trade_suggestions                     # all worksheets (first pass = full context)
+python -m features.trade_suggestions --tickers RELIANCE,TCS
+python -m features.trade_suggestions --dry-run           # print, don't store
+python -m features.trade_suggestions --force             # regenerate everything
+python -m features.trade_suggestions --workers 4 --limit 10
+```
+
+Read the stored suggestions back:
+
+```bash
+python -c "
+from dotenv import load_dotenv; load_dotenv()
+from ingestion._firestore import init_firestore_client
+for d in init_firestore_client().collection('trade_suggestions').stream():
+    s = d.to_dict(); print(d.id, s['action'], 'sell', s.get('sell_day'), 'stop', s.get('stoploss'))
+"
+```
+
 ### MLOps & utilities
 
 ```bash
@@ -357,6 +386,7 @@ Copy `.env.example` → `.env` and fill in. Highlights:
 | `DEVICE` | `auto` (CUDA → MPS → CPU), `cpu`, `cuda`, `mps` |
 | `FIREBASE_CREDENTIALS` | Firebase Admin SDK JSON for the news + sentiment-analysis Firestore project; all Firestore writes prefer this, falling back to `GOOGLE_CREDENTIALS` when unset |
 | `FIREBASE_PROJECT` | Optional explicit Firebase project id (default: read from the credentials JSON) |
+| `GLM_API_KEY` / `GLM_BASE_URL` / `GLM_MODEL` | LLM decision layer (trade suggestions); any OpenAI-compatible endpoint — default Ollama Cloud `glm-4.7` |
 | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` / `REDDIT_USER_AGENT` | Reddit ingestion |
 | `CREDENTIALS_FILE` | Credentials filename used by the docker-compose mount |
 
