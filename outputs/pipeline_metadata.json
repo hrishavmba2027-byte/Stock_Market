@@ -57,6 +57,24 @@
     0.9
   ],
   "target_type": "multi_horizon_quantile_log_return",
+  "circuit_limit": {
+    "daily_pct": 0.1,
+    "daily_log_return": 0.09531017980432487,
+    "horizon_logret_bounds": [
+      0.09531017980432487,
+      0.19062035960864973,
+      0.2859305394129746,
+      0.38124071921729946,
+      0.47655089902162434
+    ],
+    "output_head": "scaled_tanh",
+    "applied_at": [
+      "model_output_head",
+      "train_target_clamp",
+      "inference_clip"
+    ]
+  },
+  "garch_mode": "garch",
   "target_base_col": "Close",
   "label_anchor": "previous_close",
   "forecast_horizon_count": 5,
@@ -1166,85 +1184,85 @@
   "metrics_scaled": {
     "Train": {
       "n": 463750,
-      "MSE": 0.0011831437902728415,
-      "RMSE": 0.03439685727319927,
-      "MAE": 0.02346855819511708,
-      "R2": 0.00790475236545618,
-      "Adjusted_R2": 0.006533712375980438,
-      "MAPE": 113.96052350325327
+      "MSE": 0.0011712073851098213,
+      "RMSE": 0.034222907315273804,
+      "MAE": 0.023476030081426475,
+      "R2": 0.017913722478329674,
+      "Adjusted_R2": 0.016556514525960297,
+      "MAPE": 118.7875435044791
     },
     "Validation": {
       "n": 53695,
-      "MSE": 0.0007277379491210242,
-      "RMSE": 0.026976618563508366,
-      "MAE": 0.017256807923564453,
-      "R2": -0.021736378609049867,
-      "Adjusted_R2": -0.034061769386555696,
-      "MAPE": 114.49713182023005
+      "MSE": 0.0007437131154666891,
+      "RMSE": 0.027271104038279953,
+      "MAE": 0.01753232863134577,
+      "R2": -0.044165343086457254,
+      "Adjusted_R2": -0.056761298520078274,
+      "MAPE": 137.97916360582195
     },
     "Test": {
       "n": 89915,
-      "MSE": 0.0008217187380256592,
-      "RMSE": 0.028665636885052095,
-      "MAE": 0.0203381792652923,
-      "R2": -0.00808729128207708,
-      "Adjusted_R2": -0.01531420915761239,
-      "MAPE": 117.0119968224578
+      "MSE": 0.0008285181152862005,
+      "RMSE": 0.028783990607387996,
+      "MAE": 0.020451504273735047,
+      "R2": -0.01642879000638886,
+      "Adjusted_R2": -0.023715507590501783,
+      "MAPE": 134.14332958110572
     }
   },
   "test_price_metrics": {
     "n": 89915,
-    "MSE": 18934.415631372685,
-    "RMSE": 137.60238236081773,
-    "MAE": 54.26184653146575,
-    "R2": 0.9989969016390394,
-    "Adjusted_R2": 0.9989897104865089,
-    "MAPE": 2.030765557609906
+    "MSE": 19100.783766048226,
+    "RMSE": 138.2055851478088,
+    "MAE": 54.53882921658518,
+    "R2": 0.9989880878680492,
+    "Adjusted_R2": 0.9989808335301182,
+    "MAPE": 2.0399089809976236
   },
   "test_horizon_metrics": [
     {
       "horizon": 1,
       "n": 18081,
-      "pinball": 0.004018902701015274,
-      "mae_q50": 0.01175567228347063,
-      "coverage_q10_q90": 0.881367181018749,
-      "spearman_ic": 0.018387189746749955,
+      "pinball": 0.00397980857330064,
+      "mae_q50": 0.011776220053434372,
+      "coverage_q10_q90": 0.8591338974614235,
+      "spearman_ic": 0.009456749833711416,
       "spearman_groups": 369
     },
     {
       "horizon": 2,
       "n": 18032,
-      "pinball": 0.005658669086794059,
-      "mae_q50": 0.016891051083803177,
-      "coverage_q10_q90": 0.871561668145519,
-      "spearman_ic": 0.0249794809228039,
+      "pinball": 0.00565508163223664,
+      "mae_q50": 0.017086254432797432,
+      "coverage_q10_q90": 0.8518744454303461,
+      "spearman_ic": 0.027816104702750657,
       "spearman_groups": 368
     },
     {
       "horizon": 3,
       "n": 17983,
-      "pinball": 0.006974365096539259,
-      "mae_q50": 0.021106215193867683,
-      "coverage_q10_q90": 0.8625368403492187,
-      "spearman_ic": 0.036007618306178046,
+      "pinball": 0.006963270716369152,
+      "mae_q50": 0.021234288811683655,
+      "coverage_q10_q90": 0.8444642162041929,
+      "spearman_ic": 0.025181560362564644,
       "spearman_groups": 367
     },
     {
       "horizon": 4,
       "n": 17934,
-      "pinball": 0.008053924422711134,
-      "mae_q50": 0.024532577022910118,
-      "coverage_q10_q90": 0.8507304561168729,
-      "spearman_ic": 0.03992445877282098,
+      "pinball": 0.008052924958368143,
+      "mae_q50": 0.024683674797415733,
+      "coverage_q10_q90": 0.8306010928961749,
+      "spearman_ic": 0.03277015788335178,
       "spearman_groups": 366
     },
     {
       "horizon": 5,
       "n": 17885,
-      "pinball": 0.009002343596269688,
-      "mae_q50": 0.027512069791555405,
-      "coverage_q10_q90": 0.850545149566676,
-      "spearman_ic": 0.04874252166620072,
+      "pinball": 0.008995363488793373,
+      "mae_q50": 0.027583932504057884,
+      "coverage_q10_q90": 0.8276209113782499,
+      "spearman_ic": 0.043151244059267534,
       "spearman_groups": 365
     }
   ],
@@ -1252,114 +1270,40 @@
     {
       "horizon": 1,
       "n": 18081,
-      "top_decile_mean": 0.001085878349840641,
-      "bottom_decile_mean": -0.00023543673160020262,
-      "overall_mean": 0.0004197753733024001,
-      "top_vs_overall": 0.0006661029765382409,
-      "top_vs_bottom": 0.0013213150814408436
+      "top_decile_mean": 0.0018740086816251278,
+      "bottom_decile_mean": -0.00016246159793809056,
+      "overall_mean": 0.00041977540240623057,
+      "top_vs_overall": 0.0014542332792188972,
+      "top_vs_bottom": 0.0020364702795632184
     },
     {
       "horizon": 5,
       "n": 17885,
-      "top_decile_mean": 0.0024986646603792906,
-      "bottom_decile_mean": -0.0011645692866295576,
+      "top_decile_mean": 0.0065774982795119286,
+      "bottom_decile_mean": 0.00341118429787457,
       "overall_mean": 0.0020380690693855286,
-      "top_vs_overall": 0.000460595590993762,
-      "top_vs_bottom": 0.003663233947008848
+      "top_vs_overall": 0.0045394292101264,
+      "top_vs_bottom": 0.0031663139816373587
     }
   ],
   "backtest_decile_lift": [
     {
       "horizon": 1,
       "n": 6174,
-      "top_decile_mean": 0.00019123826260107545,
-      "bottom_decile_mean": 0.0010162385114863691,
+      "top_decile_mean": 0.0007314105138599048,
+      "bottom_decile_mean": 0.0005876456541245332,
       "overall_mean": 0.00039564448341450147,
-      "top_vs_overall": -0.00020440622081342602,
-      "top_vs_bottom": -0.0008250002488852937
+      "top_vs_overall": 0.0003357660304454033,
+      "top_vs_bottom": 0.00014376485973537155
     },
     {
       "horizon": 5,
       "n": 5978,
-      "top_decile_mean": 0.000724074016225271,
-      "bottom_decile_mean": 0.0026661539254211933,
+      "top_decile_mean": 0.0036773409840210776,
+      "bottom_decile_mean": 0.002122711784555583,
       "overall_mean": 0.0017474227890949905,
-      "top_vs_overall": -0.0010233487728697195,
-      "top_vs_bottom": -0.0019420799091959223
+      "top_vs_overall": 0.001929918194926087,
+      "top_vs_bottom": 0.0015546291994654945
     }
-  ],
-  "pipeline_version": "1.0.0",
-  "feature_engineering_version": "1.0.0",
-  "last_successful_run": null,
-  "last_run_status": null,
-  "last_run_at": null,
-  "run_count": 0,
-  "worksheet_state": {},
-  "trained_at": null,
-  "training_data_start": null,
-  "training_data_end": null,
-  "model_files": {
-    "Dense": "outputs/Saved_Models/Dense.pt",
-    "LSTM": "outputs/Saved_Models/LSTM.pt",
-    "Transformer": "outputs/Saved_Models/Transformer.pt"
-  },
-  "created_at": "2026-05-30T11:34:50.096225+00:00",
-  "schema_version": 1,
-  "workflow": {
-    "last_run_id": "wf-20260531T070051Z-1",
-    "last_feature_engineering_at": "2026-05-31T07:05:10.888401+00:00",
-    "feature_engineering_worksheets": [
-      "RELIANCE",
-      "TCS",
-      "INFY",
-      "HDFCBANK",
-      "ICICIBANK",
-      "SBIN",
-      "LT",
-      "ITC",
-      "HINDUNILVR",
-      "AXISBANK",
-      "KOTAKBANK",
-      "BAJFINANCE",
-      "ASIANPAINT",
-      "BHARTIARTL",
-      "MARUTI",
-      "SUNPHARMA",
-      "ULTRACEMCO",
-      "NTPC",
-      "POWERGRID",
-      "TITAN",
-      "BAJAJFINSV",
-      "NESTLEIND",
-      "ONGC",
-      "TECHM",
-      "HCLTECH",
-      "WIPRO",
-      "ADANIENT",
-      "ADANIPORTS",
-      "JSWSTEEL",
-      "TATASTEEL",
-      "INDUSINDBK",
-      "HDFCLIFE",
-      "SBILIFE",
-      "DIVISLAB",
-      "DRREDDY",
-      "BRITANNIA",
-      "EICHERMOT",
-      "HEROMOTOCO",
-      "BAJAJ-AUTO",
-      "CIPLA",
-      "COALINDIA",
-      "GRASIM",
-      "APOLLOHOSP",
-      "SHREECEM",
-      "TATACONSUM",
-      "UPL",
-      "BPCL",
-      "IOC",
-      "HINDALCO"
-    ],
-    "mode": "live"
-  },
-  "last_modified_at": "2026-05-31T07:05:10.888711+00:00"
+  ]
 }

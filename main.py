@@ -136,6 +136,7 @@ def select_quantile_outputs(
     n_quantiles: int,
     n_horizons: int,
     quantile_idx: int,
+    circuit_bounds: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if output.dim() == 2:
         expected_width = n_quantiles * n_horizons
@@ -148,7 +149,20 @@ def select_quantile_outputs(
         raise ValueError(
             f"model output shape mismatch: expected (*, {n_quantiles}, {n_horizons}), got {tuple(output.shape)}"
         )
+    if circuit_bounds is not None:
+        # Same scaled-tanh bound the checkpoints were trained through: the
+        # horizon-h log-return can never exceed h daily circuit-limit moves.
+        output = circuit_bounds * torch.tanh(output / circuit_bounds)
     return output[:, quantile_idx, :]
+
+
+def _circuit_bounds_tensor(horizon_bounds: Optional[Sequence[float]]) -> Optional[torch.Tensor]:
+    if horizon_bounds is None:
+        return None
+    values = [float(bound) for bound in horizon_bounds]
+    if any((not math.isfinite(bound)) or bound <= 0 for bound in values):
+        raise ValueError(f"horizon_bounds must be positive and finite, got {horizon_bounds}")
+    return torch.as_tensor(values, dtype=torch.float32).view(1, 1, -1)
 
 
 class DenseModel(nn.Module):
@@ -161,11 +175,13 @@ class DenseModel(nn.Module):
         n_horizons: int,
         quantile_idx: int,
         dropout: float = 0.3,
+        horizon_bounds: Optional[Sequence[float]] = None,
     ):
         super().__init__()
         self.n_quantiles = n_quantiles
         self.n_horizons = n_horizons
         self.quantile_idx = quantile_idx
+        self.register_buffer("circuit_bounds", _circuit_bounds_tensor(horizon_bounds), persistent=False)
         self.flatten = nn.Flatten()
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.dropout1 = nn.Dropout(dropout)
@@ -185,6 +201,7 @@ class DenseModel(nn.Module):
             self.n_quantiles,
             self.n_horizons,
             self.quantile_idx,
+            circuit_bounds=self.circuit_bounds,
         )
 
 
@@ -199,11 +216,13 @@ class LSTMModel(nn.Module):
         n_horizons: int,
         quantile_idx: int,
         dropout: float = 0.3,
+        horizon_bounds: Optional[Sequence[float]] = None,
     ):
         super().__init__()
         self.n_quantiles = n_quantiles
         self.n_horizons = n_horizons
         self.quantile_idx = quantile_idx
+        self.register_buffer("circuit_bounds", _circuit_bounds_tensor(horizon_bounds), persistent=False)
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
@@ -225,6 +244,7 @@ class LSTMModel(nn.Module):
             self.n_quantiles,
             self.n_horizons,
             self.quantile_idx,
+            circuit_bounds=self.circuit_bounds,
         )
 
 
@@ -241,11 +261,13 @@ class TransformerModel(nn.Module):
         quantile_idx: int,
         dropout: float = 0.3,
         max_seq_len: int = 512,
+        horizon_bounds: Optional[Sequence[float]] = None,
     ):
         super().__init__()
         self.n_quantiles = n_quantiles
         self.n_horizons = n_horizons
         self.quantile_idx = quantile_idx
+        self.register_buffer("circuit_bounds", _circuit_bounds_tensor(horizon_bounds), persistent=False)
         self.input_projection = nn.Linear(input_size, hidden_size)
         self.position_embedding = nn.Parameter(torch.zeros(1, max_seq_len, hidden_size))
         encoder_layer = nn.TransformerEncoderLayer(
@@ -279,6 +301,7 @@ class TransformerModel(nn.Module):
             self.n_quantiles,
             self.n_horizons,
             self.quantile_idx,
+            circuit_bounds=self.circuit_bounds,
         )
 
 
@@ -422,6 +445,51 @@ def quantile_output_contract(metadata: Dict[str, Any], output_size: int) -> Tupl
     return n_quantiles, n_horizons, quantile_idx
 
 
+def metadata_circuit_bounds(metadata: Dict[str, Any]) -> Optional[List[float]]:
+    """Per-horizon |log-return| caps recorded by the training notebook.
+
+    Returns None for legacy metadata without a circuit_limit block, in which
+    case models run unbounded exactly as before.
+    """
+    info = metadata.get("circuit_limit") or {}
+    raw = info.get("horizon_logret_bounds")
+    if not raw:
+        return None
+    bounds = [float(value) for value in raw]
+    if any((not math.isfinite(value)) or value <= 0 for value in bounds):
+        raise ValueError(f"Invalid circuit_limit horizon bounds in metadata: {raw}")
+    return bounds
+
+
+def model_horizon_bounds(metadata: Dict[str, Any], n_horizons: int) -> Optional[List[float]]:
+    bounds = metadata_circuit_bounds(metadata)
+    if bounds is not None and len(bounds) != n_horizons:
+        raise ValueError(
+            f"circuit_limit horizon bounds length {len(bounds)} does not match n_horizons {n_horizons}"
+        )
+    return bounds
+
+
+def circuit_logret_limits(metadata: Dict[str, Any], n_columns: int) -> Optional[np.ndarray]:
+    """|log-return| caps for forecast columns T+1..T+n_columns.
+
+    Columns beyond the trained horizons extend at one extra daily circuit
+    move per additional day.
+    """
+    bounds = metadata_circuit_bounds(metadata)
+    if bounds is None:
+        return None
+    info = metadata.get("circuit_limit") or {}
+    daily = float(info.get("daily_log_return") or bounds[0])
+    if not math.isfinite(daily) or daily <= 0:
+        raise ValueError(f"Invalid circuit_limit daily_log_return: {info.get('daily_log_return')}")
+    limits = [
+        bounds[index] if index < len(bounds) else bounds[-1] + daily * (index + 1 - len(bounds))
+        for index in range(int(n_columns))
+    ]
+    return np.asarray(limits, dtype=np.float64)
+
+
 def infer_dense_model(state: Dict[str, torch.Tensor], metadata: Dict[str, Any]) -> DenseModel:
     hidden_size, input_size = state["fc1.weight"].shape
     output_size = int(state["fc3.weight"].shape[0])
@@ -436,6 +504,7 @@ def infer_dense_model(state: Dict[str, torch.Tensor], metadata: Dict[str, Any]) 
         n_quantiles=output_contract[0],
         n_horizons=output_contract[1],
         quantile_idx=output_contract[2],
+        horizon_bounds=model_horizon_bounds(metadata, output_contract[1]),
     )
 
 
@@ -460,6 +529,7 @@ def infer_lstm_model(state: Dict[str, torch.Tensor], metadata: Dict[str, Any]) -
         n_quantiles=output_contract[0],
         n_horizons=output_contract[1],
         quantile_idx=output_contract[2],
+        horizon_bounds=model_horizon_bounds(metadata, output_contract[1]),
     )
 
 
@@ -495,6 +565,7 @@ def infer_transformer_model(state: Dict[str, torch.Tensor], metadata: Dict[str, 
         n_horizons=output_contract[1],
         quantile_idx=output_contract[2],
         max_seq_len=int(state["position_embedding"].shape[1]),
+        horizon_bounds=model_horizon_bounds(metadata, output_contract[1]),
     )
 
 
@@ -532,6 +603,7 @@ def get_models(model_dir: Path, metadata: Dict[str, Any], device: torch.device) 
         tuple(metadata.get("quantiles", [])),
         tuple(metadata.get("horizons", [])),
         json.dumps(metadata.get("model_capacity", {}), sort_keys=True),
+        json.dumps(metadata.get("circuit_limit", {}), sort_keys=True),
     )
     with MODELS_LOCK:
         if MODELS is None or MODELS_CACHE_KEY != cache_key:
@@ -1091,7 +1163,13 @@ def model_output_to_price(values: np.ndarray, part: StockInferencePart, metadata
         if not np.isfinite(anchor_close).all():
             raise ValueError("Anchor close contains missing or non-finite values")
         # q50 outputs are direct forward log returns for T+1 through T+5.
-        return anchor_close.astype(np.float64)[:, None] * np.exp(values.astype(np.float64))
+        # Clip each horizon to the daily circuit-limit band so a bad model
+        # output can never produce a price outside h limit moves of the anchor.
+        log_returns = values.astype(np.float64)
+        limits = circuit_logret_limits(metadata, log_returns.shape[1])
+        if limits is not None:
+            log_returns = np.clip(log_returns, -limits, limits)
+        return anchor_close.astype(np.float64)[:, None] * np.exp(log_returns)
     if values.shape[1] != 1:
         raise ValueError(f"Non-quantile price inverse transform expects one output, got {values.shape[1]}")
     return part.target_scaler.inverse_transform(values.reshape(-1, 1)).reshape(-1, 1)
@@ -1288,6 +1366,9 @@ def one_step_outputs_to_price(values: np.ndarray, previous_close: np.ndarray, pa
             RECURSIVE_RETURN_CLIP[0],
             RECURSIVE_RETURN_CLIP[1],
         )
+        one_step_limits = circuit_logret_limits(metadata, 1)
+        if one_step_limits is not None:
+            clipped_returns = np.clip(clipped_returns, -one_step_limits[0], one_step_limits[0])
         return anchors * np.exp(clipped_returns)
     return part.target_scaler.inverse_transform(values.reshape(-1, 1)).reshape(-1)
 
