@@ -140,6 +140,14 @@ jobs:
 
           EXTRA_FLAGS=""
 
+          # Scheduled runs honor the retrain gate inside monthly_finetune.py
+          # (new calendar month since last success, or median new rows per
+          # active symbol >= MIN_NEW_ROWS_FOR_FINETUNE). Manual
+          # workflow_dispatch remains a force-run without the gate.
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            EXTRA_FLAGS="$EXTRA_FLAGS --if-due"
+          fi
+
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             EXTRA_FLAGS="$EXTRA_FLAGS --dry-run"
           fi

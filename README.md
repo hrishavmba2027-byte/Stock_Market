@@ -17,8 +17,8 @@ Stock_Market/
 ├── main.py                    ← inference entry point (ensemble forecasts)
 ├── Data_update.py             ← yfinance OHLCV ingestion → Google Sheets
 ├── Feature_Engineering.py     ← indicator + label computation (imported, not run)
-├── monthly_finetune.py        ← monthly model fine-tuning job
-├── run_full_workflow.py       ← 15-stage end-to-end orchestrator
+├── monthly_finetune.py        ← incremental monthly fine-tune (gated, new data only)
+├── run_full_workflow.py       ← 16-stage end-to-end orchestrator
 ├── app_data.py                ← CLI + FastAPI wrapper (uvicorn app_data:app)
 ├── app.py                     ← FastAPI re-export (app.api.server)
 ├── app/                       ← API, watcher, pipeline, services packages
@@ -76,14 +76,21 @@ cp /Users/hrishavmajumder/Documents/Stock_Market/.env .env
 #      cp ~/Downloads/<your-gcp-key>.json      credentials/Credentials_New.json
 #      cp ~/Downloads/<your-firebase-key>.json credentials/Firebase_Credentials.json
 
-# 3a. Python environment (manual)
+# 3a. Cross-platform bootstrap (Windows / macOS / Linux — recommended):
+#     creates venv, installs pinned deps, copies .env if missing, then runs
+#     a doctor check (torch device, checkpoints, metadata, credentials).
+python3 scripts/setup_local.py                 # python scripts/setup_local.py on Windows
+python3 scripts/setup_local.py --doctor        # re-check health any time
+python3 scripts/setup_local.py --with-notebook # + jupyter/ipykernel for retraining
+
+# 3b. …or manual:
 python3.11 -m venv venv
-source venv/bin/activate
+source venv/bin/activate                   # venv\Scripts\activate on Windows
 pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 pip install -r requirements-dev.txt        # optional: test/dev tools
 
-# 3b. …or the automated macOS bootstrap (creates venv, installs everything,
+# 3c. …or the automated macOS bootstrap (creates venv, installs everything,
 #     verifies imports and Apple-Silicon MPS support):
 chmod +x scripts/fix_environment.sh
 ./scripts/fix_environment.sh
@@ -112,7 +119,40 @@ python main.py --worksheets RELIANCE --dry-run       # models load + 15-day fore
 
 ## Running the pipeline
 
-### Full end-to-end workflow (15 stages)
+### Quick reference — the whole system in three commands
+
+Market data → forecasts → news/sentiment → LLM decisions, in order (each step
+depends on the previous one; `&&` stops the chain on failure):
+
+```bash
+source venv/bin/activate                             # venv\Scripts\activate on Windows
+
+python run_full_workflow.py --live && \
+python -m ingestion.collect_all && \
+python -m features.trade_suggestions
+```
+
+| Step | What it does | Writes to |
+|---|---|---|
+| `run_full_workflow.py --live` | 16 stages: yfinance OHLCV append → feature engineering → ensemble forecasts (`Forecast_Close_T+1…15`) → **stage 15 auto fine-tune** (`monthly_finetune.py --if-due`) | Google Sheets, `outputs/` |
+| `ingestion.collect_all` | News + Reddit + X ingestion (parallel), then FinBERT sentiment | Firestore `news`, `sentiment_latest`, … |
+| `features.trade_suggestions` | GLM BUY/HOLD/AVOID per stock from forecast path + sentiment | Firestore `trade_suggestions` |
+
+Rehearsal without external writes:
+
+```bash
+python run_full_workflow.py            # dry-run (stage 15 runs a read-only gate probe)
+python -m ingestion.collect_all --no-firestore
+python -m features.trade_suggestions --dry-run
+```
+
+Model retraining is automatic and incremental: stage 15 fine-tunes the saved
+checkpoints **only on data they were never trained on** at the start of every
+month (or earlier once the median stock accumulates 30 new rows), overwriting
+`outputs/Saved_Models/{Dense,LSTM,Transformer}.pt` in place — see
+[Monthly fine-tuning](#monthly-fine-tuning).
+
+### Full end-to-end workflow (16 stages)
 
 ```bash
 python run_full_workflow.py                          # dry-run (default, no sheet writes)
@@ -153,9 +193,33 @@ python main.py --all-eligible-rows --plots           # full backfill + HTML plot
 
 ### Monthly fine-tuning
 
+Incremental only — the models are **never retrained on the full dataset**.
+Each run warm-starts the saved checkpoints on historical rows newer than the
+last fine-tune state (plus a small per-symbol replay buffer) and atomically
+overwrites `outputs/Saved_Models/{Dense,LSTM,Transformer}.pt` in place, so
+`main.py` keeps loading the same files with no other changes.
+
+**Automatic scheduling.** The retrain gate lives inside `monthly_finetune.py`
+and fires when either:
+
+- a **new calendar month** has started since the last successful fine-tune
+  (primary monthly trigger), or
+- the **median active stock** already has `MIN_NEW_ROWS_FOR_FINETUNE`
+  (default 30) rows the models were never trained on (early trigger).
+
+It runs automatically from two places:
+
+- **Locally** — `run_full_workflow.py` stage 15 calls
+  `monthly_finetune.py --if-due` after every successful pipeline run
+  (disable with `AUTO_FINETUNE_AFTER_WORKFLOW=false`).
+- **Cloud** — the `monthly-finetune` GitHub Actions workflow (1st of every
+  month); scheduled runs pass `--if-due`, manual dispatch is a force-run.
+
 ```bash
+python monthly_finetune.py --check-only              # is a retrain due? read-only probe
+python monthly_finetune.py --if-due                  # fine-tune only when the gate is due
 python monthly_finetune.py --dry-run                 # validate + train, no writes
-python monthly_finetune.py                           # real fine-tune run
+python monthly_finetune.py                           # force a real fine-tune run
 python monthly_finetune.py \
   --operational-sheet-id "$OPERATIONAL_SHEET_ID" \
   --historical-sheet-id  "$HISTORICAL_TRAINING_SHEET_ID" \
@@ -366,7 +430,7 @@ iterations kept for reference.
 | `daily-prediction.yml` | daily | `Data_update.py` → `features.cross_sectional` → `main.py` |
 | `weekly-fundamentals.yml` | weekly | `ingestion.fundamentals` |
 | `news-sentiment.yml` | scheduled | news ingest + `features.sentiment` |
-| `monthly-finetune.yml` | 1st of month | `monthly_finetune.py` |
+| `monthly-finetune.yml` | 1st of month | `monthly_finetune.py --if-due` (incremental, gate-checked) |
 | `monthly-training.yml` | monthly | full retrain path |
 | `run-full-workflow.yml` | manual dispatch | `run_full_workflow.py` (dry/live) |
 | `upload-models.yml` | manual/after training | `mlops.upload_models` |
@@ -383,6 +447,9 @@ Copy `.env.example` → `.env` and fill in. Highlights:
 | `HISTORICAL_TRAINING_SHEET_ID` | Training-archive sheet |
 | `TRAIN_END`, `TEST_END`, `BACK_TEST_START`, `BACK_TEST_END` | Train/test/backtest split dates |
 | `FORECAST_DAYS`, `ROLLING_OPERATIONAL_ROWS` | Forecast horizon & sheet retention |
+| `AUTO_FINETUNE_AFTER_WORKFLOW` | `true` (default) = workflow stage 15 runs `monthly_finetune.py --if-due` after each run |
+| `MIN_NEW_ROWS_FOR_FINETUNE` | Early fine-tune trigger: median new (untrained) rows per active stock (default 30) |
+| `DAILY_CIRCUIT_PCT` | Daily price-band bound baked into model training (default 0.10 = 10%/day) |
 | `DEVICE` | `auto` (CUDA → MPS → CPU), `cpu`, `cuda`, `mps` |
 | `FIREBASE_CREDENTIALS` | Firebase Admin SDK JSON for the news + sentiment-analysis Firestore project; all Firestore writes prefer this, falling back to `GOOGLE_CREDENTIALS` when unset |
 | `FIREBASE_PROJECT` | Optional explicit Firebase project id (default: read from the credentials JSON) |

@@ -55,6 +55,10 @@ DEFAULT_WEIGHT_DECAY = 1e-5
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_GRAD_CLIP = 1.0
 MIN_FINE_TUNE_TRAIN_SAMPLES = 16
+# Early-trigger threshold for the retrain gate: fine-tune before the next
+# calendar month when the median active symbol already accumulated this many
+# rows the models have never been trained on.
+DEFAULT_MIN_NEW_ROWS = 30
 DATE_COLUMNS = ("Date_str", "Date", "Date_")
 REQUIRED_PRICE_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 STATE_SCHEMA_VERSION = 1
@@ -165,6 +169,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--grad-clip", type=float, default=DEFAULT_GRAD_CLIP)
     parser.add_argument("--min-train-samples", type=int, default=MIN_FINE_TUNE_TRAIN_SAMPLES)
+    parser.add_argument(
+        "--min-new-rows",
+        type=int,
+        default=parse_positive_int(
+            os.environ.get("MIN_NEW_ROWS_FOR_FINETUNE"),
+            DEFAULT_MIN_NEW_ROWS,
+            name="MIN_NEW_ROWS_FOR_FINETUNE",
+        ),
+        help=(
+            "Early-trigger threshold: fine-tune before the next calendar month when the "
+            "median active symbol has at least this many rows newer than the fine-tune state."
+        ),
+    )
+    parser.add_argument(
+        "--if-due",
+        action="store_true",
+        help=(
+            "Only fine-tune when the retrain gate is due: a new calendar month has started "
+            "since the last successful fine-tune, or the median new-row count per active "
+            "symbol reached --min-new-rows. Intended for schedulers/automation hooks."
+        ),
+    )
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help=(
+            "Evaluate the retrain gate and new-row counts, print the JSON verdict, and exit "
+            "without training, archival, sheet writes, or state changes."
+        ),
+    )
     parser.add_argument(
         "--force-finetune",
         action="store_true",
@@ -517,6 +551,55 @@ def update_finetune_state(
         }
 
 
+def evaluate_retrain_gate(
+    state: Dict[str, Any],
+    summaries: Sequence[SymbolDatasetSummary],
+    min_new_rows: int,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Decide whether an incremental fine-tune is due.
+
+    Due when either condition holds:
+
+    * ``calendar`` — a new calendar month has started since the last successful
+      fine-tune (``fine_tune.last_successful_run_utc`` in the state file; a
+      missing or unparseable value counts as "never ran"), and the median
+      active symbol has at least one row the models were never trained on.
+      This is the primary monthly trigger: run at the start of every month.
+    * ``data`` — the median new-row count per active symbol reached
+      ``min_new_rows``. This fires early, mid-month, when untrained data
+      accumulates faster than one batch per month.
+
+    "Active" symbols are those with any rows in the historical sheet; the
+    median makes the gate robust to a single stale or delisted worksheet.
+    Never triggers a full-dataset retrain — only the incremental batch.
+    """
+    now = now or datetime.now(timezone.utc)
+    active_new_rows = sorted(int(s.new_rows) for s in summaries if int(s.rows) > 0)
+    median_new_rows = float(np.median(active_new_rows)) if active_new_rows else 0.0
+    last_raw = str((state.get("fine_tune") or {}).get("last_successful_run_utc") or "")
+    last_run: Optional[datetime] = None
+    if last_raw:
+        try:
+            last_run = datetime.fromisoformat(last_raw.replace("Z", "+00:00"))
+        except ValueError:
+            last_run = None
+    month_started = last_run is None or (now.year, now.month) != (last_run.year, last_run.month)
+    calendar_due = month_started and median_new_rows >= 1.0
+    data_due = min_new_rows > 0 and median_new_rows >= float(min_new_rows)
+    return {
+        "due": bool(calendar_due or data_due),
+        "calendar_due": bool(calendar_due),
+        "data_due": bool(data_due),
+        "median_new_rows_per_active_symbol": median_new_rows,
+        "min_new_rows_threshold": int(min_new_rows),
+        "active_symbols": len(active_new_rows),
+        "new_calendar_month_since_last_success": bool(month_started),
+        "last_successful_run_utc": last_raw,
+        "checked_at_utc": now.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+
+
 def column_number_to_letter(number: int) -> str:
     if number <= 0:
         raise ValueError("column number must be positive")
@@ -559,6 +642,41 @@ def read_worksheet_values(worksheet: Any) -> List[List[Any]]:
     return Data_update.with_retry(worksheet.get_all_values, f"{worksheet.title}: get_all_values")
 
 
+def repair_schema_against_data(
+    headers: Sequence[str],
+    data_rows: Sequence[Sequence[Any]],
+    schema: Dict[str, int],
+) -> Dict[str, int]:
+    """Re-point schema entries that reference empty columns to data-bearing ones.
+
+    The historical sheet can contain BOTH plain canonical headers (``Open``,
+    ``Close``, ...) that are completely empty and prefixed data columns
+    (``Open_RELIANCE.NS``). resolve_sheet_schema prefers the exact canonical
+    name, which would make every row look malformed. For each required price
+    column whose resolved cells are empty, fall back to another header that
+    matches ``<name>`` / ``<name>_*`` and actually holds data.
+    """
+    sample = list(data_rows[:50]) + list(data_rows[-50:])
+
+    def column_has_data(idx: int) -> bool:
+        return any(idx < len(row) and str(row[idx]).strip() for row in sample)
+
+    repaired = dict(schema)
+    for column in (*REQUIRED_PRICE_COLUMNS, "Adj Close"):
+        idx = repaired.get(column)
+        if idx is None or column_has_data(idx):
+            continue
+        target = column.lower()
+        for alt_idx, header in enumerate(headers):
+            if alt_idx == idx:
+                continue
+            lower = str(header).strip().lower()
+            if (lower == target or lower.startswith(target + "_")) and column_has_data(alt_idx):
+                repaired[column] = alt_idx
+                break
+    return repaired
+
+
 def validate_and_repair_worksheet(worksheet: Any, *, dry_run: bool = False) -> SheetValidationResult:
     title = str(getattr(worksheet, "title", "")).strip()
     stock = title.upper()
@@ -579,6 +697,7 @@ def validate_and_repair_worksheet(worksheet: Any, *, dry_run: bool = False) -> S
             rows_after=len(data_rows),
             reason=schema_error,
         )
+    schema = repair_schema_against_data(headers, data_rows, schema)
 
     date_index = schema.get("Date_str")
     if date_index is None:
@@ -704,6 +823,7 @@ def worksheet_to_required_frame(worksheet: Any) -> pd.DataFrame:
     schema, schema_error = Data_update.resolve_sheet_schema(headers, worksheet.title.strip().upper())
     if schema is None:
         raise ValueError(schema_error)
+    schema = repair_schema_against_data(headers, frame.values.tolist(), schema)
     normalized = Data_update.normalize_frame_to_required_columns(frame, headers, schema)
     normalized["Date"] = Data_update.normalize_date_series(normalized["Date"])
     normalized["Date_str"] = normalized["Date"].dt.strftime("%Y-%m-%d")
@@ -712,6 +832,10 @@ def worksheet_to_required_frame(worksheet: Any) -> pd.DataFrame:
             normalized[column].astype(str).str.replace(",", "", regex=False),
             errors="coerce",
         )
+    # Historical sheets may have no Adj Close data at all; backfill from Close
+    # (same rule validate_and_repair_worksheet applies) instead of dropping
+    # every row in the dropna below.
+    normalized["Adj Close"] = normalized["Adj Close"].fillna(normalized["Close"])
     normalized = normalized.dropna(subset=["Date", *Data_update.NUMERIC_COLUMNS])
     normalized = normalized.drop_duplicates(subset=["Date_str"], keep="last")
     return normalized.sort_values("Date").reset_index(drop=True)
@@ -1328,23 +1452,30 @@ def run_monthly_finetune(args: argparse.Namespace) -> Dict[str, Any]:
     device = forecast.choose_device(args.device)
     log(f"Device: {device}")
 
-    yfinance_update = run_yfinance_update(args)
     requested = parse_worksheet_filters(args.worksheets, args.worksheet)
-    operational_spreadsheet = open_operational_spreadsheet(args)
     historical_spreadsheet = open_historical_spreadsheet(args)
     baseline_dates = latest_historical_dates(historical_spreadsheet, requested)
-    archival_results, missing_operational = run_operational_archival(
-        operational_spreadsheet,
-        historical_spreadsheet,
-        args,
-    )
-    update_archival_state(
-        state,
-        archival_results,
-        operational_sheet_id=args.operational_sheet_id,
-        historical_sheet_id=args.historical_sheet_id,
-    )
-    save_finetune_state(state_path, state, dry_run=bool(args.dry_run))
+    if args.check_only:
+        # Gate probe: strictly read-only. No yfinance append, no archival,
+        # no state write, no Row_finetuned flag updates.
+        yfinance_update: Dict[str, Any] = {"status": "skipped_check_only"}
+        archival_results: List[Any] = []
+        missing_operational: List[str] = []
+    else:
+        yfinance_update = run_yfinance_update(args)
+        operational_spreadsheet = open_operational_spreadsheet(args)
+        archival_results, missing_operational = run_operational_archival(
+            operational_spreadsheet,
+            historical_spreadsheet,
+            args,
+        )
+        update_archival_state(
+            state,
+            archival_results,
+            operational_sheet_id=args.operational_sheet_id,
+            historical_sheet_id=args.historical_sheet_id,
+        )
+        save_finetune_state(state_path, state, dry_run=bool(args.dry_run))
 
     worksheets, missing_historical = target_worksheets(historical_spreadsheet, args)
 
@@ -1375,6 +1506,55 @@ def run_monthly_finetune(args: argparse.Namespace) -> Dict[str, Any]:
     )
     arrays = build_finetune_arrays(frames, metadata, args, cutoffs)
     new_rows_available = sum(summary.new_rows for summary in arrays.summaries)
+    retrain_gate = evaluate_retrain_gate(state, arrays.summaries, int(args.min_new_rows))
+
+    if args.check_only:
+        return {
+            "status": "check_only",
+            "due": retrain_gate["due"],
+            "retrain_gate": retrain_gate,
+            "dataset": {
+                "train_samples": int(len(arrays.X_train)),
+                "validation_samples": int(len(arrays.X_val)),
+                "new_rows_available": int(new_rows_available),
+                "symbols": [summary.__dict__ for summary in arrays.summaries],
+            },
+            "state": {"path": str(state_path), "load_status": state_status},
+            "incremental_finetuning": {
+                "only_new_historical_rows": bool(args.fine_tune_batch_only_new_data),
+                "full_dataset_retrain": False,
+            },
+        }
+
+    if args.if_due and not retrain_gate["due"]:
+        payload = {
+            "status": "skipped_not_due",
+            "message": (
+                "Retrain gate not due: no new calendar month since the last successful fine-tune "
+                f"({retrain_gate['last_successful_run_utc'] or 'never'}) and median new rows per active "
+                f"symbol {retrain_gate['median_new_rows_per_active_symbol']:.1f} < "
+                f"{int(args.min_new_rows)} early-trigger threshold."
+            ),
+            "retrain_gate": retrain_gate,
+            "state": {"path": str(state_path), "load_status": state_status},
+            "dataset": {
+                "train_samples": int(len(arrays.X_train)),
+                "validation_samples": int(len(arrays.X_val)),
+                "new_rows_available": int(new_rows_available),
+                "symbols": [summary.__dict__ for summary in arrays.summaries],
+            },
+            "checkpoint_overwrite_status": {name: "skipped_not_due" for name in ("Dense", "LSTM", "Transformer")},
+            "incremental_finetuning": {
+                "only_new_historical_rows": bool(args.fine_tune_batch_only_new_data),
+                "replay_buffer_enabled": int(args.replay_samples_per_symbol) > 0,
+                "full_dataset_retrain": False,
+            },
+        }
+        (output_dir / "monthly_finetune_metrics.json").write_text(
+            json.dumps(payload, indent=2, default=str, allow_nan=False)
+        )
+        return payload
+
     if len(arrays.X_train) < int(args.min_train_samples):
         status = "no_new_historical_data" if new_rows_available <= 0 else "skipped_insufficient_training_data"
         payload = {
@@ -1384,6 +1564,7 @@ def run_monthly_finetune(args: argparse.Namespace) -> Dict[str, Any]:
                 if status == "no_new_historical_data"
                 else f"Only {len(arrays.X_train)} training samples available; required {args.min_train_samples}."
             ),
+            "retrain_gate": retrain_gate,
             "triggering": {
                 "mode": "external_cli_or_scheduler_only",
                 "self_watching": False,
@@ -1456,11 +1637,18 @@ def run_monthly_finetune(args: argparse.Namespace) -> Dict[str, Any]:
 
     payload = {
         "status": status,
+        "retrain_gate": retrain_gate,
         "triggering": {
             "mode": "external_cli_or_scheduler_only",
             "self_watching": False,
             "google_sheet_polling": False,
-            "valid_triggers": ["GitHub Actions workflow_dispatch", "GitHub Actions schedule", "manual CLI", "cron"],
+            "valid_triggers": [
+                "GitHub Actions workflow_dispatch",
+                "GitHub Actions schedule",
+                "manual CLI",
+                "cron",
+                "run_full_workflow.py auto fine-tune stage (--if-due)",
+            ],
         },
         "state": {
             "path": str(state_path),

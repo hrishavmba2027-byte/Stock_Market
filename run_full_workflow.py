@@ -17,11 +17,11 @@
 #     app/pipeline/startup.py     — startup self-validation
 #     app/services/sheet_archival.py — TEST -> TRAIN rollover (keep latest 30)
 #
-# The orchestrator DRIVES those components in 15 explicit stages, inserts
+# The orchestrator DRIVES those components in 16 explicit stages, inserts
 # hard validation gates between them, and adds structured logging, retry /
 # exponential backoff, atomic writes, concurrency safety and failure isolation.
 #
-# 15-stage contract (strict order):
+# 16-stage contract (strict order):
 #    1  Startup validation
 #    2  Check YFinance for new data
 #    3  Download / append new market data
@@ -36,7 +36,8 @@
 #   12  Push forecast results back into Google Sheets
 #   13  Handle train/test sheet rollover logic
 #   14  Validate final outputs
-#   15  Log workflow summary
+#   15  Auto fine-tune gate (monthly incremental retrain via monthly_finetune.py)
+#   16  Log workflow summary
 #
 # Safety model:
 #   * Dry-run is the DEFAULT. No Google Sheet is mutated unless --live is passed.
@@ -84,7 +85,7 @@ for _p in {str(PROJECT_ROOT), str(_SCRIPT_DIR)}:
         sys.path.insert(0, _p)
 
 WORKFLOW_VERSION = "1.0.0"
-STAGE_COUNT = 15
+STAGE_COUNT = 16
 
 # Worksheets in the operational sheet that are NOT per-stock data tabs and must
 # never be treated as stocks by the orchestrator.
@@ -1588,9 +1589,69 @@ class WorkflowOrchestrator:
                            "all final-output validations passed")
 
     # ====================================================================== #
-    # STAGE 15 — Log workflow summary
+    # STAGE 15 — Auto fine-tune gate (monthly incremental retrain)
     # ====================================================================== #
-    def stage_15_summary(self, r: StageResult) -> None:
+    def stage_15_auto_finetune(self, r: StageResult) -> None:
+        """Run ``monthly_finetune.py --if-due`` after the pipeline stages.
+
+        The gate lives inside monthly_finetune.py so cloud and local runs
+        behave identically: fine-tune fires when a new calendar month has
+        started since the last successful fine-tune (primary monthly trigger)
+        or when the median active symbol accumulated MIN_NEW_ROWS_FOR_FINETUNE
+        rows the models were never trained on (early trigger). Training uses
+        ONLY those new rows plus a small replay buffer — never the full
+        dataset — and overwrites Dense.pt / LSTM.pt / Transformer.pt
+        atomically in place, so main.py keeps loading the same files with no
+        other changes.
+
+        In dry-run workflow mode only the read-only gate probe runs. Failures
+        degrade (not fail) the run: forecasts already succeeded by this stage.
+        """
+        enabled = str(os.environ.get("AUTO_FINETUNE_AFTER_WORKFLOW", "true")).strip().lower()
+        if enabled not in {"1", "true", "yes", "y", "on"}:
+            r.status = "skipped"
+            r.details = {"status": "disabled", "reason": "AUTO_FINETUNE_AFTER_WORKFLOW is off"}
+            self.log.event("finetune", "INFO", "auto_finetune_disabled",
+                           "auto fine-tune disabled via AUTO_FINETUNE_AFTER_WORKFLOW")
+            return
+        script = self.cfg.base_dir / "monthly_finetune.py"
+        if not script.exists():
+            r.status = "degraded"
+            r.details = {"status": "missing_script", "path": str(script)}
+            return
+        cmd = [sys.executable, str(script), "--if-due"]
+        if not self.live:
+            cmd.append("--check-only")
+        res = self._run_subprocess(
+            cmd,
+            "monthly_finetune --if-due" + ("" if self.live else " --check-only"),
+            component="finetune",
+            retries=0,
+        )
+        stdout = res.get("stdout", "")
+        payload = _parse_last_json(stdout) or _parse_trailing_json_block(stdout) or {}
+        status = str(payload.get("status", "unknown"))
+        r.details = {
+            "mode": "live" if self.live else "check_only_probe (dry-run workflow)",
+            "finetune_status": status,
+            "retrain_gate": payload.get("retrain_gate", {}),
+            "checkpoint_overwrite_status": payload.get("checkpoint_overwrite_status", {}),
+            "metrics_json": str(self.cfg.base_dir / "outputs" / "monthly_finetune" / "monthly_finetune_metrics.json"),
+        }
+        if res.get("returncode", 1) != 0 or status in {"error", "unknown"}:
+            r.status = "degraded"
+            r.error = f"monthly_finetune status={status} rc={res.get('returncode')}"
+            self.log.event("finetune", "WARNING", "auto_finetune_degraded",
+                           f"auto fine-tune reported status={status}")
+        else:
+            self.log.event("finetune", "INFO", "auto_finetune_done",
+                           f"auto fine-tune finished: status={status}",
+                           due=bool(payload.get("retrain_gate", {}).get("due", payload.get("due", False))))
+
+    # ====================================================================== #
+    # STAGE 16 — Log workflow summary
+    # ====================================================================== #
+    def stage_16_summary(self, r: StageResult) -> None:
         summary = self.build_summary()
         out_path = self.cfg.workflow_dir / f"run_summary_{self.run_id}.json"
         atomic_write_json(out_path, summary)
@@ -1745,6 +1806,7 @@ class WorkflowOrchestrator:
             (12, "Push forecasts to Google Sheets", self.stage_12_push_forecasts),
             (13, "Train/test rollover validation", self.stage_13_rollover),
             (14, "Validate final outputs", self.stage_14_validate_final),
+            (15, "Auto fine-tune gate (monthly incremental)", self.stage_15_auto_finetune),
         ]
         for index, name, fn in stage_plan:
             if self.aborted:
@@ -1760,8 +1822,8 @@ class WorkflowOrchestrator:
                 continue
             self._run_stage(index, name, fn)
 
-        # Stage 15 always runs so a summary is produced even after an abort.
-        self._run_stage(15, "Log workflow summary", self.stage_15_summary)
+        # Stage 16 always runs so a summary is produced even after an abort.
+        self._run_stage(16, "Log workflow summary", self.stage_16_summary)
 
         summary = self.build_summary()
         self.log.banner(
@@ -1793,11 +1855,31 @@ def _parse_last_json(stdout: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _parse_trailing_json_block(stdout: str) -> Optional[Dict[str, Any]]:
+    """Parse a pretty-printed (multi-line) JSON object that ends stdout.
+
+    monthly_finetune.py prints its result with indent=2 and other components
+    (e.g. google_auth) may print plain lines first, so neither whole-stdout
+    parsing nor per-line parsing works. Try each '{' as a candidate start.
+    """
+    text = stdout or ""
+    for idx, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value = json.loads(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="run_full_workflow.py",
         description="Master end-to-end orchestrator for the Stock Market ML "
-                    "pipeline (15 deterministic stages).",
+                    "pipeline (16 deterministic stages).",
     )
     p.add_argument("--live", action="store_true",
                    help="Perform real Google Sheet writes (yfinance append, "
