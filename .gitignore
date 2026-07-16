@@ -4,6 +4,8 @@
 # Anything resembling a credential file
 credentials/*
 !credentials/.gitkeep
+# Local scratch file that holds real API keys (Groq etc.) — never commit
+env_suggestion.txt
 *.pem
 *.key
 *.p12
@@ -237,3 +239,4 @@ Stock_Market/
 # Claude / agent local state
 # ---------------------------------------------------------------------------
 .claude/settings.local.json
+env_suggestion.txt
