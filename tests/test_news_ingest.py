@@ -10,6 +10,14 @@ def test_default_backfill_window_is_one_week():
     assert news_ingest.DEFAULT_BACKFILL_DAYS == 7
 
 
+def test_default_backfill_days_reads_config(monkeypatch):
+    """The live window comes from NEWS_LOOKBACK_DAYS, not the constant."""
+    monkeypatch.setenv("NEWS_LOOKBACK_DAYS", "10")
+    assert news_ingest.default_backfill_days() == 10
+    monkeypatch.delenv("NEWS_LOOKBACK_DAYS", raising=False)
+    assert news_ingest.default_backfill_days() == 7
+
+
 def test_merge_with_cache_drops_items_older_than_one_week(tmp_path):
     output = tmp_path / "news.parquet"
     now = datetime.now(timezone.utc)
@@ -51,13 +59,16 @@ def test_extract_news_items_handles_new_yfinance_shape():
         }
     ]
     items = news_ingest._extract_news_items("RELIANCE", raw)
-    assert len(items) == 1
-    item = items[0]
+    # Company row + its implied sector row (ENABLE_SECTOR_NEWS default on).
+    company_items = [i for i in items if i["ticker"] == "RELIANCE"]
+    assert len(company_items) == 1
+    item = company_items[0]
     assert item["ticker"] == "RELIANCE"
     assert item["title"].startswith("Reliance Q3")
     assert item["url"] == "https://example.com/reliance-q3"
     assert item["source"] == "Moneycontrol"
     assert item["url_hash"]
+    assert any(news_ingest.is_sector_entity(i["ticker"]) for i in items)
 
 
 def test_extract_news_items_handles_legacy_shape():
@@ -70,8 +81,9 @@ def test_extract_news_items_handles_legacy_shape():
         }
     ]
     items = news_ingest._extract_news_items("TCS", raw)
-    assert len(items) == 1
-    assert items[0]["source"] == "BQ Prime"
+    company_items = [i for i in items if i["ticker"] == "TCS"]
+    assert len(company_items) == 1
+    assert company_items[0]["source"] == "BQ Prime"
 
 
 def test_extract_news_items_skips_incomplete_rows():
@@ -91,9 +103,10 @@ def test_extract_news_items_populates_company_name():
         }
     ]
     items = news_ingest._extract_news_items("RELIANCE", raw)
-    assert len(items) == 1
-    assert items[0]["ticker"] == "RELIANCE"
-    assert items[0]["company_name"] == "Reliance Industries"
+    company_items = [i for i in items if i["ticker"] == "RELIANCE"]
+    assert len(company_items) == 1
+    assert company_items[0]["ticker"] == "RELIANCE"
+    assert company_items[0]["company_name"] == "Reliance Industries"
 
 
 def test_extract_news_items_marks_macro_news_as_general():
@@ -126,14 +139,16 @@ def test_extract_news_items_fans_out_to_multiple_companies():
         }
     ]
     items = news_ingest._extract_news_items("TCS", raw)
-    tickers = {row["ticker"] for row in items}
-    assert tickers == {"TCS", "INFY"}
-    # Each fanned-out row has the matching company name
+    company_tickers = {row["ticker"] for row in items if news_ingest._entity_kind(row["ticker"]) == "company"}
+    assert company_tickers == {"TCS", "INFY"}
+    # Each fanned-out company row has the matching company name
     for row in items:
         if row["ticker"] == "TCS":
             assert row["company_name"] == "Tata Consultancy Services"
         elif row["ticker"] == "INFY":
             assert row["company_name"] == "Infosys"
+    # Both companies share the IT sector → a single IT sector row is present.
+    assert any(news_ingest.is_sector_entity(row["ticker"]) for row in items)
 
 
 def test_article_entry_carries_headline_content_and_metadata():
@@ -195,38 +210,61 @@ def test_firestore_doc_id_is_just_the_ticker():
     assert news_ingest._firestore_doc_id({}) == news_ingest.GENERAL_TICKER
 
 
-class _FakeFirestoreBatch:
-    def __init__(self, log):
-        self._log = log
-
-    def set(self, doc_ref, payload):
-        self._log.append((doc_ref.doc_id, payload))
-
-    def commit(self):
-        pass
+class _FakeSnap:
+    def __init__(self, reference):
+        self.reference = reference
 
 
 class _FakeFirestoreDocRef:
-    def __init__(self, doc_id):
+    def __init__(self, store, doc_id):
+        self._store = store
         self.doc_id = doc_id
 
 
+class _FakeFirestoreBatch:
+    """Deferred-commit batch that mutates the backing store (so wipe works)."""
+
+    def __init__(self, writes):
+        self._writes = writes
+        self._ops = []
+
+    def set(self, doc_ref, payload):
+        self._ops.append(("set", doc_ref, payload))
+
+    def delete(self, doc_ref):
+        self._ops.append(("delete", doc_ref, None))
+
+    def commit(self):
+        for op, ref, payload in self._ops:
+            if op == "set":
+                ref._store[ref.doc_id] = payload
+                self._writes.append((ref.doc_id, payload))
+            else:
+                ref._store.pop(ref.doc_id, None)
+        self._ops = []
+
+
 class _FakeFirestoreCollection:
-    def __init__(self, expected_name):
-        self.expected_name = expected_name
+    def __init__(self, store):
+        self._store = store
 
     def document(self, doc_id):
-        return _FakeFirestoreDocRef(doc_id)
+        return _FakeFirestoreDocRef(self._store, doc_id)
+
+    def stream(self):
+        return [_FakeSnap(_FakeFirestoreDocRef(self._store, doc_id))
+                for doc_id in list(self._store.keys())]
 
 
 class _FakeFirestoreClient:
     def __init__(self, expected_collection):
-        self.writes = []
+        self.writes = []                 # append-only log of committed set()s
         self.expected_collection = expected_collection
+        self.store = {}                  # current collection state (doc_id -> payload)
 
     def collection(self, name):
         assert name == self.expected_collection
-        return _FakeFirestoreCollection(name)
+        return _FakeFirestoreCollection(self.store)
 
     def batch(self):
         return _FakeFirestoreBatch(self.writes)
@@ -286,6 +324,30 @@ def test_write_news_to_firestore_groups_into_per_ticker_docs():
     general = by_id[news_ingest.GENERAL_TICKER]
     assert general["company_name"] == news_ingest.GENERAL_COMPANY_NAME
     assert set(general["articles"].keys()) == {"h3"}
+
+
+def test_write_news_wipes_stale_docs_before_writing():
+    """Latest-only: a ticker present last run but absent this run is removed."""
+    client = _FakeFirestoreClient(news_ingest.FIRESTORE_COLLECTION)
+    # Simulate a stale doc from a prior run (ticker no longer has fresh news).
+    client.store["OLDCO"] = {"ticker": "OLDCO", "articles": {"old": {}}}
+    df = pd.DataFrame([{
+        "ticker": "RELIANCE", "company_name": "Reliance Industries",
+        "ts": pd.Timestamp("2026-01-15T08:00:00", tz="UTC"), "title": "fresh",
+        "content": "b", "source": "ET", "url": "https://x/a", "url_hash": "h1",
+    }])
+    news_ingest.write_news_to_firestore(df, client=client)
+    # OLDCO wiped; only the freshly collected ticker remains.
+    assert set(client.store.keys()) == {"RELIANCE"}
+
+
+def test_write_news_empty_df_does_not_wipe():
+    """A zero-collection run must NOT nuke the last good snapshot."""
+    client = _FakeFirestoreClient(news_ingest.FIRESTORE_COLLECTION)
+    client.store["RELIANCE"] = {"ticker": "RELIANCE", "articles": {"h1": {}}}
+    written = news_ingest.write_news_to_firestore(pd.DataFrame(), client=client)
+    assert written == 0
+    assert set(client.store.keys()) == {"RELIANCE"}   # preserved
 
 
 def test_attach_article_content_populates_in_place(monkeypatch):

@@ -4,6 +4,11 @@ name: news-sentiment
 # per-(ticker, date, source) sentiment features. Raw ingests are first staged
 # under Data/archive so sentiment can score them, then drain-only upload steps
 # push those staged rows to Firestore and delete the parquet files on success.
+#
+# Config knobs (Settings / .env): NEWS_LOOKBACK_DAYS (trailing window re-scraped
+# each daily run, default 7) and SENTIMENT_HALFLIFE_DAYS (recency weight decay,
+# default 3 — newest headlines dominate the per-day sentiment mean; the oldest
+# item in the window carries the least weight).
 
 on:
   schedule:

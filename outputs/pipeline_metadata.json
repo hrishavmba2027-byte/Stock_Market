@@ -1324,8 +1324,8 @@
   "created_at": "2026-07-13T08:35:54.287334+00:00",
   "schema_version": 1,
   "workflow": {
-    "last_run_id": "wf-20260713T083209Z-50373",
-    "last_feature_engineering_at": "2026-07-13T08:35:54.287340+00:00",
+    "last_run_id": "wf-20260715T093216Z-65877",
+    "last_feature_engineering_at": "2026-07-15T09:36:46.494856+00:00",
     "feature_engineering_worksheets": [
       "RELIANCE",
       "TCS",
@@ -1379,5 +1379,5 @@
     ],
     "mode": "live"
   },
-  "last_modified_at": "2026-07-13T08:35:54.287654+00:00"
+  "last_modified_at": "2026-07-15T09:36:46.495298+00:00"
 }

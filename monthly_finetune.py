@@ -56,9 +56,23 @@ DEFAULT_BATCH_SIZE = 64
 DEFAULT_GRAD_CLIP = 1.0
 MIN_FINE_TUNE_TRAIN_SAMPLES = 16
 # Early-trigger threshold for the retrain gate: fine-tune before the next
-# calendar month when the median active symbol already accumulated this many
-# rows the models have never been trained on.
+# scheduled interval when the median active symbol already accumulated this
+# many rows the models have never been trained on.
 DEFAULT_MIN_NEW_ROWS = 30
+# Primary retrain cadence (days). Fallback only — the live default comes from
+# ``Settings.retrain_interval_days`` (env ``RETRAIN_INTERVAL_DAYS``) via
+# :func:`default_retrain_interval_days`.
+DEFAULT_RETRAIN_INTERVAL_DAYS = 15
+
+
+def default_retrain_interval_days() -> int:
+    """Retrain cadence in days, sourced from config (``RETRAIN_INTERVAL_DAYS``)."""
+    try:
+        from app.config.settings import Settings
+
+        return int(Settings.from_env().retrain_interval_days)
+    except Exception:  # pragma: no cover - config import/parse failure fallback
+        return DEFAULT_RETRAIN_INTERVAL_DAYS
 DATE_COLUMNS = ("Date_str", "Date", "Date_")
 REQUIRED_PRICE_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 STATE_SCHEMA_VERSION = 1
@@ -178,17 +192,31 @@ def parse_args() -> argparse.Namespace:
             name="MIN_NEW_ROWS_FOR_FINETUNE",
         ),
         help=(
-            "Early-trigger threshold: fine-tune before the next calendar month when the "
+            "Early-trigger threshold: fine-tune before the next scheduled interval when the "
             "median active symbol has at least this many rows newer than the fine-tune state."
+        ),
+    )
+    parser.add_argument(
+        "--retrain-interval-days",
+        type=int,
+        default=parse_positive_int(
+            os.environ.get("RETRAIN_INTERVAL_DAYS"),
+            default_retrain_interval_days(),
+            name="RETRAIN_INTERVAL_DAYS",
+        ),
+        help=(
+            "Primary retrain cadence in days (config: RETRAIN_INTERVAL_DAYS, default 15). "
+            "The gate is due once this many days have elapsed since the last successful "
+            "fine-tune and there is any new data."
         ),
     )
     parser.add_argument(
         "--if-due",
         action="store_true",
         help=(
-            "Only fine-tune when the retrain gate is due: a new calendar month has started "
-            "since the last successful fine-tune, or the median new-row count per active "
-            "symbol reached --min-new-rows. Intended for schedulers/automation hooks."
+            "Only fine-tune when the retrain gate is due: --retrain-interval-days have "
+            "elapsed since the last successful fine-tune, or the median new-row count per "
+            "active symbol reached --min-new-rows. Intended for schedulers/automation hooks."
         ),
     )
     parser.add_argument(
@@ -555,20 +583,22 @@ def evaluate_retrain_gate(
     state: Dict[str, Any],
     summaries: Sequence[SymbolDatasetSummary],
     min_new_rows: int,
+    interval_days: int,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Decide whether an incremental fine-tune is due.
 
     Due when either condition holds:
 
-    * ``calendar`` — a new calendar month has started since the last successful
-      fine-tune (``fine_tune.last_successful_run_utc`` in the state file; a
-      missing or unparseable value counts as "never ran"), and the median
-      active symbol has at least one row the models were never trained on.
-      This is the primary monthly trigger: run at the start of every month.
+    * ``interval`` — at least ``interval_days`` (config: ``RETRAIN_INTERVAL_DAYS``,
+      default 15) have elapsed since the last successful fine-tune
+      (``fine_tune.last_successful_run_utc`` in the state file; a missing or
+      unparseable value counts as "never ran"), and the median active symbol
+      has at least one row the models were never trained on. This is the
+      primary cadence trigger: retrain every ``interval_days``.
     * ``data`` — the median new-row count per active symbol reached
-      ``min_new_rows``. This fires early, mid-month, when untrained data
-      accumulates faster than one batch per month.
+      ``min_new_rows``. This fires early, within the interval, when untrained
+      data accumulates faster than one batch per cadence window.
 
     "Active" symbols are those with any rows in the historical sheet; the
     median makes the gate robust to a single stale or delisted worksheet.
@@ -584,17 +614,24 @@ def evaluate_retrain_gate(
             last_run = datetime.fromisoformat(last_raw.replace("Z", "+00:00"))
         except ValueError:
             last_run = None
-    month_started = last_run is None or (now.year, now.month) != (last_run.year, last_run.month)
-    calendar_due = month_started and median_new_rows >= 1.0
+    if last_run is None:
+        days_since: Optional[float] = None
+        interval_elapsed = True
+    else:
+        days_since = (now - last_run).total_seconds() / 86400.0
+        interval_elapsed = days_since >= float(interval_days)
+    interval_due = interval_elapsed and median_new_rows >= 1.0
     data_due = min_new_rows > 0 and median_new_rows >= float(min_new_rows)
     return {
-        "due": bool(calendar_due or data_due),
-        "calendar_due": bool(calendar_due),
+        "due": bool(interval_due or data_due),
+        "interval_due": bool(interval_due),
         "data_due": bool(data_due),
         "median_new_rows_per_active_symbol": median_new_rows,
         "min_new_rows_threshold": int(min_new_rows),
+        "retrain_interval_days": int(interval_days),
+        "days_since_last_success": round(days_since, 2) if days_since is not None else None,
         "active_symbols": len(active_new_rows),
-        "new_calendar_month_since_last_success": bool(month_started),
+        "interval_elapsed_since_last_success": bool(interval_elapsed),
         "last_successful_run_utc": last_raw,
         "checked_at_utc": now.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     }
@@ -1506,7 +1543,12 @@ def run_monthly_finetune(args: argparse.Namespace) -> Dict[str, Any]:
     )
     arrays = build_finetune_arrays(frames, metadata, args, cutoffs)
     new_rows_available = sum(summary.new_rows for summary in arrays.summaries)
-    retrain_gate = evaluate_retrain_gate(state, arrays.summaries, int(args.min_new_rows))
+    retrain_gate = evaluate_retrain_gate(
+        state,
+        arrays.summaries,
+        int(args.min_new_rows),
+        int(args.retrain_interval_days),
+    )
 
     if args.check_only:
         return {
@@ -1530,8 +1572,9 @@ def run_monthly_finetune(args: argparse.Namespace) -> Dict[str, Any]:
         payload = {
             "status": "skipped_not_due",
             "message": (
-                "Retrain gate not due: no new calendar month since the last successful fine-tune "
-                f"({retrain_gate['last_successful_run_utc'] or 'never'}) and median new rows per active "
+                f"Retrain gate not due: only {retrain_gate['days_since_last_success']} days since the "
+                f"last successful fine-tune ({retrain_gate['last_successful_run_utc'] or 'never'}) < "
+                f"{int(args.retrain_interval_days)}-day interval, and median new rows per active "
                 f"symbol {retrain_gate['median_new_rows_per_active_symbol']:.1f} < "
                 f"{int(args.min_new_rows)} early-trigger threshold."
             ),

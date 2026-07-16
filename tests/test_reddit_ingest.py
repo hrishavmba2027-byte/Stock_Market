@@ -226,34 +226,60 @@ def test_firestore_doc_id_is_just_the_ticker():
     assert reddit_ingest._firestore_doc_id("RELIANCE") == "RELIANCE"
 
 
-class _FakeFirestoreBatch:
-    def __init__(self, log):
-        self._log = log
-
-    def set(self, doc_ref, payload):
-        self._log.append((doc_ref.doc_id, payload))
-
-    def commit(self):
-        pass
+class _FakeSnap:
+    def __init__(self, reference):
+        self.reference = reference
 
 
 class _FakeFirestoreDocRef:
-    def __init__(self, doc_id):
+    def __init__(self, store, doc_id):
+        self._store = store
         self.doc_id = doc_id
 
 
+class _FakeFirestoreBatch:
+    """Deferred-commit batch that mutates the backing store (so wipe works)."""
+
+    def __init__(self, writes):
+        self._writes = writes
+        self._ops = []
+
+    def set(self, doc_ref, payload):
+        self._ops.append(("set", doc_ref, payload))
+
+    def delete(self, doc_ref):
+        self._ops.append(("delete", doc_ref, None))
+
+    def commit(self):
+        for op, ref, payload in self._ops:
+            if op == "set":
+                ref._store[ref.doc_id] = payload
+                self._writes.append((ref.doc_id, payload))
+            else:
+                ref._store.pop(ref.doc_id, None)
+        self._ops = []
+
+
 class _FakeFirestoreCollection:
+    def __init__(self, store):
+        self._store = store
+
     def document(self, doc_id):
-        return _FakeFirestoreDocRef(doc_id)
+        return _FakeFirestoreDocRef(self._store, doc_id)
+
+    def stream(self):
+        return [_FakeSnap(_FakeFirestoreDocRef(self._store, doc_id))
+                for doc_id in list(self._store.keys())]
 
 
 class _FakeFirestoreClient:
     def __init__(self):
         self.writes = []
+        self.store = {}
 
     def collection(self, name):
         assert name == reddit_ingest.FIRESTORE_COLLECTION
-        return _FakeFirestoreCollection()
+        return _FakeFirestoreCollection(self.store)
 
     def batch(self):
         return _FakeFirestoreBatch(self.writes)
@@ -310,6 +336,28 @@ def test_write_reddit_to_firestore_groups_into_per_ticker_docs():
     assert by_id["RELIANCE"]["posts"]["h2"]["body"] == "margins"
     assert set(by_id["TCS"]["posts"].keys()) == {"h3"}
     assert by_id["TCS"]["company_name"] == "Tata Consultancy Services"
+
+
+def test_write_reddit_wipes_stale_docs_before_writing():
+    """Latest-only: a ticker present last run but absent this run is removed."""
+    client = _FakeFirestoreClient()
+    client.store["OLDCO"] = {"ticker": "OLDCO", "posts": {"old": {}}}
+    df = pd.DataFrame([{
+        "ticker": "RELIANCE", "ts": pd.Timestamp("2026-01-15T08:00:00", tz="UTC"),
+        "title": "fresh", "body": "", "score": 1, "subreddit": "NIFTY50",
+        "permalink": "https://www.reddit.com/z", "permalink_hash": "h9", "kind": "post",
+    }])
+    reddit_ingest.write_reddit_to_firestore(df, client=client)
+    assert set(client.store.keys()) == {"RELIANCE"}
+
+
+def test_write_reddit_empty_df_does_not_wipe():
+    """A zero-collection run (e.g. Reddit 403) must NOT nuke prior posts."""
+    client = _FakeFirestoreClient()
+    client.store["RELIANCE"] = {"ticker": "RELIANCE", "posts": {"h1": {}}}
+    written = reddit_ingest.write_reddit_to_firestore(pd.DataFrame(), client=client)
+    assert written == 0
+    assert set(client.store.keys()) == {"RELIANCE"}
 
 
 # ----------------------------------------------------------------------------

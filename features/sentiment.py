@@ -32,6 +32,13 @@ the composite importance, so the final weight used in ``np.average`` is:
 
     final_weight = recency_decay × engagement × source_quality × confidence
 
+Recency decay is exponential with a **config-driven half-life**
+(``SENTIMENT_HALFLIFE_DAYS``, default 3 days): the latest headlines dominate
+the per-day mean and weight halves every ``half_life`` days as you move back in
+time, so the oldest item in the trailing news window (``news_lookback_days``,
+~7 days) carries the least weight. The tighter 3-day window decays twice as
+fast (``half_life × HALF_LIFE_FACTOR``).
+
 Output schema (one row per ticker, date, source):
 
     ticker, date, source,
@@ -71,8 +78,22 @@ REDDIT_PATH = Path(__file__).resolve().parents[1] / "Data" / "archive" / "reddit
 X_PATH = Path(__file__).resolve().parents[1] / "Data" / "archive" / "x_posts.parquet"
 
 DEFAULT_MODEL = "ProsusAI/finbert"
+# The 7-day sentiment window uses the configured half-life; the tighter 3-day
+# window decays twice as fast (half the half-life) so very recent sentiment
+# dominates the short-horizon signal.
 HALF_LIFE_FACTOR = 0.5
+DEFAULT_HALF_LIFE_DAYS = 3.0  # fallback if Settings can't be loaded
 BASELINE_DAYS = 90
+
+
+def default_half_life_days() -> float:
+    """Recency-decay half-life (days), sourced from ``SENTIMENT_HALFLIFE_DAYS``."""
+    try:
+        from app.config.settings import Settings
+
+        return float(Settings.from_env().sentiment_halflife_days)
+    except Exception:  # pragma: no cover - config import/parse failure fallback
+        return DEFAULT_HALF_LIFE_DAYS
 
 # Firestore: one document per (ticker, source) holding the latest sentiment
 # snapshot. Each refresh **wipes the collection** before writing, so no stale
@@ -232,10 +253,17 @@ def _aggregate(
     scored: pd.DataFrame,
     source: str,
     weight_col: str,
+    half_life_days: float = DEFAULT_HALF_LIFE_DAYS,
 ) -> pd.DataFrame:
-    """Compute per-(ticker, date) features from scored items."""
+    """Compute per-(ticker, date) features from scored items.
+
+    ``half_life_days`` controls the recency weight decay for the 7-day window;
+    the 3-day window decays with ``half_life_days * HALF_LIFE_FACTOR``.
+    """
     if scored.empty:
         return pd.DataFrame()
+    half_life_7d = float(half_life_days)
+    half_life_3d = half_life_7d * HALF_LIFE_FACTOR
     df = scored.copy()
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     df["date"] = df["ts"].dt.tz_convert("Asia/Kolkata").dt.date
@@ -263,8 +291,8 @@ def _aggregate(
             if n_7d == 0:
                 continue
 
-            w7 = _exp_weights(window_7d, weight_col, half_life_days=3.0, asof_date=asof)
-            w3 = _exp_weights(window_3d, weight_col, half_life_days=1.5, asof_date=asof) if n_3d else None
+            w7 = _exp_weights(window_7d, weight_col, half_life_days=half_life_7d, asof_date=asof)
+            w3 = _exp_weights(window_3d, weight_col, half_life_days=half_life_3d, asof_date=asof) if n_3d else None
 
             sent_mean_7d = float(np.average(window_7d["polarity"], weights=w7)) if w7.sum() > 0 else float("nan")
             sent_mean_3d = (
@@ -356,7 +384,12 @@ def _compose_importance(df: pd.DataFrame, source: str) -> pd.Series:
     return engagement * source_quality * confidence
 
 
-def score_source(prepared: pd.DataFrame, scorer: FinBertScorer, source: str) -> pd.DataFrame:
+def score_source(
+    prepared: pd.DataFrame,
+    scorer: FinBertScorer,
+    source: str,
+    half_life_days: float = DEFAULT_HALF_LIFE_DAYS,
+) -> pd.DataFrame:
     if prepared.empty:
         return pd.DataFrame()
     texts = prepared["text"].fillna("").tolist()
@@ -367,7 +400,7 @@ def score_source(prepared: pd.DataFrame, scorer: FinBertScorer, source: str) -> 
     # Composite importance is computed *after* FinBERT scoring so we can use
     # the model's confidence as one of the weighting axes.
     df["weight"] = _compose_importance(df, source=source)
-    aggregated = _aggregate(df, source=source, weight_col="weight")
+    aggregated = _aggregate(df, source=source, weight_col="weight", half_life_days=half_life_days)
     return aggregated
 
 
@@ -507,8 +540,13 @@ def refresh_sentiment(
     scorer: Optional[FinBertScorer] = None,
     write_firestore: bool = False,
     firestore_client: Optional[Any] = None,
+    half_life_days: Optional[float] = None,
 ) -> pd.DataFrame:
     scorer = scorer or FinBertScorer()
+    if half_life_days is None:
+        half_life_days = default_half_life_days()
+    _log(f"[sentiment] recency half-life: {half_life_days:.2f}d (7d window), "
+         f"{half_life_days * HALF_LIFE_FACTOR:.2f}d (3d window)")
     frames: List[pd.DataFrame] = []
 
     if news_path.exists():
@@ -520,7 +558,7 @@ def refresh_sentiment(
         news_df = _news_from_firestore(firestore_client)
     if not news_df.empty:
         prepared = _prepare_news(news_df)
-        agg = score_source(prepared, scorer, source="news")
+        agg = score_source(prepared, scorer, source="news", half_life_days=half_life_days)
         if not agg.empty:
             frames.append(agg)
             _log(f"[sentiment] news: {len(agg)} (ticker, date) rows")
@@ -530,7 +568,7 @@ def refresh_sentiment(
     if reddit_path.exists():
         reddit_df = pd.read_parquet(reddit_path)
         prepared = _prepare_reddit(reddit_df)
-        agg = score_source(prepared, scorer, source="reddit")
+        agg = score_source(prepared, scorer, source="reddit", half_life_days=half_life_days)
         if not agg.empty:
             frames.append(agg)
             _log(f"[sentiment] reddit: {len(agg)} (ticker, date) rows")
@@ -540,7 +578,7 @@ def refresh_sentiment(
     if x_path.exists():
         x_df = pd.read_parquet(x_path)
         prepared = _prepare_x(x_df)
-        agg = score_source(prepared, scorer, source="x")
+        agg = score_source(prepared, scorer, source="x", half_life_days=half_life_days)
         if not agg.empty:
             frames.append(agg)
             _log(f"[sentiment] x: {len(agg)} (ticker, date) rows")
@@ -571,6 +609,16 @@ def refresh_sentiment(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(output_path, index=False)
     _log(f"[sentiment] wrote {len(combined)} rows to {output_path}")
+
+    # PIT spine (Phase 3): append daily sentiment snapshots (append-only, keyed
+    # on (ticker, source, date)) so past-date sentiment is reconstructable while
+    # the live sentiment_latest collection keeps only the newest snapshot.
+    from ingestion._pit import maybe_append_pit
+
+    maybe_append_pit(
+        combined, "sentiment",
+        dedup_keys=("ticker", "source", "date"), log=_log,
+    )
 
     if write_firestore and not combined.empty:
         try:
@@ -603,6 +651,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--x", default=str(X_PATH))
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
+        "--half-life-days",
+        type=float,
+        default=None,
+        help="Recency weight-decay half-life in days (default: SENTIMENT_HALFLIFE_DAYS from config).",
+    )
+    parser.add_argument(
         "--no-firestore",
         action="store_true",
         help="Skip the Firestore wipe-and-write step (parquet only).",
@@ -620,6 +674,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         x_path=Path(args.x),
         scorer=scorer,
         write_firestore=write_firestore,
+        half_life_days=args.half_life_days,
     )
     print(json.dumps({"rows": int(len(df))}))
     return 0

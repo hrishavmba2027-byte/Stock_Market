@@ -7,6 +7,103 @@ import pytest
 from ingestion import fundamentals
 
 
+def test_default_refresh_days_reads_config(monkeypatch):
+    monkeypatch.setenv("FUNDAMENTALS_REFRESH_DAYS", "20")
+    assert fundamentals.default_refresh_days() == 20
+    monkeypatch.delenv("FUNDAMENTALS_REFRESH_DAYS", raising=False)
+    assert fundamentals.default_refresh_days() == 15
+
+
+def test_fundamentals_refresh_due_never_ran(tmp_path):
+    state = tmp_path / "fundamentals_state.json"
+    assert fundamentals.fundamentals_refresh_due(state, refresh_days=15) is True
+
+
+def test_fundamentals_refresh_gate_interval(tmp_path):
+    from datetime import datetime, timezone
+
+    state = tmp_path / "fundamentals_state.json"
+    last = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    fundamentals._record_refresh_run(state, now=last)
+    # 10 days later → within the 15-day window → not due.
+    within = datetime(2026, 6, 11, tzinfo=timezone.utc)
+    assert fundamentals.fundamentals_refresh_due(state, refresh_days=15, now=within) is False
+    # 15 days later → boundary reached → due again.
+    boundary = datetime(2026, 6, 16, tzinfo=timezone.utc)
+    assert fundamentals.fundamentals_refresh_due(state, refresh_days=15, now=boundary) is True
+
+
+def test_refresh_fundamentals_skips_fetch_when_gate_not_due(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    archive = tmp_path / "archive" / "fundamentals.parquet"
+    archive.parent.mkdir()
+    state = tmp_path / "fundamentals_state.json"
+    fundamentals._record_refresh_run(state, now=datetime(2026, 6, 10, tzinfo=timezone.utc))
+
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("fresh collection should be skipped when gate not due")
+
+    monkeypatch.setattr(fundamentals, "fetch_fundamentals", fail_fetch)
+    monkeypatch.setattr(fundamentals, "fetch_quarterly_records", fail_fetch)
+
+    summary = fundamentals.refresh_fundamentals(
+        ["RELIANCE"],
+        output_path=archive,
+        archive_path=archive,
+        write_firestore=False,
+        collect=True,
+        state_path=state,
+        refresh_days=15,
+        now_utc=datetime(2026, 6, 20, tzinfo=timezone.utc),  # only 10 days later
+    )
+    assert summary["refresh_due"] is False
+    assert summary["flat_rows"] == 0
+
+
+def test_refresh_fundamentals_force_bypasses_gate(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    archive = tmp_path / "archive" / "fundamentals.parquet"
+    archive.parent.mkdir()
+    state = tmp_path / "fundamentals_state.json"
+    fundamentals._record_refresh_run(state, now=datetime(2026, 6, 19, tzinfo=timezone.utc))
+
+    monkeypatch.setattr(
+        fundamentals,
+        "fetch_fundamentals",
+        lambda *a, **k: {"ticker": "RELIANCE", "sector": "Energy", "pe_trailing": 12.0},
+    )
+    monkeypatch.setattr(
+        fundamentals,
+        "fetch_quarterly_records",
+        lambda *a, **k: [
+            {
+                "ticker": "RELIANCE",
+                "company_name": "Reliance",
+                "scrape_date": "2026-06-20",
+                "quarter": "2026Q1",
+                "quarter_end_date": "2026-06-30",
+                "financials": {"revenue": 1},
+            }
+        ],
+    )
+
+    summary = fundamentals.refresh_fundamentals(
+        ["RELIANCE"],
+        output_path=archive,
+        archive_path=archive,
+        write_firestore=False,
+        collect=True,
+        state_path=state,
+        refresh_days=15,
+        force=True,
+        now_utc=datetime(2026, 6, 20, tzinfo=timezone.utc),  # 1 day later, but forced
+    )
+    assert summary["quarterly_records"] == 1
+    assert summary["refresh_due"] is True
+
+
 def test_safe_float_handles_none_and_nan():
     assert fundamentals._safe_float(None) is None
     assert fundamentals._safe_float(float("nan")) is None
@@ -421,6 +518,7 @@ def test_refresh_fundamentals_collect_false_drains_archive_without_fetching(tmp_
         write_firestore=True,
         firestore_client="sentinel",
         collect=False,
+        state_path=tmp_path / "fundamentals_state.json",
     )
 
     assert uploaded_records[0]["ticker"] == "TCS"
@@ -430,4 +528,5 @@ def test_refresh_fundamentals_collect_false_drains_archive_without_fetching(tmp_
         "quarterly_records": 0,
         "firestore_writes": 0,
         "archive_drained": 1,
+        "refresh_due": True,
     }

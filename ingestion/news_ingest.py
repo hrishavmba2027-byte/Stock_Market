@@ -59,8 +59,15 @@ from ingestion._archive import (
     truthy_env,
     upload_and_clear_archive,
 )
-from ingestion._firestore import init_firestore_client
+from ingestion._firestore import init_firestore_client, wipe_collection
 from ingestion.aliases import find_tickers_in_text, list_tickers, load_aliases
+from ingestion.sectors import (
+    find_sectors_in_text,
+    is_sector_entity,
+    sector_entity_id,
+    sector_name_for_entity,
+    sectors_for_companies,
+)
 
 # Load .env so standalone runs (python -m ...) see the same configuration as
 # Docker / collect_all. Existing environment variables always win.
@@ -71,8 +78,21 @@ except ImportError:
     pass
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "Data" / "archive" / "news.parquet"
-DEFAULT_BACKFILL_DAYS = 7  # Hard cap: keep only headlines from the last 7 days.
+# Hard fallback if Settings can't be loaded. The live default comes from
+# ``Settings.news_lookback_days`` (env ``NEWS_LOOKBACK_DAYS``) via
+# :func:`default_backfill_days` — this is not the source of truth.
+DEFAULT_BACKFILL_DAYS = 7
 NSE_SUFFIX = ".NS"
+
+
+def default_backfill_days() -> int:
+    """Trailing news window (days), sourced from config (``NEWS_LOOKBACK_DAYS``)."""
+    try:
+        from app.config.settings import Settings
+
+        return int(Settings.from_env().news_lookback_days)
+    except Exception:  # pragma: no cover - config import/parse failure fallback
+        return DEFAULT_BACKFILL_DAYS
 
 FIRESTORE_COLLECTION = "news"
 GENERAL_TICKER = "GENERAL"
@@ -90,23 +110,52 @@ def _hash_url(url: str) -> str:
 def _company_name_for(ticker: str) -> str:
     if ticker == GENERAL_TICKER:
         return GENERAL_COMPANY_NAME
+    if is_sector_entity(ticker):
+        return sector_name_for_entity(ticker)
     entry = load_aliases().get(ticker.upper(), {})
     return entry.get("name") or ticker
 
 
-def _map_companies(title: str, fetch_ticker: str) -> List[str]:
-    """Return the NIFTY tickers a headline is about.
+def _entity_kind(entity: str) -> str:
+    """Classify a news entity id: company / sector / general."""
+    if entity == GENERAL_TICKER:
+        return "general"
+    if is_sector_entity(entity):
+        return "sector"
+    return "company"
 
-    Strategy: run alias detection on the title. If anything matches, use
-    those hits. Otherwise the headline didn't name a covered company → tag
-    it as ``GENERAL`` even though yfinance returned it under ``fetch_ticker``
-    (yfinance attaches macro headlines to every ticker, which would inflate
-    per-company sentiment if we kept the attribution).
+
+def _sector_news_enabled() -> bool:
+    """Whether to also tag headlines to their sector (ENABLE_SECTOR_NEWS)."""
+    try:
+        from app.config.settings import get_settings
+
+        return bool(get_settings().enable_sector_news)
+    except Exception:  # pragma: no cover - config failure ⇒ default on
+        return True
+
+
+def _map_entities(title: str) -> List[str]:
+    """Return the entity ids a headline maps to: companies, sectors, or GENERAL.
+
+    * Company entities — NIFTY tickers named in the title (alias detection).
+    * Sector entities — the sector of any matched company (implied) plus any
+      sector named via curated sector terms (explicit). Only added when
+      ``ENABLE_SECTOR_NEWS`` is on.
+    * GENERAL — the fallback when nothing matches (macro/market headline).
+
+    Sector attribution lets the LLM read a company's own sentiment *and* its
+    sector's sentiment; unmatched sectors/companies never reach a given stock.
     """
-    hits = find_tickers_in_text(title or "")
-    if hits:
-        return hits
-    return [GENERAL_TICKER]
+    text = title or ""
+    companies = find_tickers_in_text(text)
+    entities: List[str] = list(companies)
+    if _sector_news_enabled():
+        sectors = list(dict.fromkeys(sectors_for_companies(companies) + find_sectors_in_text(text)))
+        entities.extend(sector_entity_id(s) for s in sectors)
+    if not entities:
+        return [GENERAL_TICKER]
+    return entities
 
 
 def _extract_news_items(symbol: str, raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -141,11 +190,11 @@ def _extract_news_items(symbol: str, raw: List[Dict[str, Any]]) -> List[Dict[str
         url_hash = _hash_url(url_str)
         source_str = str(provider).strip() if provider else None
 
-        for company_ticker in _map_companies(title_str, symbol):
+        for entity_id in _map_entities(title_str):
             out.append(
                 {
-                    "ticker": company_ticker,
-                    "company_name": _company_name_for(company_ticker),
+                    "ticker": entity_id,
+                    "company_name": _company_name_for(entity_id),
                     "ts": ts,
                     "title": title_str,
                     "source": source_str,
@@ -273,7 +322,7 @@ def attach_article_content(
 def refresh_news(
     tickers: Iterable[str],
     output_path: Path = DEFAULT_OUTPUT,
-    backfill_days: int = DEFAULT_BACKFILL_DAYS,
+    backfill_days: Optional[int] = None,
     sleep_seconds: float = 0.2,
     write_firestore: bool = False,
     firestore_client: Optional[Any] = None,
@@ -294,6 +343,8 @@ def refresh_news(
     4. **Upload + clear** — pushes the staged archive to Firestore; deletes
        the file on success or retains it for the next run on failure.
     """
+    if backfill_days is None:
+        backfill_days = default_backfill_days()
     archive_path = archive_path_for(output_path)
     upload_fn = lambda df: write_news_to_firestore(df, client=firestore_client)
 
@@ -331,6 +382,13 @@ def refresh_news(
 
     fresh_df = _merge_with_cache(new_df, output_path, cutoff=cutoff)
     _log(f"[news] prepared {len(fresh_df)} fresh rows for Firestore staging")
+
+    # PIT spine (Phase 3): mirror fresh news into the append-only archive keyed
+    # on (ticker, url_hash). Nothing is pruned here (unlike the trailing-window
+    # cache), so the news that existed as of any past date stays reconstructable.
+    from ingestion._pit import maybe_append_pit
+
+    maybe_append_pit(fresh_df, "news", dedup_keys=("ticker", "url_hash"), log=_log)
 
     # ---- Steps 3 + 4: merge-stage and upload ----------------------------
     merged_count = merge_stage_to_archive(
@@ -399,6 +457,7 @@ def _firestore_payload_for_ticker(
     return {
         "company_name": company_name,
         "ticker": ticker,
+        "kind": _entity_kind(ticker),
         "scrape_date": scrape_date,
         "articles": articles,
     }
@@ -416,7 +475,16 @@ def write_news_to_firestore(
     collection: str = FIRESTORE_COLLECTION,
     client: Optional[Any] = None,
 ) -> int:
-    """Write **one document per ticker** with all articles nested by ``url_hash``.
+    """Wipe ``collection`` then write **one document per ticker** with all
+    articles nested by ``url_hash``.
+
+    "Wipe-then-write" enforces the rolling last-``NEWS_LOOKBACK_DAYS`` window in
+    Firestore: ``df`` is this run's *complete* fetch (yfinance returns the recent
+    list, already filtered to the trailing window), so rebuilding the collection
+    from scratch drops articles that have aged out **and** removes stale docs for
+    tickers that produced no fresh news — leaving only the latest collected news.
+    An empty ``df`` is a no-op (never wipes on a zero-collection run), so a
+    transient fetch failure can't nuke the last good snapshot.
 
     Returns the number of input rows uploaded (not the number of documents).
     The archive layer compares this to ``len(df)`` to decide whether to
@@ -436,6 +504,10 @@ def write_news_to_firestore(
 
     if not grouped:
         return 0
+
+    # Remove stale docs (incl. tickers absent from this run) before writing the
+    # fresh window — only reached once we know there is fresh data to write.
+    wipe_collection(client, collection)
 
     coll = client.collection(collection)
     batch = client.batch()
@@ -466,7 +538,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Refresh yfinance news headlines.")
     parser.add_argument("--tickers", default=None, help="Comma-separated tickers (defaults to NIFTY 50).")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
-    parser.add_argument("--backfill-days", type=int, default=DEFAULT_BACKFILL_DAYS)
+    parser.add_argument(
+        "--backfill-days",
+        type=int,
+        default=None,
+        help="Trailing news window in days (default: NEWS_LOOKBACK_DAYS from config).",
+    )
     parser.add_argument("--sleep", type=float, default=0.2)
     parser.add_argument(
         "--no-firestore",

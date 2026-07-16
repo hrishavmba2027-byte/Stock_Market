@@ -59,11 +59,69 @@ except ImportError:
 # successful Firestore uploads delete it; failed/skipped uploads retain it.
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "Data" / "archive" / "fundamentals.parquet"
 FLAT_SNAPSHOT_PATH = Path(__file__).resolve().parents[1] / "Data" / "archive" / "fundamentals_flat.parquet"
-DEFAULT_LOOKBACK_QUARTERS = 4
+DEFAULT_LOOKBACK_QUARTERS = 5   # pull the latest 5 quarters from yfinance
+MAX_STORED_QUARTERS = 5         # rolling window kept per company (oldest evicted)
 DEFAULT_EVENT_WINDOW_DAYS = 5
 FIRESTORE_COLLECTION = "fundamentals"
 FIRESTORE_BATCH_SIZE = 200  # well under the 500-op hard limit
 NSE_SUFFIX = ".NS"
+
+# Config-driven refresh cadence. The scheduler (weekly cron / Docker entrypoint)
+# invokes this job; the gate below enforces that a *fresh* fundamentals scrape
+# only happens once every ``fundamentals_refresh_days`` (default 15). Off-cadence
+# invocations fall through to drain-only (upload any retained archive, no fetch).
+FUNDAMENTALS_STATE_PATH = Path(__file__).resolve().parents[1] / "state" / "fundamentals_state.json"
+DEFAULT_REFRESH_DAYS = 15
+
+
+def default_refresh_days() -> int:
+    """Fundamentals refresh cadence in days (config: ``FUNDAMENTALS_REFRESH_DAYS``)."""
+    try:
+        from app.config.settings import Settings
+
+        return int(Settings.from_env().fundamentals_refresh_days)
+    except Exception:  # pragma: no cover - config import/parse failure fallback
+        return DEFAULT_REFRESH_DAYS
+
+
+def _load_last_refresh(state_path: Path) -> Optional[datetime]:
+    try:
+        data = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        return None
+    raw = (data or {}).get("last_successful_run_utc")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def fundamentals_refresh_due(
+    state_path: Path = FUNDAMENTALS_STATE_PATH,
+    refresh_days: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> bool:
+    """True when a fresh fundamentals scrape is due per the config cadence.
+
+    Due when the state file is missing/unparseable ("never ran") or at least
+    ``refresh_days`` have elapsed since the last recorded successful run.
+    """
+    if refresh_days is None:
+        refresh_days = default_refresh_days()
+    now = now or datetime.now(timezone.utc)
+    last = _load_last_refresh(state_path)
+    if last is None:
+        return True
+    return (now - last).total_seconds() / 86400.0 >= float(refresh_days)
+
+
+def _record_refresh_run(state_path: Path, now: Optional[datetime] = None) -> None:
+    now = now or datetime.now(timezone.utc)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    state_path.write_text(json.dumps({"last_successful_run_utc": stamp}))
 
 
 def _log(msg: str) -> None:
@@ -452,12 +510,47 @@ def _firestore_doc_id(record: Dict[str, Any]) -> str:
     return str(record["ticker"])
 
 
+def _read_existing_quarters(doc_ref: Any) -> Dict[str, Any]:
+    """Existing ``quarters`` map on a fundamentals doc, or ``{}`` (tolerant of fakes)."""
+    try:
+        snap = doc_ref.get()
+    except Exception:  # pragma: no cover - fake clients may not implement get()
+        return {}
+    try:
+        data = snap.to_dict() if snap is not None and getattr(snap, "exists", True) else None
+    except Exception:  # pragma: no cover
+        return {}
+    quarters = (data or {}).get("quarters") if isinstance(data, dict) else None
+    return dict(quarters) if isinstance(quarters, dict) else {}
+
+
+def _cap_quarters(quarters: Dict[str, Any], cap: int = MAX_STORED_QUARTERS) -> Dict[str, Any]:
+    """Keep only the latest ``cap`` quarters (rolling eviction of the oldest).
+
+    Ordered by ``quarter_end_date`` (falling back to the quarter label) so the
+    newest survive; this is what enforces the fixed-size rolling window.
+    """
+    ordered = sorted(
+        quarters.items(),
+        key=lambda kv: (str((kv[1] or {}).get("quarter_end_date") or ""), kv[0]),
+        reverse=True,
+    )[:cap]
+    return {q: payload for q, payload in ordered}
+
+
 def write_quarterly_to_firestore(
     records: Iterable[Dict[str, Any]],
     collection: str = FIRESTORE_COLLECTION,
     client: Optional[Any] = None,
 ) -> int:
-    """Batch-write company-level fundamentals docs. Returns docs written."""
+    """Batch-write company-level fundamentals docs. Returns docs written.
+
+    Each doc keeps a **rolling window of the latest ``MAX_STORED_QUARTERS`` (5)**
+    quarters: this run's freshly-scraped quarters are merged on top of the doc's
+    existing quarters (new data wins on a shared quarter), then the oldest are
+    evicted so at most five are ever stored — and thus at most five are handed to
+    the LLM. History is never lost when yfinance returns fewer quarters on a run.
+    """
     client = client or init_firestore_client()
 
     batch = client.batch()
@@ -476,7 +569,13 @@ def write_quarterly_to_firestore(
     for ticker in sorted(grouped):
         quarter_records = list(grouped[ticker].values())
         doc_ref = coll.document(ticker)
-        batch.set(doc_ref, _firestore_payload(quarter_records))
+        payload = _firestore_payload(quarter_records)
+        # Merge this run's quarters onto whatever is already stored, newest wins,
+        # then evict the oldest beyond the rolling window.
+        merged = _read_existing_quarters(doc_ref)
+        merged.update(payload["quarters"])
+        payload["quarters"] = _cap_quarters(merged, MAX_STORED_QUARTERS)
+        batch.set(doc_ref, payload)
         pending += 1
         written += 1
         if pending >= FIRESTORE_BATCH_SIZE:
@@ -568,6 +667,10 @@ def refresh_fundamentals(
     archive_path: Optional[Path] = None,
     flat_snapshot_path: Optional[Path] = None,
     collect: bool = True,
+    refresh_days: Optional[int] = None,
+    state_path: Optional[Path] = None,
+    force: bool = False,
+    now_utc: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Refresh fundamentals with the fall-through retry-queue pattern.
 
@@ -597,6 +700,21 @@ def refresh_fundamentals(
     elif archive_path.exists():
         _log("[fundamentals] pending archive present but --no-firestore set; leaving file alone")
 
+    # ---- Config-driven refresh gate (FUNDAMENTALS_REFRESH_DAYS) ----------
+    # A fresh scrape only runs once per cadence window; off-cadence invocations
+    # fall through to drain-only so retained archives still upload.
+    if state_path is None:
+        state_path = FUNDAMENTALS_STATE_PATH
+    if refresh_days is None:
+        refresh_days = default_refresh_days()
+    refresh_due = force or fundamentals_refresh_due(state_path, refresh_days, now=now_utc)
+    if collect and not refresh_due:
+        _log(
+            f"[fundamentals] refresh gate not due (< {refresh_days}d since last successful "
+            "scrape); drain-only run"
+        )
+        collect = False
+
     # ---- Skip-collect short-circuit (COLLECT_FUNDAMENTALS=false) --------
     if not collect:
         _log("[fundamentals] COLLECT_FUNDAMENTALS=false; skipping fresh collection (drain-only run)")
@@ -606,6 +724,7 @@ def refresh_fundamentals(
             "quarterly_records": len(existing_quarterly),
             "firestore_writes": 0,
             "archive_drained": archive_drained,
+            "refresh_due": bool(refresh_due),
         }
 
     # ---- Step 2: fresh collection ---------------------------------------
@@ -631,6 +750,14 @@ def refresh_fundamentals(
     quarterly_df = _records_to_archive_df(quarterly_records) if quarterly_records else pd.DataFrame()
     if not quarterly_df.empty:
         _log(f"[fundamentals] prepared {len(quarterly_df)} quarterly rows for Firestore staging")
+        # PIT spine (Phase 3): mirror this scrape (with its scrape_date) into the
+        # append-only archive so a past date's fundamentals are reconstructable.
+        from ingestion._pit import maybe_append_pit
+
+        maybe_append_pit(
+            quarterly_df, "fundamentals",
+            dedup_keys=("ticker", "quarter", "scrape_date"), log=_log,
+        )
     else:
         _log("[fundamentals] no quarterly records fetched")
 
@@ -653,11 +780,17 @@ def refresh_fundamentals(
     else:
         _log("[fundamentals] Firestore write skipped (--no-firestore); staged archive retained")
 
+    # Advance the cadence clock: a fresh scrape ran this invocation, so the
+    # next one is only due after ``refresh_days`` more days.
+    if quarterly_records:
+        _record_refresh_run(state_path, now=now_utc)
+
     return {
         "flat_rows": len(flat_df),
         "quarterly_records": len(quarterly_records),
         "firestore_writes": firestore_writes,
         "archive_drained": archive_drained,
+        "refresh_due": True,
     }
 
 
@@ -667,7 +800,9 @@ def load_fundamentals(path: Path = DEFAULT_OUTPUT) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-def cache_is_fresh(path: Path = DEFAULT_OUTPUT, max_age_days: int = 7) -> bool:
+def cache_is_fresh(path: Path = DEFAULT_OUTPUT, max_age_days: Optional[int] = None) -> bool:
+    if max_age_days is None:
+        max_age_days = default_refresh_days()
     if not path.exists():
         return False
     age = datetime.now(timezone.utc) - datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
@@ -690,6 +825,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Skip Firestore writes (parquet snapshot only).",
     )
+    parser.add_argument(
+        "--refresh-days",
+        type=int,
+        default=None,
+        help="Refresh cadence in days (default: FUNDAMENTALS_REFRESH_DAYS from config).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass the refresh-cadence gate and scrape now regardless of last run.",
+    )
     args = parser.parse_args(argv)
 
     if args.tickers:
@@ -704,6 +850,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         write_firestore=not args.no_firestore,
         lookback_quarters=args.lookback_quarters,
         collect=truthy_env("COLLECT_FUNDAMENTALS", default=True),
+        refresh_days=args.refresh_days,
+        force=args.force,
     )
     print(json.dumps(summary))
     return 0

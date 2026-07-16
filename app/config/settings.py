@@ -105,8 +105,34 @@ class Settings(BaseModel):
     indices_path: Path = BASE_DIR / "Data" / "archive" / "indices.parquet"
     sentiment_model: str = "ProsusAI/finbert"
     sentiment_backfill_days: int = 90
+    # Recency weight-decay half-life (days) for sentiment aggregation. Newer
+    # headlines dominate the per-day mean; a headline this many days old carries
+    # half the weight of a same-day one, so the oldest item in the trailing
+    # news window (news_lookback_days) contributes the least. The 3-day window
+    # uses half this value (see features.sentiment.HALF_LIFE_FACTOR).
+    sentiment_halflife_days: float = 3.0
+    # Trailing window (days) of yfinance news retained each run. On every run
+    # the trailing window is re-scraped; only headlines newer than
+    # ``now - news_lookback_days`` survive at fetch time and in the cache.
+    news_lookback_days: int = 7
+    # Cadence knobs (days). Fundamentals/technicals refresh and model retrain
+    # are gated to these intervals; the schedulers (GitHub Actions crons /
+    # Docker entrypoint) invoke the jobs, and these gates enforce the interval.
+    fundamentals_refresh_days: int = 15
+    retrain_interval_days: int = 15
     firestore_project: str = ""
     firestore_fundamentals_collection: str = "fundamentals"
+    # Phase 3 — point-in-time (PIT) data spine. When enabled, ingest jobs mirror
+    # each run's rows into append-only, as-of-dated parquet under pit_archive_dir
+    # so a past date's inputs can be reconstructed for backtesting. This is a
+    # *parallel* store — the live "latest-only" Firestore collections are
+    # untouched, so replace semantics / training preservation are unaffected.
+    enable_pit_archive: bool = False
+    pit_archive_dir: Path = BASE_DIR / "Data" / "pit"
+    # Phase 3 — production news is now collected per company AND per sector (plus
+    # GENERAL macro). Sector sentiment for a company's own sector, plus GENERAL,
+    # feed the LLM alongside the company's own sentiment.
+    enable_sector_news: bool = True
 
     class Config:
         arbitrary_types_allowed = True
@@ -156,8 +182,15 @@ class Settings(BaseModel):
             indices_path=Path(os.getenv("INDICES_PATH", str(base_dir / "Data" / "archive" / "indices.parquet"))),
             sentiment_model=os.getenv("SENTIMENT_MODEL", "ProsusAI/finbert"),
             sentiment_backfill_days=_int_env("SENTIMENT_BACKFILL_DAYS", 90),
+            sentiment_halflife_days=_float_env("SENTIMENT_HALFLIFE_DAYS", 3.0),
+            news_lookback_days=_int_env("NEWS_LOOKBACK_DAYS", 7, minimum=1),
+            fundamentals_refresh_days=_int_env("FUNDAMENTALS_REFRESH_DAYS", 15, minimum=1),
+            retrain_interval_days=_int_env("RETRAIN_INTERVAL_DAYS", 15, minimum=1),
             firestore_project=os.getenv("FIRESTORE_PROJECT", ""),
             firestore_fundamentals_collection=os.getenv("FIRESTORE_FUNDAMENTALS_COLLECTION", "fundamentals"),
+            enable_pit_archive=_bool_env("ENABLE_PIT_ARCHIVE", False),
+            pit_archive_dir=Path(os.getenv("PIT_ARCHIVE_DIR", str(base_dir / "Data" / "pit"))),
+            enable_sector_news=_bool_env("ENABLE_SECTOR_NEWS", True),
         )
 
     def ensure_runtime_dirs(self) -> None:

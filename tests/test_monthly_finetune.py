@@ -293,7 +293,10 @@ def test_archive_old_rows_appends_before_operational_cleanup_and_skips_duplicate
     assert result.duplicate_rows_skipped == 1
     assert result.rows_removed_from_operational == 2
     assert historical.appended[0][1] == "2025-01-02"
-    assert historical.appended[0][-1] == "102"
+    # A Row_finetuned column is injected as the trailing column (0 = un-fine-tuned
+    # on arrival), so the Forecast_Close_T+1 value is now second-to-last.
+    assert historical.appended[0][-1] == 0
+    assert historical.appended[0][-2] == "102"
     assert [row[1] for row in operational.values[1:]] == ["2025-01-03", "2025-01-06", "2025-01-07"]
 
 

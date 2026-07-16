@@ -273,8 +273,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--backfill-days",
         type=int,
-        default=7,
-        help="Lookback window in days for news / Reddit / X (default: 7).",
+        default=None,
+        help=(
+            "Lookback window in days for news / Reddit / X "
+            "(default: NEWS_LOOKBACK_DAYS from config)."
+        ),
     )
     parser.add_argument(
         "--no-firestore",
@@ -322,6 +325,11 @@ def _run_parallel(
 
 
 def collect_all(args: argparse.Namespace) -> Dict[str, Any]:
+    if getattr(args, "backfill_days", None) is None:
+        from ingestion.news_ingest import default_backfill_days
+
+        args.backfill_days = default_backfill_days()
+        _log(f"[collect_all] backfill window from config: {args.backfill_days} days")
     write_firestore = _firestore_enabled(args)
     _log(f"[collect_all] Firestore writes: {'enabled' if write_firestore else 'disabled'}")
 

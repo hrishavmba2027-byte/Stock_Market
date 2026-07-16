@@ -40,7 +40,7 @@ Stock_Market/
 ├── credentials/               ← Google + Firebase service-account JSONs (gitignored)
 ├── state/, logs/, cache/      ← runtime state
 ├── Dockerfile, docker-compose.yml
-├── requirements.txt           ← runtime deps (+ requirements-dev.txt, -lock.txt)
+├── requirements.txt           ← single deps file (production + backtesting + tests)
 └── .env.example               ← copy to .env and fill in
 ```
 
@@ -87,8 +87,7 @@ python3 scripts/setup_local.py --with-notebook # + jupyter/ipykernel for retrain
 python3.11 -m venv venv
 source venv/bin/activate                   # venv\Scripts\activate on Windows
 pip install --upgrade pip setuptools wheel
-pip install -r requirements.txt
-pip install -r requirements-dev.txt        # optional: test/dev tools
+pip install -r requirements.txt            # single file: production + backtesting + tests
 
 # 3c. …or the automated macOS bootstrap (creates venv, installs everything,
 #     verifies imports and Apple-Silicon MPS support):

@@ -84,6 +84,17 @@ for _p in {str(PROJECT_ROOT), str(_SCRIPT_DIR)}:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+# Load .env so a direct ``python run_full_workflow.py`` invocation sees the same
+# configuration (GOOGLE_CREDENTIALS, SHEET_ID, …) as the rest of the app. Without
+# this, credential resolution falls back to the legacy ``Credentials_New.json``
+# default and startup validation fails even though auth would otherwise work.
+# override=False → any already-exported env var (e.g. in CI) still wins.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(PROJECT_ROOT / ".env", override=False)
+except ImportError:  # pragma: no cover - dotenv is a declared dependency
+    pass
+
 WORKFLOW_VERSION = "1.0.0"
 STAGE_COUNT = 16
 

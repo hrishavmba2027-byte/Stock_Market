@@ -480,9 +480,7 @@ Summary:
 ## Appendix: File Inventory
 
 ### Configuration Files
-- `requirements.txt` — Main dependencies
-- `requirements-dev.txt` — Dev dependencies
-- `requirements-lock.txt` — Locked versions
+- `requirements.txt` — Single consolidated dependencies file (production + backtesting + tests)
 - `.env` — Environment variables (Google API keys, etc.)
 - `.env.example` — Template
 - `setup.py` (likely) — Package setup

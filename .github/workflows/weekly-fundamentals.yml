@@ -5,6 +5,11 @@ name: weekly-fundamentals
 #   • Firestore collection `fundamentals` (one doc per ticker, quarters nested)
 # Re-running is idempotent — same ticker doc IDs are overwritten.
 #
+# Cadence note: a FRESH yfinance scrape is gated to FUNDAMENTALS_REFRESH_DAYS
+# (default 15) via state/fundamentals_state.json. This weekly cron intentionally
+# over-invokes; off-cadence runs fall through to drain-only (they just re-upload
+# any retained archive, no fetch). Use `--force` to scrape regardless.
+#
 # The flat parquet is also uploaded as a workflow artifact (7-day retention)
 # so you can grab last week's snapshot from the Actions tab if needed.
 

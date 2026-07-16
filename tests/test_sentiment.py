@@ -394,3 +394,43 @@ def test_importance_weighting_in_aggregate_favors_credible_source():
     # The credible+confident positive item dominates → mean is positive.
     last = agg.iloc[-1]
     assert last["sent_mean_7d"] > 0.5
+
+
+def test_default_half_life_days_reads_config(monkeypatch):
+    monkeypatch.setenv("SENTIMENT_HALFLIFE_DAYS", "5")
+    assert sentiment.default_half_life_days() == 5.0
+    monkeypatch.delenv("SENTIMENT_HALFLIFE_DAYS", raising=False)
+    assert sentiment.default_half_life_days() == 3.0
+
+
+def test_recency_decay_newest_dominates_and_scales_with_half_life():
+    """Weight decay: the newest headline dominates; a shorter half-life makes
+    recent sentiment count even more relative to older items in the window."""
+    df = pd.DataFrame(
+        [
+            {  # oldest item in the 7d window — negative
+                "ticker": "RELIANCE",
+                "ts": datetime(2026, 1, 10, 6, tzinfo=timezone.utc),
+                "text": "old bad",
+                "weight": 1.0,
+                "polarity": -1.0,
+            },
+            {  # newest item — positive
+                "ticker": "RELIANCE",
+                "ts": datetime(2026, 1, 16, 6, tzinfo=timezone.utc),
+                "text": "new good",
+                "weight": 1.0,
+                "polarity": 1.0,
+            },
+        ]
+    )
+    agg = sentiment._aggregate(df, source="news", weight_col="weight", half_life_days=3.0)
+    latest = agg[agg["date"] == agg["date"].max()].iloc[0]
+    assert latest["n_7d"] == 2
+    # Newest positive item outweighs the older negative one.
+    assert latest["sent_mean_7d"] > 0
+
+    agg_fast = sentiment._aggregate(df, source="news", weight_col="weight", half_life_days=1.0)
+    latest_fast = agg_fast[agg_fast["date"] == agg_fast["date"].max()].iloc[0]
+    # A shorter half-life decays the old item harder → newest dominates more.
+    assert latest_fast["sent_mean_7d"] > latest["sent_mean_7d"]

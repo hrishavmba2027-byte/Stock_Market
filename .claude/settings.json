@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import Feature_Engineering as fe; print\\('IND', len\\(fe.INDICATOR_COLUMNS\\)\\); print\\('DEC', len\\(fe.DECISION_FEATURE_COLUMNS\\)\\); print\\('has compute_decision_features', hasattr\\(fe,'compute_decision_features'\\)\\)\")",
+      "Bash(python3 -c \"import openpyxl; print\\('openpyxl', openpyxl.__version__\\)\")",
+      "Bash(python3 scripts/fill_workbook.py)",
+      "Bash(python3 scripts/train_from_workbook.py --tickers TCS,RELIANCE,INFY --dry-run --device cpu)",
+      "Bash(grep -vE \"FutureWarning|end of life|warnings.warn|NotOpenSSL|urllib3|You are using|with any|and then update|best-effort|Please upgrade|^\\\\s*$\")",
+      "Bash(python3 scripts/train_from_workbook.py --device cpu)",
+      "Bash(grep -vE 'FutureWarning|end of life|warnings.warn|NotOpenSSL|urllib3|You are using|with any|and then update|best-effort|Please upgrade|^\\\\s*$' /private/tmp/claude-501/-Users-kingshukbarua-Documents-Stock-Market/cef6f330-bb75-493e-b6e4-7e8b707c79cc/tasks/bs2nhd0ny.output)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import bs4, lxml; print\\('bs4', bs4.__version__, 'lxml ok'\\)\")",
+      "Bash(timeout 60 python3 -c ' *)",
+      "Bash(python3 -m backtesting.results --help)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(python3 -m pytest tests/test_fundamentals.py tests/test_trade_suggestions.py -q)",
+      "Bash(python3 -m pytest \"tests/test_backtest_settings.py::test_defaults_are_inert\" -q)",
+      "Bash(env)",
+      "Bash(python3 -c \"import lxml.etree, lxml.html; print\\('lxml', lxml.__version__\\)\")",
+      "Bash(python3 -c \"import importlib.util; print\\('pytest_timeout installed:', importlib.util.find_spec\\('pytest_timeout'\\) is not None\\)\")",
+      "Bash(python3 -c \"import lxml,trafilatura; print\\('lxml',lxml.__version__,'trafilatura',trafilatura.__version__\\)\")",
+      "Bash(python3 -c \"import trafilatura; print\\('trafilatura imports OK'\\)\")",
+      "Bash(python3 -c \"import lxml_html_clean; print\\('lxml_html_clean OK', lxml_html_clean.__version__ if hasattr\\(lxml_html_clean,'__version__'\\) else ''\\)\")",
+      "Bash(python3 -c \"import lxml.html.clean\")",
+      "Bash(curl -s -m 40 -G https://web.archive.org/cdx/search/cdx --data-urlencode url=economictimes.indiatimes.com/*hdfc-bank* --data-urlencode matchType=prefix --data-urlencode output=json --data-urlencode from=20230101 --data-urlencode to=20231231 --data-urlencode collapse=urlkey --data-urlencode limit=8 --data-urlencode fl=original,timestamp -w '\\\\n[http %{http_code} time %{time_total}s]\\\\n')",
+      "Bash(curl -s -m 60 -G https://web.archive.org/cdx/search/cdx --data-urlencode url=economictimes.indiatimes.com --data-urlencode matchType=domain --data-urlencode output=json --data-urlencode filter=original:.*hdfc-bank.* --data-urlencode filter=statuscode:200 --data-urlencode filter=mimetype:text/html --data-urlencode from=20230101 --data-urlencode to=20231231 --data-urlencode collapse=urlkey --data-urlencode limit=8 --data-urlencode fl=original,timestamp -w '\\\\n[http %{http_code} time %{time_total}s]\\\\n')",
+      "Bash(python3 -c \"from ingestion.aliases import all_aliases_for, load_aliases; print\\('HDFCBANK:', all_aliases_for\\('HDFCBANK'\\)\\); print\\('SBIN:', all_aliases_for\\('SBIN'\\)\\)\")",
+      "Bash(curl -s -m 30 -G https://web.archive.org/cdx/search/cdx --data-urlencode url=moneycontrol.com/news --data-urlencode matchType=prefix --data-urlencode output=json --data-urlencode 'filter=original:.*\\(?<![a-z]\\)\\(sbi|state-bank\\)\\(?![a-z]\\).*' --data-urlencode filter=statuscode:200 --data-urlencode filter=mimetype:text/html --data-urlencode from=20230101 --data-urlencode to=20231231 --data-urlencode collapse=urlkey --data-urlencode limit=6 --data-urlencode fl=original,timestamp -w '\\\\n[http %{http_code} %{time_total}s]\\\\n')",
+      "Bash(curl -s -m 30 -G https://web.archive.org/cdx/search/cdx --data-urlencode url=moneycontrol.com/news --data-urlencode matchType=prefix --data-urlencode output=json --data-urlencode 'filter=original:.*\\(sbi|state-bank\\).*' --data-urlencode filter=statuscode:200 --data-urlencode filter=mimetype:text/html --data-urlencode from=20230101 --data-urlencode to=20231231 --data-urlencode collapse=urlkey --data-urlencode limit=6 --data-urlencode fl=original,timestamp -w '\\\\n[http %{http_code} %{time_total}s]\\\\n')",
+      "Bash(python3 -c \"import backtesting.fetch_news as fn; print\\('import OK; domains:', fn.NEWS_DOMAINS\\)\")",
+      "Bash(python3 -c \"import sys,json;d=json.load\\(sys.stdin\\); print\\('CONTENT:', repr\\(d['choices'][0]['message']['content']\\)\\) if 'choices' in d else print\\('ERR:', str\\(d\\)[:300]\\)\")",
+      "Bash(python3 -m pytest tests/ -k \"backtest or settings or suggestion or signal\" -q)",
+      "Bash(python3 -c \"import trafilatura; print\\('trafilatura OK', trafilatura.__version__\\)\")",
+      "Bash(python3 -c \"import lxml_html_clean; print\\('lxml_html_clean OK'\\)\")",
+      "Bash(python3 -c \"import lxml.html.clean; print\\('lxml.html.clean OK'\\)\")",
+      "Bash(python3 -m pip show trafilatura lxml lxml_html_clean)",
+      "Bash(python3 -c \"import backtesting.fetch_news as fn; print\\('import OK; trafilatura_available =', fn.trafilatura_available\\(\\)\\)\")",
+      "Bash(python3 -c 'import sys,json; *)",
+      "Bash(python3 -c \"import backtesting.fetch_news as fn; print\\('import OK; _cdx_ts_to_iso\\(20230806175959\\) =', fn._cdx_ts_to_iso\\('20230806175959'\\)\\)\")",
+      "Bash(python3 -m pytest tests/ -k \"news or fetch_news or cdx\" -q)"
+    ]
+  }
+}

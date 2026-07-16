@@ -15,6 +15,14 @@ name: monthly-finetune
 #      best-loss checkpoints, then replaces the 'models-current' release assets.
 #   7. Uploads the fine-tune metrics JSON and updated state/ as artifacts.
 #
+# Cadence note: this monthly cron is a BACKSTOP. The effective retrain cadence
+# is the config-driven gate (RETRAIN_INTERVAL_DAYS, default 15) — retrain fires
+# once >= 15 days have passed since the last successful fine-tune AND there is
+# new data. run_full_workflow.py stage 15 invokes `monthly_finetune.py --if-due`
+# after every daily pipeline run, so in practice the model retrains ~every 15
+# days rather than strictly monthly; this cron just guarantees a check even if
+# the daily workflow is disabled.
+#
 # The run is fully idempotent: if no historical rows are newer than the
 # state checkpoint, the script exits with status "no_new_historical_data"
 # and the checkpoints are left untouched.
@@ -141,9 +149,10 @@ jobs:
           EXTRA_FLAGS=""
 
           # Scheduled runs honor the retrain gate inside monthly_finetune.py
-          # (new calendar month since last success, or median new rows per
-          # active symbol >= MIN_NEW_ROWS_FOR_FINETUNE). Manual
-          # workflow_dispatch remains a force-run without the gate.
+          # (>= RETRAIN_INTERVAL_DAYS since last success — default 15 — with any
+          # new data, or median new rows per active symbol >=
+          # MIN_NEW_ROWS_FOR_FINETUNE). Manual workflow_dispatch remains a
+          # force-run without the gate.
           if [ "${{ github.event_name }}" = "schedule" ]; then
             EXTRA_FLAGS="$EXTRA_FLAGS --if-due"
           fi

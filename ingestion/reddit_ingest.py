@@ -38,7 +38,7 @@ from ingestion._archive import (
     truthy_env,
     upload_and_clear_archive,
 )
-from ingestion._firestore import init_firestore_client
+from ingestion._firestore import init_firestore_client, wipe_collection
 from ingestion.aliases import find_tickers_in_text, load_aliases
 
 # Load .env so standalone runs (python -m ...) see the same configuration as
@@ -61,7 +61,7 @@ DEFAULT_SUBREDDITS = (
 POST_FETCH_LIMIT = 100  # Reddit's /new.json caps at 100 per call
 
 REDDIT_BASE = "https://www.reddit.com"
-DEFAULT_USER_AGENT = "stock-market-automation/0.1 (anonymous scrape)"
+DEFAULT_USER_AGENT = "stock-automation/0.1 (anonymous scrape)"
 REQUEST_TIMEOUT_SECONDS = 15
 INTER_SUBREDDIT_SLEEP_SECONDS = 2.0
 
@@ -333,7 +333,15 @@ def write_reddit_to_firestore(
     collection: str = FIRESTORE_COLLECTION,
     client: Optional[Any] = None,
 ) -> int:
-    """Write **one document per ticker** with all posts nested by ``permalink_hash``.
+    """Wipe ``collection`` then write **one document per ticker** with all posts
+    nested by ``permalink_hash``.
+
+    "Wipe-then-write" enforces the rolling last-``backfill_days`` window in
+    Firestore: ``df`` is this run's complete fetch (already filtered to the
+    trailing window), so rebuilding the collection drops posts that have aged out
+    **and** removes stale docs for tickers with no fresh posts — leaving only the
+    latest collected posts. An empty ``df`` is a no-op (never wipes on a
+    zero-collection run), so a transient scrape failure can't nuke prior data.
 
     Returns the number of input rows uploaded (not the number of documents).
     """
@@ -353,6 +361,10 @@ def write_reddit_to_firestore(
 
     if not grouped:
         return 0
+
+    # Remove stale docs (incl. tickers absent from this run) before writing the
+    # fresh window — only reached once we know there is fresh data to write.
+    wipe_collection(client, collection)
 
     coll = client.collection(collection)
     batch = client.batch()
