@@ -29,6 +29,10 @@ class AllocationConfig:
     cash_floor_frac: float = 0.10
     # Hard per-name weight ceiling (fraction of the book).
     per_name_cap_frac: float = 0.20
+    # Minimum per-name allocation floor (fraction of the book). Any Markowitz
+    # weight below this is dropped to 0 — a position must be at least this size or
+    # not taken at all. Freed capital is NOT redistributed; it stays in cash.
+    min_weight_frac: float = 0.05
     # Annual vol target used to shrink the per-name cap for volatile names:
     # cap_i = min(per_name_cap_frac, vol_target_annual / sigma_i).
     vol_target_annual: float = 0.20
@@ -71,6 +75,7 @@ class AllocationConfig:
             ),
             cash_floor_frac=_float_env("ALLOC_CASH_FLOOR_FRAC", 0.10),
             per_name_cap_frac=_float_env("ALLOC_PER_NAME_CAP_FRAC", 0.20),
+            min_weight_frac=_float_env("ALLOC_MIN_WEIGHT_FRAC", 0.05),
             vol_target_annual=_float_env("ALLOC_VOL_TARGET_ANNUAL", 0.20),
             llm_confidence_tilt=_float_env("ALLOC_LLM_CONFIDENCE_TILT", 0.25),
             min_ticket_inr=_float_env("ALLOC_MIN_TICKET_INR", 10_000.0),
@@ -88,6 +93,7 @@ class AllocationConfig:
             initial_capital=float(settings.initial_capital),
             cash_floor_frac=float(settings.cash_floor_frac),
             per_name_cap_frac=float(settings.per_name_cap_frac),
+            min_weight_frac=float(getattr(settings, "min_weight_frac", 0.05)),
             vol_target_annual=float(settings.vol_target_annual),
             llm_confidence_tilt=float(settings.llm_confidence_tilt),
             min_ticket_inr=float(settings.min_ticket_inr),

@@ -64,6 +64,7 @@ def _load_suggestions() -> Dict[str, Dict[str, Any]]:
             "sell_price": data.get("sell_price"),
             "stoploss": data.get("stoploss"),
             "buy_price": data.get("buy_price"),
+            "trail_armed": bool(data.get("trail_armed")),
         }
     return out
 
@@ -131,9 +132,23 @@ def check_exits(*, dry_run: bool = False) -> Dict[str, Any]:
             ohlc[t] = {k: bar[k] for k in ("open", "high", "low", "close")}
             atr_map[t] = bar["atr14"]
 
-    exits = bt_exits.scan_exits(held, signals, ohlc, honor_stop=honor_stop)
+    # Hold-and-trail (mirrors the backtest): a target touch no longer sells —
+    # it ratchets a trailing stop; only stop hits, LLM verdict changes, or the
+    # max-age rule close a position.
+    trail_on_target = os.environ.get("DAILY_TRAIL_ON_TARGET", "true").strip().lower() in {"1", "true", "yes", "on"}
+    trail_atr_mult = float(os.environ.get("DAILY_TRAIL_ATR_MULT", "2.0"))
+    max_holding_days = int(os.environ.get("DAILY_MAX_HOLDING_DAYS", "0"))   # 0 = age exit disabled
+    exits, stop_updates = bt_exits.scan_exits_and_trail(
+        held, signals, ohlc, honor_stop=honor_stop,
+        trail_on_target=trail_on_target, trail_atr_mult=trail_atr_mult,
+        atr_map=atr_map, max_holding_days=max_holding_days,
+        bar=datetime.now(timezone.utc).date().isoformat(),
+    )
     monitor = bt_exits.monitor_rows(datetime.now(timezone.utc).date().isoformat(),
-                                    held, signals, ohlc, exits, honor_stop=honor_stop)
+                                    held, signals, ohlc, exits, honor_stop=honor_stop,
+                                    stop_updates=stop_updates)
+    if stop_updates and not dry_run:
+        _persist_stop_updates(stop_updates)
 
     booked: List[Dict[str, Any]] = []
     if exits:
@@ -171,6 +186,22 @@ def check_exits(*, dry_run: bool = False) -> Dict[str, Any]:
              f"pnl ₹{b['realized_pnl']:,.0f}")
     return {"status": "ok", "held": len(held), "exits": booked, "monitor": monitor,
             "cash": round(holdings.cash, 2)}
+
+
+def _persist_stop_updates(stop_updates: Dict[str, Dict[str, Any]]) -> None:
+    """Write ratcheted trailing stops back to the suggestions store so the next
+    daily run monitors against the raised stop (best-effort; the ratchet is
+    recomputed from prices anyway, so a missed write only delays it a day)."""
+    try:
+        from ingestion._firestore import init_firestore_client
+        from features.trade_suggestions import SUGGESTIONS_COLLECTION
+        fs = init_firestore_client()
+        for t, upd in stop_updates.items():
+            fs.collection(SUGGESTIONS_COLLECTION).document(t).set(
+                {"stoploss": upd["stoploss"], "trail_armed": True}, merge=True)
+            _log(f"[daily] {t}: trailing stop ratcheted → ₹{upd['stoploss']:.2f}")
+    except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+        _log(f"[daily] stop-update persist skipped: {exc}")
 
 
 def _save_holdings(holdings: Any, path: Path) -> None:

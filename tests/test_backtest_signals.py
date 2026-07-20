@@ -18,7 +18,8 @@ def test_build_market_shape():
     m = bt_signals.build_market("A", _frame(), {"T+1": 131, "T+15": 145}, "2020-01-30")
     assert m["date"] == "2020-01-30"
     assert m["close"] == 129
-    assert len(m["recent_closes"]) == 5
+    from features.trade_suggestions import RECENT_CLOSES
+    assert len(m["recent_closes"]) == min(RECENT_CLOSES, 30)   # capped at frame rows
     assert m["forecast"]["T+15"] == 145
 
 

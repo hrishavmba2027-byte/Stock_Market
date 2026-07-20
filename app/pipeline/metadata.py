@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import tempfile
@@ -137,6 +138,24 @@ _DEFAULT_METADATA: Dict[str, Any] = {
     "quantiles": [0.1, 0.5, 0.9],
     "target_type": "multi_horizon_quantile_log_return",
     "label_columns": _LABEL_COLUMNS,
+
+    # ── NSE circuit-limit bounds (10% daily band) ───────────────────────────
+    # Drives three safety layers in main.py: the scaled-tanh model output head
+    # (horizon-h log-return can never exceed h daily circuit moves), the training
+    # target clamp, and the inference-side clip. Without this block models are
+    # built with UNBOUNDED heads and forecasts can explode (the bug that produced
+    # erratic backtest price paths — see outputs/backtest 2026-07 incident).
+    "circuit_limit": {
+        "daily_pct": 0.1,
+        "daily_log_return": math.log(1.10),
+        "horizon_logret_bounds": [math.log(1.10) * h for h in range(1, 6)],
+        "output_head": "scaled_tanh",
+        "applied_at": [
+            "model_output_head",
+            "train_target_clamp",
+            "inference_clip",
+        ],
+    },
 
     # ── ensemble ────────────────────────────────────────────────────────────
     "ensemble_weights": {

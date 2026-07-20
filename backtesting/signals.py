@@ -23,8 +23,13 @@ from features.trade_suggestions import (
     fingerprint,
     sentiment_context_for,
 )
+from features.entry_gates import (
+    GateConfig,
+    apply_entry_gates,
+    compute_entry_features,
+)
 
-FORECAST_KEYS = [f"T+{h}" for h in range(1, 16)]
+FORECAST_KEYS = [f"T+{h}" for h in range(1, 31)]
 
 
 def build_market(
@@ -32,16 +37,39 @@ def build_market(
     frame_asof: pd.DataFrame,
     forecast_path: Dict[str, float],
     cutoff: Any,
+    *,
+    position: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """``{date, close, recent_closes, forecast}`` for a single stock at bar ``C``."""
+    """``{date, close, recent_closes, forecast[, position]}`` for one stock at bar ``C``.
+
+    A non-empty ``position`` block switches the LLM call into position-review
+    mode (see ``features.trade_suggestions.POSITION_REVIEW_PROMPT``)."""
     closes = pd.to_numeric(frame_asof.get("Close"), errors="coerce").dropna().to_numpy(dtype=float)
     close = float(closes[-1]) if len(closes) else None
-    return {
+    market = {
         "date": pd.Timestamp(cutoff).strftime("%Y-%m-%d"),
         "close": close,
         "recent_closes": [float(x) for x in closes[-RECENT_CLOSES:]],
         "forecast": {k: float(v) for k, v in (forecast_path or {}).items()},
     }
+    if position:
+        market["position"] = position
+    return market
+
+
+def entry_features_for(
+    frame_asof: pd.DataFrame,
+    lookback: int,
+) -> Dict[str, Optional[float]]:
+    """Gate features from the full PIT frame (closes + highs/lows + volume)."""
+    def col(name):
+        s = frame_asof.get(name)
+        return None if s is None else pd.to_numeric(s, errors="coerce").tolist()
+    return compute_entry_features(
+        col("Close") or [],
+        highs=col("High"), lows=col("Low"), volumes=col("Volume"),
+        lookback=lookback,
+    )
 
 
 def fundamentals_asof(
@@ -166,6 +194,8 @@ def run_signals(
     prev_fingerprints: Optional[Dict[str, str]] = None,
     workers: int = 4,
     ask: Callable[..., Dict[str, Any]] = ask_glm,
+    positions: Optional[Dict[str, Dict[str, Any]]] = None,
+    gate_config: Optional[GateConfig] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Per-ticker BUY/HOLD/AVOID via ``ask`` (defaults to production ``ask_glm``).
 
@@ -173,10 +203,17 @@ def run_signals(
     unchanged from ``prev_fingerprints`` — the same "contextualize once, then only
     new data" contract production uses. ``ask`` is injectable so tests run without
     the network.
+
+    ``positions`` (ticker → the review payload built by the walk-forward) routes
+    HELD names through the position-review prompt — hold-and-trail / raise
+    target / exit — instead of the fresh-entry prompt; a held name is never
+    fingerprint-skipped, so every cycle re-underwrites every open position.
+    ``gate_config`` arms the deterministic entry gates on fresh BUYs.
     """
     model = model or os.environ.get("GLM_MODEL", GLM_MODEL)
     api_key = api_key or os.environ.get("GLM_API_KEY", "")
     prev_fingerprints = prev_fingerprints or {}
+    positions = positions or {}
 
     jobs = []
     for t in tickers:
@@ -184,19 +221,27 @@ def run_signals(
         frame = frames_asof.get(t)
         if not fc or frame is None or frame.empty:
             continue
-        market = build_market(t, frame, fc, cutoff)
+        pos = positions.get(t.upper()) or positions.get(t)
+        market = build_market(t, frame, fc, cutoff, position=pos)
         snap = sentiment_context_for(t, sent_map)
         fund = funds.get(t.upper())
         fp = fingerprint({"market": market, "sentiment": snap, "fundamentals": fund})
-        if prev_fingerprints.get(t) == fp:
+        if pos is None and prev_fingerprints.get(t) == fp:
             continue
-        jobs.append((t, market, snap, fund, fp))
+        jobs.append((t, market, snap, fund, fp, frame))
 
     results: Dict[str, Dict[str, Any]] = {}
 
     def _one(job):
-        t, market, snap, fund, fp = job
+        t, market, snap, fund, fp, frame = job
         suggestion = ask(t, market, snap, model, api_key, fund)
+        # Deterministic entry gates on fresh BUYs (review replies pass through —
+        # they can only be HOLD/AVOID and carry their own ratchet semantics).
+        if gate_config is not None and not market.get("position"):
+            feats = entry_features_for(frame, gate_config.momentum_lookback_days)
+            suggestion = apply_entry_gates(
+                suggestion, feats, market.get("forecast"), market.get("close"), gate_config,
+            )
         return t, {
             "as_of_date": market["date"],
             "last_close": market["close"],
@@ -210,6 +255,8 @@ def run_signals(
             "sentiment_used": _has_sentiment(snap),
             "fundamentals_used": bool(fund),
             "fingerprint": fp,
+            "review_decision": suggestion.get("review_decision"),
+            "gate_reasons": suggestion.get("gate_reasons"),
         }
 
     if workers <= 1:

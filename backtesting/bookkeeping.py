@@ -52,6 +52,8 @@ class BacktestBookkeeper:
                 "confidence": s.get("confidence"),
                 "sentiment_used": s.get("sentiment_used"),
                 "fundamentals_used": s.get("fundamentals_used"),
+                "review_decision": s.get("review_decision"),
+                "gate_reasons": "; ".join(s.get("gate_reasons") or []) or None,
                 "rationale": s.get("rationale"),
             })
 
@@ -103,6 +105,7 @@ class BacktestBookkeeper:
             "EquityCurve": _df(state.equity_curve),
             "Forecasts": _df(state.forecast_log),
             "PnL_Statement": _pnl_statement(state),
+            "PnL_Ex_Costs": _pnl_statement(state, exclude_costs=True),
             "Open_Positions": _open_positions(state),
         }
         tmp = self.path.with_suffix(".xlsx.tmp")
@@ -140,7 +143,10 @@ def _open_positions(state: Any) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _pnl_statement(state: Any) -> pd.DataFrame:
+def _pnl_statement(state: Any, *, exclude_costs: bool = False) -> pd.DataFrame:
+    """The P&L statement; ``exclude_costs=True`` adds every rupee of transaction
+    cost back to equity/realized so the sheet answers "what would the strategy
+    have earned with free execution?" (the cost drag isolated in one number)."""
     positions_value = state.position_value()
     unrealized = sum(
         (float(state.mark_prices.get(t.upper(), p.get("avg_price", 0.0)) or 0.0) - float(p.get("avg_price", 0.0)))
@@ -148,18 +154,24 @@ def _pnl_statement(state: Any) -> pd.DataFrame:
         for t, p in state.positions.items()
     )
     equity = state.equity()
+    costs = float(state.total_costs)
+    realized = float(state.realized_pnl)
+    if exclude_costs:
+        equity += costs
+        realized += costs
     total_return = equity - state.initial_capital
     rows = [
         ("Initial capital", round(state.initial_capital, 2)),
-        ("Ending cash", round(state.cash, 2)),
+        ("Ending cash", round(state.cash + (costs if exclude_costs else 0.0), 2)),
         ("Ending positions value", round(positions_value, 2)),
         ("Ending equity", round(equity, 2)),
-        ("Realized P&L", round(state.realized_pnl, 2)),
+        ("Realized P&L", round(realized, 2)),
         ("Unrealized P&L", round(unrealized, 2)),
-        ("Total transaction costs", round(state.total_costs, 2)),
+        ("Total transaction costs", 0.0 if exclude_costs else round(costs, 2)),
         ("Net total return (₹)", round(total_return, 2)),
         ("Net total return (%)", round(100.0 * total_return / state.initial_capital, 4) if state.initial_capital else 0.0),
         ("Trades executed", len(state.trade_log)),
+        ("Costs excluded", exclude_costs),
     ]
     return pd.DataFrame(rows, columns=["metric", "value"])
 

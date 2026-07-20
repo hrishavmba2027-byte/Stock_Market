@@ -95,6 +95,9 @@ def run_backtest(
 ) -> Dict[str, Any]:
     settings = settings or get_backtest_settings()
     config = AllocationConfig.from_backtest_settings(settings)
+    from features.entry_gates import GateConfig
+    gate_cfg = (GateConfig.from_backtest_settings(settings)
+                if getattr(settings, "entry_gates_enabled", True) else None)
     start = start or settings.start_date
     end = end or (settings.end_date or None)
 
@@ -106,7 +109,10 @@ def run_backtest(
     log(f"[backtest] {len(universe)} symbol frames built")
 
     days = bt_calendar.trading_days(frames, start, end)
-    sched = bt_calendar.cadence_schedule(days, settings.retrain_interval_days, settings.sentiment_interval_days)
+    # The second cadence is the WEEKLY open-position review (5 trading bars ≈ 1
+    # calendar week): between retrains, only held names are re-underwritten.
+    sched = bt_calendar.cadence_schedule(days, settings.retrain_interval_days,
+                                         getattr(settings, "review_interval_days", 5))
     log(f"[backtest] {len(days)} trading bars in [{start}, {end}]")
 
     try:
@@ -150,21 +156,35 @@ def run_backtest(
         state.apply_fills(fills, bar=C)
         state.pending_orders_prev = []
 
-        # 1b) intraday profit-booking: exit any held name whose LLM target (or
-        # stop) is touched by *this* bar's range, filling same-bar at the level and
-        # holding the freed cash until a fresh suggestion. Strictly PIT — only bar
+        # 1b) intraday exit management (hold-and-trail): a stop touch still sells
+        # same-bar, but a *target* touch now arms/ratchets a trailing stop instead
+        # of banking the profit (finding D: 62% of target exits kept rising), and
+        # positions older than ``max_holding_days`` age out (finding E: the
+        # 16–30d bucket was the only profitable one). Strictly PIT — only bar
         # C's own O/H/L/C is consulted (see backtesting.exits).
         ohlc = data_access.day_ohlc(frames, C)
-        exits = bt_exits.scan_exits(
-            state.positions, state.last_signal, ohlc, honor_stop=settings.honor_stoploss
+        atr_now = _atr_map(frames, C)
+        exits, stop_updates = bt_exits.scan_exits_and_trail(
+            state.positions, state.last_signal, ohlc,
+            honor_stop=settings.honor_stoploss,
+            trail_on_target=settings.trail_on_target,
+            trail_atr_mult=settings.trail_atr_mult,
+            atr_map=atr_now,
+            max_holding_days=settings.max_holding_days,
+            bar=C,
         )
+        for t, upd in stop_updates.items():
+            sig = state.last_signal.get(t)
+            if sig is not None:
+                sig.update(upd)
         state.record_price_monitor(
             bt_exits.monitor_rows(C, state.positions, state.last_signal, ohlc, exits,
-                                  honor_stop=settings.honor_stoploss)
+                                  honor_stop=settings.honor_stoploss,
+                                  stop_updates=stop_updates)
         )
         if exits:
             exit_fills = bt_portfolio.fill_exits(
-                exits, state.positions, atr_map=_atr_map(frames, C),
+                exits, state.positions, atr_map=atr_now,
                 cost_bps=settings.cost_bps_roundtrip, slippage_atr_mult=settings.slippage_atr_mult,
             )
             fill_by_ticker = {f.ticker.upper(): f for f in exit_fills}
@@ -194,24 +214,49 @@ def run_backtest(
             sent = sentiment_store.window_asof(universe, C, settings.sentiment_interval_days,
                                                workbook_path=news_wb, cache_path=sent_cache)
             funds = bt_signals.fundamentals_asof(universe, C, reporting_lag_days=settings.reporting_lag_days)
-            new = bt_signals.run_signals(universe, fc, frames_asof, sent, funds, C, ask=llm_ask)
+            new = bt_signals.run_signals(universe, fc, frames_asof, sent, funds, C, ask=llm_ask,
+                                         positions=_review_payloads(state, C, atr_now, settings),
+                                         gate_config=gate_cfg)
             _merge_signals(state, new, sent, universe)
             bookkeeper.log_suggestions(C, new)
             targets = list(new.keys())
 
         elif events.get("sentiment"):
-            sent = sentiment_store.window_asof(universe, C, settings.sentiment_interval_days,
-                                               workbook_path=news_wb, cache_path=sent_cache)
-            changed = [t for t in universe if sentiment_store.sent_fingerprint(sent, t) != state.last_sentiment_fp.get(t)]
-            if changed:
-                funds = bt_signals.fundamentals_asof(changed, C, reporting_lag_days=settings.reporting_lag_days)
-                new = bt_signals.run_signals(changed, state.last_forecast, frames_asof, sent, funds, C, ask=llm_ask)
-                _merge_signals(state, new, sent, changed)
+            # Weekly open-position review: ONLY held names are re-underwritten
+            # (fresh sentiment + the latest forecasts through the position-review
+            # prompt) so a broken thesis is caught within ~a week instead of
+            # waiting for the next retrain. Fresh entries are decided on retrain
+            # bars alone — no new BUY signals are generated here.
+            held_now = sorted({t.upper() for t, p in state.positions.items()
+                               if float(p.get("qty", 0)) > 0})
+            if held_now:
+                sent = sentiment_store.window_asof(held_now, C, settings.sentiment_interval_days,
+                                                   workbook_path=news_wb, cache_path=sent_cache)
+                funds = bt_signals.fundamentals_asof(held_now, C, reporting_lag_days=settings.reporting_lag_days)
+                new = bt_signals.run_signals(held_now, state.last_forecast, frames_asof, sent, funds, C,
+                                             ask=llm_ask, positions=_review_payloads(state, C, atr_now, settings),
+                                             gate_config=gate_cfg)
+                _merge_signals(state, new, sent, held_now)
                 bookkeeper.log_suggestions(C, new)
                 targets = list(new.keys())
 
         # 2) rebalance: size the BUY set, reconcile to cash-guarded orders.
         if targets:
+            # Time-diversification: at most N NEW names may enter per cycle.
+            # The cap runs on the MERGED signal view so stale BUYs carried from
+            # earlier cycles count too; overflow is demoted to HOLD in place and
+            # re-qualifies when its next (fresh-forecast) BUY signal arrives.
+            from features.entry_gates import apply_entry_cap
+            held_names = {t.upper() for t, p in state.positions.items()
+                          if float(p.get("qty", 0)) > 0}
+            deferred = apply_entry_cap(
+                state.last_signal, held_names,
+                int(getattr(settings, "max_new_positions_per_cycle", 0)),
+                cost_pct=settings.gate_roundtrip_cost_pct,
+            )
+            if deferred:
+                log(f"[backtest] {C.date()} entry cap "
+                    f"({settings.max_new_positions_per_cycle}): deferred {', '.join(deferred)}")
             buy_set, hold_set, avoid_set = _action_sets(state.last_signal)
             closes = data_access.close_asof(frames, C)
             equity = state.equity()
@@ -254,10 +299,61 @@ def run_backtest(
             "metrics": metrics, "bookkeeping": str(settings.bookkeeping_path)}
 
 
+def _review_payloads(state: BacktestState, C, atr_map=None, settings=None) -> Dict[str, Dict[str, Any]]:
+    """Open-position blocks for the LLM position-review prompt.
+
+    ``min_price_to_trail_inr`` is the profit cushion the trade must clear before
+    its stop may be tightened to break-even — ``entry + max(atr_mult*ATR,
+    profit_pct*entry)`` — so a young position keeps its wide entry stop and is
+    not whipsawed out at break-even by normal daily noise.
+    """
+    atr_map = atr_map or {}
+    profit_pct = float(getattr(settings, "trail_arm_profit_pct", 0.02)) if settings else 0.02
+    atr_mult = float(getattr(settings, "trail_arm_atr_mult", 1.0)) if settings else 1.0
+    out: Dict[str, Dict[str, Any]] = {}
+    for t, pos in state.positions.items():
+        qty = float(pos.get("qty", 0.0))
+        if qty <= 0:
+            continue
+        tkr = t.upper()
+        sig = state.last_signal.get(tkr) or {}
+        entry_bar = pos.get("entry_bar")
+        try:
+            days_held = int((pd.Timestamp(C) - pd.Timestamp(entry_bar)).days) if entry_bar else None
+        except Exception:
+            days_held = None
+        entry = float(pos.get("avg_price", 0.0))
+        atr = float(atr_map.get(tkr) or atr_map.get(t) or 0.0)
+        arm_level = entry + max(atr_mult * atr, profit_pct * entry) if entry > 0 else None
+        out[tkr] = {
+            "entry_price_inr": entry,
+            "entry_date": entry_bar,
+            "days_held": days_held,
+            "qty": qty,
+            "current_target": sig.get("sell_price"),
+            "current_stoploss": sig.get("stoploss"),
+            "trail_armed": bool(sig.get("trail_armed")),
+            "current_price_inr": state.mark_prices.get(tkr),
+            "min_price_to_trail_inr": round(arm_level, 4) if arm_level else None,
+            "atr_inr": round(atr, 4) if atr > 0 else None,
+        }
+    return out
+
+
 def _merge_signals(state: BacktestState, new: Dict[str, Dict[str, Any]], sent, tickers) -> None:
     for t, sig in new.items():
         if "error" in sig:
             continue
+        prev = state.last_signal.get(t.upper()) or {}
+        # A review HOLD keeps the trail armed and never loosens the stop.
+        if prev.get("trail_armed") and str(sig.get("action", "")).upper() == "HOLD":
+            sig["trail_armed"] = True
+            prev_stop, new_stop = prev.get("stoploss"), sig.get("stoploss")
+            try:
+                if prev_stop is not None and (new_stop is None or float(new_stop) < float(prev_stop)):
+                    sig["stoploss"] = prev_stop
+            except (TypeError, ValueError):
+                sig["stoploss"] = prev_stop
         state.last_signal[t.upper()] = sig
         state.signal_log.append({
             "bar": sig.get("as_of_date"), "ticker": t.upper(), "action": sig.get("action"),

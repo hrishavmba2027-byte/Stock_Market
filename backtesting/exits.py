@@ -101,6 +101,105 @@ def scan_exits(
     return exits
 
 
+def scan_exits_and_trail(
+    positions: Dict[str, Dict[str, float]],
+    last_signal: Dict[str, Dict[str, Any]],
+    ohlc: Dict[str, Dict[str, float]],
+    *,
+    honor_stop: bool = True,
+    trail_on_target: bool = True,
+    trail_atr_mult: float = 2.0,
+    atr_map: Optional[Dict[str, float]] = None,
+    max_holding_days: int = 0,
+    bar: Any = None,
+) -> "tuple[List[ExitSignal], Dict[str, Dict[str, Any]]]":
+    """Hold-and-trail exit scan (trade-quality findings D/E).
+
+    Differences from :func:`scan_exits` (which keeps the legacy sell-at-target
+    behaviour):
+
+    * **Target touch does not sell.** It *arms a trailing stop*: the standing
+      stop ratchets to ``max(previous stop, close − trail_atr_mult*ATR14,
+      entry price)`` and the position stays open. 62% of the historical
+      target-exits kept rising ≥2% within 15 sessions (median further peak
+      +3.31%); trailing captured +₹537k the auto-sell gave up.
+    * **Armed positions re-ratchet every bar** (stop only ever moves up), so a
+      runner is followed until the trail is hit or the LLM verdict changes.
+    * **Age exit**: when ``max_holding_days`` > 0, a position older than that
+      (calendar days from its entry bar) is closed at the bar close — the
+      16–30-day bucket was the only profitable one; beyond it the sample says
+      nothing, so age out and let a fresh suggestion re-enter if warranted.
+    * Stop exits are unchanged, and the same-bar stop+target ambiguity still
+      resolves pessimistically to the stop.
+
+    Returns ``(exits, stop_updates)`` where ``stop_updates`` maps ticker →
+    ``{"stoploss": new_stop, "trail_armed": True}`` for the caller to fold into
+    its standing signals (the backtest mutates ``state.last_signal``; production
+    writes the ratchet back to the suggestions store).
+    """
+    exits: List[ExitSignal] = []
+    updates: Dict[str, Dict[str, Any]] = {}
+    atr_map = atr_map or {}
+    for ticker, pos in positions.items():
+        if float(pos.get("qty", 0.0)) <= 0:
+            continue
+        tkr = ticker.upper()
+        sig = last_signal.get(tkr) or last_signal.get(ticker) or {}
+        target = _num(sig.get("sell_price"))
+        stop = _num(sig.get("stoploss")) if honor_stop else None
+        armed = bool(sig.get("trail_armed"))
+        bar_px = ohlc.get(tkr) or ohlc.get(ticker)
+        if not bar_px:
+            continue
+        o = _num(bar_px.get("open"))
+        hi = _num(bar_px.get("high"))
+        lo = _num(bar_px.get("low"))
+        close = _num(bar_px.get("close"))
+        if hi is None or lo is None:
+            continue
+
+        hit_stop = stop is not None and lo <= stop
+        hit_target = (not armed) and target is not None and hi >= target
+
+        if hit_stop:
+            # Stop always wins the same-bar ambiguity (pessimistic).
+            fill = stop if (o is None or o >= stop) else o
+            exits.append(ExitSignal(tkr, "stop", fill, target, stop, hi, lo, o))
+            continue
+
+        atr = _num(atr_map.get(tkr) or atr_map.get(ticker))
+        entry = _num(pos.get("avg_price"))
+
+        if hit_target and not trail_on_target:
+            fill = target if (o is None or o <= target) else o
+            exits.append(ExitSignal(tkr, "target", fill, target, stop, hi, lo, o))
+            continue
+
+        # Age exit (checked only when nothing else fired this bar).
+        if max_holding_days > 0 and bar is not None and pos.get("entry_bar"):
+            try:
+                from pandas import Timestamp
+                age = (Timestamp(bar) - Timestamp(pos["entry_bar"])).days
+            except Exception:
+                age = -1
+            if age > max_holding_days and close is not None:
+                exits.append(ExitSignal(tkr, "max_age", close, target, stop, hi, lo, o))
+                continue
+
+        # Trail arming / ratchet — stop only ever moves UP.
+        if trail_on_target and close is not None and atr is not None:
+            if hit_target or armed:
+                candidates = [close - trail_atr_mult * atr]
+                if stop is not None:
+                    candidates.append(stop)
+                if hit_target and entry is not None:
+                    candidates.append(entry)     # break-even floor on first arm
+                new_stop = max(c for c in candidates if c is not None and c > 0)
+                if stop is None or new_stop > stop + 1e-9 or (hit_target and not armed):
+                    updates[tkr] = {"stoploss": round(new_stop, 4), "trail_armed": True}
+    return exits, updates
+
+
 def monitor_rows(
     bar: Any,
     positions: Dict[str, Dict[str, float]],
@@ -109,9 +208,11 @@ def monitor_rows(
     exits: List[ExitSignal],
     *,
     honor_stop: bool = True,
+    stop_updates: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Audit rows for the ``Price_Monitor`` sheet: the daily price check that drives
-    profit-booking, one row per held name that carries an active target/stop."""
+    profit-booking, one row per held name that carries an active target/stop.
+    A trailing-stop ratchet this bar shows as ``hit="trail↑"`` with the new stop."""
     from pandas import Timestamp
 
     try:
@@ -131,6 +232,8 @@ def monitor_rows(
             continue
         bar_px = ohlc.get(tkr) or ohlc.get(ticker) or {}
         ex = fired.get(tkr)
+        upd = (stop_updates or {}).get(tkr)
+        hit = ex.reason if ex else ("trail↑" if upd else "")
         rows.append({
             "bar": b,
             "ticker": tkr,
@@ -139,8 +242,8 @@ def monitor_rows(
             "low": bar_px.get("low"),
             "close": bar_px.get("close"),
             "target": target,
-            "stoploss": stop,
-            "hit": ex.reason if ex else "",
+            "stoploss": upd["stoploss"] if upd else stop,
+            "hit": hit,
             "exit_price": round(ex.price, 4) if ex else None,
         })
     return rows

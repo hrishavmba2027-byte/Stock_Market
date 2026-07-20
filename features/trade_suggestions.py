@@ -38,8 +38,10 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
 import requests
 
 from ingestion._firestore import init_firestore_client
@@ -77,8 +79,12 @@ SUGGESTION_SCHEMA_VERSION = 3
 
 GENERAL_ENTITY = "GENERAL"
 
-FORECAST_COLS = [f"Forecast_Close_T+{h}" for h in range(1, 16)]
-RECENT_CLOSES = 5           # trailing closes given to the LLM as context
+# Forecast columns read from the sheet — sized by FORECAST_DAYS (default 30);
+# columns absent on the sheet are simply skipped by the loader.
+FORECAST_DAYS_CONTEXT = int(os.environ.get("FORECAST_DAYS", "30") or 30)
+FORECAST_COLS = [f"Forecast_Close_T+{h}" for h in range(1, FORECAST_DAYS_CONTEXT + 1)]
+RECENT_CLOSES = 20          # trailing closes given to the LLM (>=16 so the ~15-day
+                            # momentum gate is judgeable from the payload)
 BATCH_GET_CHUNK = 20        # worksheets per Sheets values_batch_get call
 LLM_TIMEOUT_SECONDS = 240
 LLM_RETRIES = 5
@@ -99,29 +105,100 @@ def _throttle() -> None:
         time.sleep(wait)
 
 SYSTEM_PROMPT = (
-    "You are a disciplined equity trading assistant for NSE (India) stocks. "
-    "You are given a stock's recent closing prices, a model-generated 15-day "
+    "You are a senior equity swing-trading analyst for NSE (India) stocks. You think "
+    "like a portfolio manager: capital preservation first, asymmetric reward second, "
+    "activity last. You are given recent daily closes, a model-generated multi-day "
     "forecast path of closing prices, (when available) news sentiment split into "
-    "three buckets — the company's own, its SECTOR's, and GENERAL market — and "
-    "(when available) recent quarterly fundamentals (revenue, margins, ROE, "
-    "leverage, cash flow across the last few quarters). Weigh all of these: the "
-    "forecast path drives timing/price levels; company sentiment matters most, "
-    "then its sector, then general market tone; fundamentals adjust conviction — "
-    "deteriorating fundamentals or negative company/sector sentiment should lower "
-    "confidence or push toward HOLD/AVOID even on a favourable forecast. "
-    "Respond with a single JSON object and nothing else, using "
-    "exactly these keys:\n"
+    "company / SECTOR / GENERAL buckets, and (when available) recent quarterly "
+    "fundamentals.\n"
+    "Evaluate a BUY strictly through these gates, in order. If ANY gate fails, output "
+    "HOLD or AVOID. Outputting zero BUYs across all stocks is often the correct answer.\n"
+    "GATE 1 — TREND AGREEMENT (required): the price must be ABOVE its close ~15 trading "
+    "days ago AND the forecast path must end above the current price. One without the "
+    "other is a rejected trade: a bullish forecast on a falling stock is catching a "
+    "knife; a rising stock with a bearish forecast has no thesis.\n"
+    "GATE 2 — HEALTHY ENTRY (required): momentum should look orderly, not climactic. "
+    "Never buy an 'oversold bargain' (a steep multi-day slide) and never buy a huge "
+    "volume/price spike day — those are distribution days, not accumulation.\n"
+    "GATE 3 — SURVIVABLE STOP (required): stoploss below recent swing support AND at "
+    "least 2x the typical daily move below entry. A stop inside one daily range is "
+    "noise-harvesting, not protection.\n"
+    "GATE 4 — PAID FOR THE RISK (required): assume 0.9% round-trip cost. Require "
+    "(sell_price - buy_price - 0.9% of entry) >= 1.5 x (buy_price - stoploss + 0.9% of "
+    "entry).\n"
+    "GATE 5 — NO CHASING (required): buy_price within 3% of the latest close.\n"
+    "A negative forecast path is NEVER rescued by sentiment or your own conviction — "
+    "historical evidence shows high-confidence buys against the forecast lose the most.\n"
+    "CONFIDENCE is computed, not felt. Start at 0.5, then: +0.1 if the ~15-day price "
+    "change is above +3%; +0.1 if the forecast path rises steadily rather than spiking "
+    "early; +0.05 if company AND sector sentiment are both positive; +0.05 if "
+    "fundamentals improved last quarter; -0.1 if any sentiment bucket is clearly "
+    "negative; -0.1 if the stock's daily swings look unusually wide. Show the "
+    "arithmetic in the rationale. Only output BUY when the computed confidence is "
+    ">= 0.6.\n"
+    "Respond with a single JSON object and nothing else, using exactly these keys:\n"
     '  "action": "BUY" | "HOLD" | "AVOID",\n'
     '  "buy_price": number or null (suggested entry, INR),\n'
     '  "sell_day": string (e.g. "T+7") or null,\n'
     '  "sell_price": number or null (target exit, INR),\n'
     '  "stoploss": number (protective stop, INR),\n'
+    '  "confidence": number between 0 and 1 (computed via the rubric),\n'
+    '  "rationale": string (cite each gate pass/fail with its number, then the '
+    "confidence arithmetic)."
+)
+
+POSITION_REVIEW_PROMPT = (
+    "You are the exit manager for an open NSE swing position. Your job is to let "
+    "winners run and cut broken theses — never to bank a small profit reflexively, "
+    "and never to choke a young trade with a premature break-even stop. You are "
+    "given the position (entry price/date, days held, current target and stop), the "
+    "current price, a ``min_price_to_trail_inr`` level (the price the trade must "
+    "clear before its stop may be tightened toward break-even), the LATEST multi-day "
+    "forecast path (refreshed since entry), recent closes, and updated "
+    "company/sector sentiment.\n"
+    "Decide the case FIRST:\n"
+    "CASE 0 — EARLY / NOT YET IN PROFIT: the target has NOT been reached and the "
+    "current price is at or below ``min_price_to_trail_inr`` (typically the first "
+    "~15 days, before the trade has proven itself). Do NOT trail. Output HOLD and "
+    "set new_stoploss EQUAL to the current stop — keep the original wide protective "
+    "stop from entry so normal daily noise cannot shake the trade out at break-even. "
+    "Only EXIT here if the refreshed forecast has turned clearly negative or a "
+    "hard adverse event has occurred.\n"
+    "CASE A — IN PROFIT (target reached, or price has cleared "
+    "``min_price_to_trail_inr``): do not sell by default. Re-underwrite: if the "
+    "refreshed forecast still ends above the current price AND ~15-day momentum is "
+    "still positive, RAISE the target toward the new forecast peak and TRAIL the "
+    "stop to max(previous stop, current price - 2x the typical daily move, entry "
+    "price). Sell only if the refreshed forecast is now flat/negative, momentum has "
+    "turned, or the tape shows heavy selling.\n"
+    "CASE B — the original entry thesis is stale (held well past the entry "
+    "forecast's horizon): a fresh thesis must be written from the NEWEST forecast. "
+    "If it ends above the current price, set a new target and sell_day from it and "
+    "keep the trailed stop. If it does not: for a position in LOSS, EXIT — an "
+    "expired thesis is not a reason to hold, and hope is not a factor; for a "
+    "position in PROFIT, prefer HOLD with the stop tightened to about one typical "
+    "daily move below the current price — let the market take you out at a good "
+    "price instead of selling a winner at market.\n"
+    "ALWAYS: the stop only ratchets up, never down; a stop is raised to break-even "
+    "or higher ONLY when the trade has cleared ``min_price_to_trail_inr`` (CASE A/B) "
+    "— never in CASE 0. Negative refreshed forecasts are never overridden by "
+    "sentiment or conviction. Every review must name the number that kept the "
+    "position open.\n"
+    "PROFIT PROTECTION (overriding rule): you never EXIT a profitable position "
+    "merely to bank the gain, because it feels extended, or because it has been "
+    "held a long time — time held is NEVER a reason to exit. The only ways a "
+    "winner closes are its stop being hit or a genuinely broken thesis (refreshed "
+    "forecast ending below the current price, momentum turned negative, or hard "
+    "adverse news). When you do want off a winner, say HOLD and RAISE the stop — "
+    "capture the profit with the ratchet, not a market sell.\n"
+    "Respond with a single JSON object and nothing else, using exactly these keys:\n"
+    '  "decision": "HOLD_AND_RAISE" | "HOLD" | "EXIT",\n'
+    '  "new_target": number or null (INR),\n'
+    '  "new_stoploss": number (INR, must be >= the previous stop),\n'
+    '  "sell_day": string (e.g. "T+10") or null,\n'
     '  "confidence": number between 0 and 1,\n'
-    '  "rationale": string (2-3 sentences, mention forecast trend, expected '
-    "return vs risk, and sentiment if available).\n"
-    "Be conservative: recommend BUY only when the forecast path shows a "
-    "clear favourable risk/reward; place the stop-loss below recent support "
-    "or ~2-4% under entry, whichever is tighter."
+    '  "rationale": string (name the case 0/A/B, then cite forecast end vs price, '
+    "momentum, and the stop arithmetic)."
 )
 
 
@@ -356,18 +433,26 @@ def ask_glm(ticker: str, market: Dict[str, Any], sentiment: Optional[Dict[str, A
         news_sentiment: Any = sentiment if _has_sentiment(sentiment) else "unavailable"
     else:
         news_sentiment = sentiment or "unavailable"
-    user_prompt = json.dumps(
-        {
-            "ticker": ticker,
-            "as_of_date": market.get("date"),
-            "last_close_inr": market.get("close"),
-            f"previous_{RECENT_CLOSES}_closes": market.get("recent_closes"),
-            "forecast_path_inr": market.get("forecast"),
-            "news_sentiment": news_sentiment,
-            "fundamentals": fundamentals or "unavailable",
-        },
-        default=str,
-    )
+    # A ``position`` block in the market payload switches the call into
+    # position-review mode: the exit-manager prompt re-underwrites an OPEN
+    # holding (hold-and-trail / raise target / exit) instead of proposing a
+    # fresh entry. The reply is translated back into the standard suggestion
+    # shape so every downstream consumer stays unchanged.
+    position = market.get("position") if isinstance(market, dict) else None
+    review_mode = bool(position)
+    payload = {
+        "ticker": ticker,
+        "as_of_date": market.get("date"),
+        "last_close_inr": market.get("close"),
+        f"previous_{RECENT_CLOSES}_closes": market.get("recent_closes"),
+        "forecast_path_inr": market.get("forecast"),
+        "news_sentiment": news_sentiment,
+        "fundamentals": fundamentals or "unavailable",
+    }
+    if review_mode:
+        payload["open_position"] = position
+    user_prompt = json.dumps(payload, default=str)
+    system_prompt = POSITION_REVIEW_PROMPT if review_mode else SYSTEM_PROMPT
     last_exc: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
@@ -379,7 +464,7 @@ def ask_glm(ticker: str, market: Dict[str, Any], sentiment: Optional[Dict[str, A
                     "model": model,
                     "temperature": 0.2,
                     "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
                 },
@@ -394,6 +479,8 @@ def ask_glm(ticker: str, market: Dict[str, Any], sentiment: Optional[Dict[str, A
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]
             suggestion = _extract_json(content)
+            if review_mode:
+                return _translate_review(suggestion, position)
             if suggestion.get("action") not in ("BUY", "HOLD", "AVOID"):
                 raise ValueError(f"invalid action: {suggestion.get('action')!r}")
             # A BUY must carry the exit plan the trading layer relies on: a target
@@ -413,6 +500,186 @@ def ask_glm(ticker: str, market: Dict[str, Any], sentiment: Optional[Dict[str, A
     raise RuntimeError(f"GLM call failed after {retries} attempts: {last_exc}")
 
 
+def _translate_review(review: Dict[str, Any], position: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a position-review reply onto the standard suggestion shape.
+
+    EXIT → AVOID (the reconciler liquidates); HOLD / HOLD_AND_RAISE → HOLD with
+    the (possibly raised) target and the ratcheted stop. The stop can only move
+    UP: whatever the model returns is floored at the previous stop so a review
+    can never loosen protection.
+
+    **Winner-protection guard.** An EXIT verdict on a position that is
+    meaningfully in profit (trail armed, or price above the arm level) is NOT
+    executed as a market sell — it is converted into a tight trailing stop
+    (``REVIEW_EXIT_TIGHTEN_ATR_MULT`` × ATR, default 1.0, below the market;
+    never below entry or the previous stop). The ratchet then books the profit
+    if the move is over, or the position keeps running if it isn't. Only
+    losing/flat positions exit directly on the verdict.
+
+    **Profit-cushion guard.** A stop may only be raised to break-even (the entry
+    price) or above once the position is genuinely in profit — otherwise a review
+    one day after entry ratchets the stop to break-even and a normal intraday
+    wick knocks the trade out flat (the ULTRACEMCO 2021-02 whipsaw). "In profit"
+    means either the trail is already armed (target was hit) or the current price
+    has cleared ``min_price_to_trail_inr`` — an arm level the caller computes as
+    ``entry + max(atr_mult*ATR, profit_pct*entry)``. If the caller doesn't supply
+    one, a ``TRAIL_ARM_PROFIT_PCT`` (default 2%) cushion over entry is used. When
+    the cushion is not met, a break-even-or-higher stop is clamped back to the
+    original protective stop — the wide stop from entry stays in force.
+    """
+    decision = str(review.get("decision", "")).upper()
+    if decision not in ("HOLD_AND_RAISE", "HOLD", "EXIT"):
+        raise ValueError(f"invalid review decision: {review.get('decision')!r}")
+    prev_stop = _positive_number(position.get("current_stoploss"))
+    new_stop = _positive_number(review.get("new_stoploss"))
+    stop = max(x for x in (prev_stop, new_stop) if x is not None) if (prev_stop or new_stop) else None
+
+    entry = _positive_number(position.get("entry_price_inr"))
+    current = _positive_number(position.get("current_price_inr"))
+    armed = bool(position.get("trail_armed"))
+    arm_level = _positive_number(position.get("min_price_to_trail_inr"))
+    if arm_level is None and entry is not None:
+        pct = float(os.getenv("TRAIL_ARM_PROFIT_PCT", "0.02") or 0.02)
+        arm_level = entry * (1.0 + pct)
+    # "Meaningfully in profit" = the trail is already armed (target was hit) or
+    # the price has cleared the profit-cushion arm level.
+    in_profit = armed or (current is not None and arm_level is not None and current >= arm_level)
+
+    guard_note = ""
+    if decision != "EXIT" and stop is not None:
+        # Only clamp a raise that reaches break-even or above; below-entry
+        # tightenings (still protective, no whipsaw risk) always pass through.
+        if entry is not None and stop >= entry - 1e-9 and not in_profit:
+            stop = prev_stop
+            guard_note = (" [stop held at entry-stop: not yet +cushion in profit"
+                          f" (price {current}, arm ≥ {round(arm_level, 2) if arm_level else '?'})]")
+
+    if decision == "EXIT":
+        # Winner-protection guard: a review may not market-sell a position that
+        # is meaningfully in profit. The EXIT is converted into a tight trailing
+        # stop (~1 ATR below the market, never below entry or the previous
+        # stop) so at worst ~one daily move of the gain is given back while a
+        # continuation stays open — the ratchet, not the review, books the
+        # profit. Losing/flat positions exit as instructed (thesis broken).
+        if in_profit and current is not None:
+            atr = _positive_number(position.get("atr_inr"))
+            mult = float(os.getenv("REVIEW_EXIT_TIGHTEN_ATR_MULT", "1.0") or 1.0)
+            dist = mult * atr if atr else 0.015 * current
+            tight = max(x for x in (prev_stop, entry, current - dist) if x is not None)
+            tight = min(tight, current * 0.995)          # keep the stop below the market
+            if prev_stop is not None:
+                tight = max(tight, prev_stop)
+            target = _positive_number(position.get("current_target"))
+            return {
+                "action": "HOLD", "buy_price": None,
+                "sell_day": review.get("sell_day"),
+                "sell_price": target, "stoploss": round(tight, 2),
+                "confidence": review.get("confidence"),
+                "trail_armed": True,
+                "rationale": (f"[position review: EXIT on a profitable position → converted to "
+                              f"tight trail @ {round(tight, 2)}; the ratchet books the profit, "
+                              f"not a market sell] {review.get('rationale', '')}").strip(),
+                "review_decision": "EXIT_TO_TRAIL",
+            }
+        return {
+            "action": "AVOID", "buy_price": None, "sell_day": None,
+            "sell_price": None, "stoploss": stop,
+            "confidence": review.get("confidence"),
+            "rationale": f"[position review: EXIT] {review.get('rationale', '')}".strip(),
+            "review_decision": decision,
+        }
+    target = _positive_number(review.get("new_target"))
+    if target is None:
+        target = _positive_number(position.get("current_target"))
+    return {
+        "action": "HOLD", "buy_price": None,
+        "sell_day": review.get("sell_day"),
+        "sell_price": target, "stoploss": stop,
+        "confidence": review.get("confidence"),
+        "trail_armed": armed or None,
+        "rationale": (f"[position review: {decision}] {review.get('rationale', '')}"
+                      + guard_note).strip(),
+        "review_decision": decision,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Held-position review support (weekly cadence, production)
+# ---------------------------------------------------------------------------
+
+def _load_held_positions(state_path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Currently-held tickers → their ``{qty, avg_price, entry_date?}`` position.
+
+    Reads the same manually-maintained holdings book the daily exit monitor
+    uses (``state/portfolio_holdings.json``). ``entry_date`` is an optional
+    field the user may add to a position for day-count context in the review;
+    its absence only disables the day-count framing, not the review itself.
+    """
+    from features.portfolio_allocation import DEFAULT_HOLDINGS_STATE, Holdings
+    path = Path(state_path) if state_path else DEFAULT_HOLDINGS_STATE
+    if not Path(path).exists():
+        return {}
+    holdings = Holdings.load(Path(path), capital=1.0)
+    return {t.upper(): p for t, p in holdings.positions.items() if float(p.get("qty", 0)) > 0}
+
+
+def _load_suggestion_docs(client: Any, tickers: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Full stored ``trade_suggestions`` docs for ``tickers`` (target/stop/trail_armed)."""
+    out: Dict[str, Dict[str, Any]] = {}
+    wanted = {t.upper() for t in tickers}
+    for t in wanted:
+        try:
+            snap = client.collection(SUGGESTIONS_COLLECTION).document(t).get()
+        except Exception:  # noqa: BLE001
+            continue
+        if snap.exists:
+            out[t] = snap.to_dict() or {}
+    return out
+
+
+def _position_payload(
+    ticker: str,
+    pos: Dict[str, Any],
+    market: Dict[str, Any],
+    current_doc: Dict[str, Any],
+    gate_cfg: Any,
+) -> Dict[str, Any]:
+    """Build the ``market["position"]`` block for a held ticker's weekly review.
+
+    Mirrors ``backtesting.walk_forward._review_payloads``: same profit-cushion
+    arm level (``entry + max(atr_mult*ATR, profit_pct*entry)``), ATR estimated
+    from the closes-only fallback (production sheets carry no OHLC).
+    """
+    from features.entry_gates import compute_entry_features
+    entry = float(pos.get("avg_price", 0.0) or 0.0)
+    entry_date = pos.get("entry_date")
+    days_held = None
+    if entry_date:
+        try:
+            days_held = (pd.Timestamp(market.get("date")) - pd.Timestamp(entry_date)).days
+        except Exception:  # noqa: BLE001
+            days_held = None
+    close = market.get("close")
+    feats = compute_entry_features(market.get("recent_closes") or [], lookback=gate_cfg.momentum_lookback_days)
+    atr_pct = feats.get("atr_pct")
+    atr = (atr_pct * close) if (atr_pct and close) else None
+    profit_pct = float(os.getenv("TRAIL_ARM_PROFIT_PCT", "0.02") or 0.02)
+    atr_mult = float(os.getenv("TRAIL_ARM_ATR_MULT", "1.0") or 1.0)
+    arm_level = entry + max(atr_mult * (atr or 0.0), profit_pct * entry) if entry > 0 else None
+    return {
+        "entry_price_inr": entry,
+        "entry_date": entry_date,
+        "days_held": days_held,
+        "qty": float(pos.get("qty", 0.0) or 0.0),
+        "current_target": current_doc.get("sell_price"),
+        "current_stoploss": current_doc.get("stoploss"),
+        "trail_armed": bool(current_doc.get("trail_armed")),
+        "current_price_inr": close,
+        "min_price_to_trail_inr": round(arm_level, 4) if arm_level else None,
+        "atr_inr": round(atr, 4) if atr else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -429,6 +696,13 @@ def run(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     parser.add_argument("--limit", type=int, default=None, help="Cap number of stocks sent to the LLM this run.")
     parser.add_argument("--force", action="store_true", help="Re-generate even when inputs are unchanged.")
     parser.add_argument("--dry-run", action="store_true", help="Print suggestions without writing Firestore.")
+    parser.add_argument("--held-only", action="store_true",
+                        help="Weekly open-position review: re-underwrite only currently-held "
+                             "tickers via the position-review prompt (hold-and-trail / raise "
+                             "target / exit). No fresh BUY entries are considered. Intended "
+                             "cadence: ~weekly, between the full retrain cycles.")
+    parser.add_argument("--holdings-state", default=None,
+                        help="Path to portfolio_holdings.json (default: state/portfolio_holdings.json).")
     args = parser.parse_args(argv)
 
     api_key = os.environ.get("GLM_API_KEY")
@@ -436,34 +710,74 @@ def run(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         _log("[suggest] GLM_API_KEY is not set — aborting")
         return {"error": "GLM_API_KEY not set"}
 
-    tickers = [t.strip() for t in args.tickers.split(",")] if args.tickers else None
-    _log(f"[suggest] loading forecasts from sheet {args.sheet_id} …")
-    forecasts = load_forecasts(args.sheet_id, tickers)
-    _log(f"[suggest] {len(forecasts)} worksheets with a usable forecast path")
+    from features.entry_gates import GateConfig, apply_entry_cap, apply_entry_gates, compute_entry_features
+    gate_cfg = GateConfig.from_env()
 
+    tickers = [t.strip() for t in args.tickers.split(",")] if args.tickers else None
     fs = init_firestore_client()
     sentiment = load_sentiment(fs)
     fundamentals = load_fundamentals(fs)
     _log(f"[suggest] loaded fundamentals for {len(fundamentals)} tickers")
-    existing = {} if args.force else load_existing_fingerprints(fs)
 
-    todo: List[Tuple[str, Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]], str]] = []
-    skipped_unchanged = 0
-    for ticker in sorted(forecasts):
-        market = forecasts[ticker]
-        snap = sentiment_context_for(ticker, sentiment)
-        fund = fundamentals.get(ticker.upper())
-        fp = fingerprint({"market": market, "sentiment": snap, "fundamentals": fund})
-        if existing.get(ticker) == fp:
-            skipped_unchanged += 1
-            continue
-        todo.append((ticker, market, snap, fund, fp))
-    if args.limit is not None:
-        todo = todo[: args.limit]
-    _log(f"[suggest] {len(todo)} stocks need suggestions "
-         f"({skipped_unchanged} unchanged, skipped)")
+    held = _load_held_positions(args.holdings_state)
+    if tickers:
+        wanted = {t.upper() for t in tickers}
+        held = {t: p for t, p in held.items() if t in wanted}
 
-    written = failed = 0
+    if args.held_only:
+        if not held:
+            _log("[suggest] --held-only: no open positions — nothing to review")
+            summary = {"suggested": 0, "skipped_unchanged": 0, "failed": 0,
+                       "collection": SUGGESTIONS_COLLECTION, "dry_run": args.dry_run, "mode": "held_only"}
+            print(json.dumps(summary))
+            return summary
+        _log(f"[suggest] --held-only weekly review: {len(held)} open position(s)")
+        forecasts = load_forecasts(args.sheet_id, list(held))
+        current_docs = _load_suggestion_docs(fs, list(held))
+        todo = []
+        for ticker in sorted(held):
+            market = forecasts.get(ticker)
+            if not market:
+                _log(f"[suggest] {ticker}: no forecast available — review skipped")
+                continue
+            pos = held[ticker]
+            cur = current_docs.get(ticker, {})
+            market = dict(market)
+            market["position"] = _position_payload(ticker, pos, market, cur, gate_cfg)
+            snap = sentiment_context_for(ticker, sentiment)
+            fund = fundamentals.get(ticker.upper())
+            fp = fingerprint({"market": market, "sentiment": snap, "fundamentals": fund})
+            todo.append((ticker, market, snap, fund, fp))
+        skipped_unchanged = 0
+    else:
+        _log(f"[suggest] loading forecasts from sheet {args.sheet_id} …")
+        forecasts = load_forecasts(args.sheet_id, tickers)
+        _log(f"[suggest] {len(forecasts)} worksheets with a usable forecast path")
+        existing = {} if args.force else load_existing_fingerprints(fs)
+
+        todo = []
+        skipped_unchanged = 0
+        for ticker in sorted(forecasts):
+            market = forecasts[ticker]
+            snap = sentiment_context_for(ticker, sentiment)
+            fund = fundamentals.get(ticker.upper())
+            fp = fingerprint({"market": market, "sentiment": snap, "fundamentals": fund})
+            # A held name is never fingerprint-skipped here either — its fresh
+            # entry decision doesn't apply since it's already a position, but we
+            # still want the LLM to see it if it re-appears as a BUY candidate
+            # after being fully exited (fp naturally changes once flat).
+            if ticker.upper() not in held and existing.get(ticker) == fp:
+                skipped_unchanged += 1
+                continue
+            todo.append((ticker, market, snap, fund, fp))
+        if args.limit is not None:
+            todo = todo[: args.limit]
+        _log(f"[suggest] {len(todo)} stocks need suggestions "
+             f"({skipped_unchanged} unchanged, skipped)")
+
+    results: Dict[str, Dict[str, Any]] = {}
+    meta: Dict[str, Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]], str]] = {}
+    failed = 0
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
         futures = {
             pool.submit(ask_glm, ticker, market, snap, args.model, api_key, fund):
@@ -478,34 +792,68 @@ def run(argv: Optional[List[str]] = None) -> Dict[str, Any]:
                 failed += 1
                 _log(f"[suggest] {ticker}: FAILED — {exc}")
                 continue
-            doc = {
-                "ticker": ticker,
-                "schema_version": SUGGESTION_SCHEMA_VERSION,
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-                "model": args.model,
-                "as_of_date": market.get("date"),
-                "last_close_inr": market.get("close"),
-                "sentiment_used": _has_sentiment(snap),
-                "fundamentals_used": bool(fund),
-                "input_fingerprint": fp,
-                **{k: suggestion.get(k) for k in
-                   ("action", "buy_price", "sell_day", "sell_price",
-                    "stoploss", "confidence", "rationale")},
-            }
-            if args.dry_run:
-                _log(f"[suggest] {ticker} (dry-run): {json.dumps(doc, default=str)}")
-            else:
-                fs.collection(SUGGESTIONS_COLLECTION).document(ticker).set(doc)
-                _log(f"[suggest] {ticker}: {doc['action']} "
-                     f"(sell {doc.get('sell_day')}, stop {doc.get('stoploss')}) — stored")
-            written += 1
+            # Deterministic entry gates (trade-quality findings): the prompt asks
+            # for the rules, this enforces them. Production payloads carry closes
+            # only, so volume-dependent gates skip automatically. Review replies
+            # are never BUY, so apply_entry_gates passes them through untouched.
+            try:
+                feats = compute_entry_features(
+                    market.get("recent_closes") or [],
+                    lookback=gate_cfg.momentum_lookback_days,
+                )
+                gated = apply_entry_gates(
+                    suggestion, feats, market.get("forecast"), market.get("close"), gate_cfg,
+                )
+                if gated.get("gate_reasons"):
+                    _log(f"[suggest] {ticker}: BUY downgraded by entry gates — "
+                         + "; ".join(gated["gate_reasons"]))
+                suggestion = gated
+            except Exception as exc:  # noqa: BLE001 — gates must never kill the run
+                _log(f"[suggest] {ticker}: entry gates skipped ({exc})")
+            results[ticker] = suggestion
+            meta[ticker] = (market, snap, fund, fp)
+
+    # Time-diversification: cap fresh BUYs (never applies in --held-only mode,
+    # where nothing is a BUY) at MAX_NEW_POSITIONS_PER_CYCLE per run. Overflow
+    # is demoted to HOLD in place and re-qualifies on the next suggestions run.
+    max_new = int(os.getenv("MAX_NEW_POSITIONS_PER_CYCLE", "3") or 0)
+    deferred = apply_entry_cap(results, held.keys(), max_new, cost_pct=gate_cfg.roundtrip_cost_pct)
+    if deferred:
+        _log(f"[suggest] entry cap ({max_new}): deferred {', '.join(deferred)}")
+
+    written = 0
+    for ticker, suggestion in results.items():
+        market, snap, fund, fp = meta[ticker]
+        doc = {
+            "ticker": ticker,
+            "schema_version": SUGGESTION_SCHEMA_VERSION,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "model": args.model,
+            "as_of_date": market.get("date"),
+            "last_close_inr": market.get("close"),
+            "sentiment_used": _has_sentiment(snap),
+            "fundamentals_used": bool(fund),
+            "input_fingerprint": fp,
+            **{k: suggestion.get(k) for k in
+               ("action", "buy_price", "sell_day", "sell_price",
+                "stoploss", "confidence", "rationale", "trail_armed", "review_decision")},
+        }
+        if args.dry_run:
+            _log(f"[suggest] {ticker} (dry-run): {json.dumps(doc, default=str)}")
+        else:
+            fs.collection(SUGGESTIONS_COLLECTION).document(ticker).set(doc, merge=True)
+            _log(f"[suggest] {ticker}: {doc['action']} "
+                 f"(sell {doc.get('sell_day')}, stop {doc.get('stoploss')}) — stored")
+        written += 1
 
     summary = {
         "suggested": written,
         "skipped_unchanged": skipped_unchanged,
         "failed": failed,
+        "deferred_entry_cap": deferred,
         "collection": SUGGESTIONS_COLLECTION,
         "dry_run": args.dry_run,
+        "mode": "held_only" if args.held_only else "full",
     }
     print(json.dumps(summary))
     return summary

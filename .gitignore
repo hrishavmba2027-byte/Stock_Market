@@ -34,6 +34,8 @@ outputs/*
 !outputs/pipeline_metadata.json
 state/*
 
+Data/archive/nse_stock_data_train_filled.xlsx
+
 
 # ---------------------------------------------------------------------------
 # Python: bytecode, build, packaging

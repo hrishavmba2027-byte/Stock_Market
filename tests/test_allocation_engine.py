@@ -9,6 +9,7 @@ from allocation.engine import (
     BuyMeta,
     PositionView,
     deployment_fraction,
+    apply_min_weight_floor,
     max_sharpe_weights,
     optimize_weights,
     per_name_caps,
@@ -115,6 +116,41 @@ def test_optimize_weights_keeps_cash_reserve():
 
 
 # --------------------------------------------------------------------------
+# Minimum-weight floor: sub-threshold allocations are dropped to 0
+# --------------------------------------------------------------------------
+def test_apply_min_weight_floor_zeros_below_threshold():
+    w = apply_min_weight_floor([0.30, 0.04, 0.0499, 0.05, 0.20], 0.05)
+    # Only weights strictly below 5% are zeroed; the freed capital is NOT
+    # redistributed onto the survivors — the surviving weights are unchanged.
+    assert list(w) == [0.30, 0.0, 0.0, 0.05, 0.20]
+
+
+def test_apply_min_weight_floor_disabled_when_zero():
+    w = apply_min_weight_floor([0.30, 0.01, 0.02], 0.0)
+    assert list(w) == [0.30, 0.01, 0.02]
+
+
+def test_optimize_weights_drops_sub_five_percent_positions():
+    # Many names + a tight per-name cap force several tiny weights that the
+    # Markowitz solve would otherwise take; the 5% floor must zero them.
+    rng = np.random.default_rng(3)
+    names = [f"N{i}" for i in range(20)]
+    mu = {t: float(abs(rng.normal(0.05, 0.03))) for t in names}
+    conf = {t: 0.6 for t in names}
+    hist = {t: list(rng.normal(0.0005, 0.012, 200)) for t in names}
+
+    off = optimize_weights(names, mu, conf, hist, cfg(min_weight_frac=0.0, per_name_cap_frac=0.08))
+    on = optimize_weights(names, mu, conf, hist, cfg(min_weight_frac=0.05, per_name_cap_frac=0.08))
+
+    # The unfloored solve produces sub-5% positions; the floored one must not.
+    assert any(0.0 < w < 0.05 for w in off.weights.values())
+    assert all(w == 0.0 or w >= 0.05 for w in on.weights.values())
+    # Freed capital stays in cash (deployment drops), not redistributed.
+    assert on.deploy_fraction <= off.deploy_fraction + 1e-9
+    assert on.deploy_fraction == pytest.approx(sum(on.weights.values()))
+
+
+# --------------------------------------------------------------------------
 # Conviction-scaled deployment
 # --------------------------------------------------------------------------
 def test_deployment_fraction_ramps_with_risk_reward():
@@ -155,6 +191,60 @@ def test_reconcile_reserve_from_conviction():
     spent = sum(o.notional for o in res.orders if o.side == "BUY")
     assert spent == pytest.approx(300_000.0, abs=1.0)
     assert res.projected_cash == pytest.approx(700_000.0, abs=1.0)
+
+
+# --------------------------------------------------------------------------
+# whole-share quantities + reallocation ordering
+# --------------------------------------------------------------------------
+def _wc(**over):
+    return cfg(min_ticket_inr=1_000.0, cash_floor_frac=0.10, reallocation_edge=0.15, **over)
+
+
+def test_buy_quantity_is_whole_shares():
+    res = reconcile_orders(
+        cash=100_000.0, positions={}, target_notional={"A": 50_000.0},
+        buy_meta={"A": BuyMeta("A", 333.33, 2.0, 0.6)},
+        avoid=[], hold=[], config=_wc(), equity=100_000.0, min_cash_reserve=10_000.0,
+    )
+    buy = next(o for o in res.orders if o.side == "BUY")
+    assert float(buy.qty).is_integer()
+    assert buy.notional <= 50_000.0 + 1e-6            # floored, never over-spends
+    assert buy.notional == pytest.approx(buy.qty * 333.33)
+
+
+def test_no_reallocation_while_cash_is_idle():
+    # 80k cash, big conviction reserve, OLD frozen as HOLD. The BUY must be funded
+    # from the idle cash (down to the hard floor), NOT by selling OLD.
+    pos = {"OLD": PositionView("OLD", 200.0, 250.0, 0.5, "HOLD")}
+    res = reconcile_orders(
+        cash=80_000.0, positions=pos, target_notional={"NEW": 50_000.0},
+        buy_meta={"NEW": BuyMeta("NEW", 500.0, 3.0, 0.7)},
+        avoid=[], hold=["OLD"], config=_wc(), equity=130_000.0, min_cash_reserve=70_000.0,
+    )
+    assert res.reallocations == []
+    assert not any(o.side == "SELL" for o in res.orders)
+
+
+def test_reallocation_fires_only_when_cash_exhausted():
+    pos = {"OLD": PositionView("OLD", 200.0, 250.0, 0.5, "HOLD")}
+    res = reconcile_orders(
+        cash=12_000.0, positions=pos, target_notional={"NEW": 50_000.0},
+        buy_meta={"NEW": BuyMeta("NEW", 500.0, 3.0, 0.7)},
+        avoid=[], hold=["OLD"], config=_wc(), equity=62_000.0, min_cash_reserve=6_200.0,
+    )
+    assert len(res.reallocations) >= 1                # cash genuinely short → rotate
+    assert all(float(o.qty).is_integer() for o in res.orders)   # whole shares throughout
+
+
+def test_sell_and_reallocation_quantities_are_whole():
+    pos = {"OLD": PositionView("OLD", 137.0, 250.0, 0.5, "HOLD")}
+    res = reconcile_orders(
+        cash=1_000.0, positions=pos, target_notional={"NEW": 30_000.0},
+        buy_meta={"NEW": BuyMeta("NEW", 337.0, 3.0, 0.7)},
+        avoid=[], hold=["OLD"], config=_wc(), equity=35_250.0, min_cash_reserve=3_525.0,
+    )
+    for o in res.orders:
+        assert float(o.qty).is_integer(), f"{o.side} {o.ticker} qty not whole: {o.qty}"
 
 
 # --------------------------------------------------------------------------

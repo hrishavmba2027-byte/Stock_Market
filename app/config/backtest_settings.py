@@ -117,10 +117,17 @@ class BacktestSettings(BaseModel):
     # so capital is only ever *partially* deployed and can never go negative.
     initial_capital: float = 1_00_00_000.0
     retrain_interval_days: int = 15          # walk-forward retrain/forecast cadence
-    sentiment_interval_days: int = 7         # sentiment rebalance cadence
-    forecast_days: int = 15                  # T+1..T+15 forecast path (FORECAST_DAYS)
+    sentiment_interval_days: int = 7         # sentiment aggregation window (days of news per snapshot)
+    # Weekly open-position review cadence, in TRADING bars (5 ≈ one calendar
+    # week). Between retrains, ONLY held names are re-underwritten on these bars
+    # (fresh sentiment + latest forecasts through the position-review prompt);
+    # fresh entries are decided on retrain bars alone.
+    review_interval_days: int = 5
+    forecast_days: int = 30                  # T+1..T+30 forecast path (FORECAST_DAYS);
+                                             # sizing still uses T+15, the LLM sees the full path
     cash_floor_frac: float = 0.10            # >=10% of equity always retained as cash
     per_name_cap_frac: float = 0.20          # <=20% of the book in any one name
+    min_weight_frac: float = 0.05            # drop any position sized below 5% of the book to 0
     vol_target_annual: float = 0.20          # per-name vol-scaled cap target
     llm_confidence_tilt: float = 0.25        # mild expected-return tilt from LLM confidence
     min_ticket_inr: float = 10_000.0         # skip orders smaller than this notional
@@ -143,6 +150,53 @@ class BacktestSettings(BaseModel):
     # suggestion. ``honor_stoploss`` also arms the protective stop (kept on so the
     # backtest is symmetric — it books losers as well as winners, not just wins).
     honor_stoploss: bool = True
+
+    # ── Entry gates (trade-quality findings, 2026-07) ───────────────────────
+    # Deterministic gates applied to every LLM BUY; see features/entry_gates.py
+    # for the numbers behind each default. momentum_lookback_days doubles as the
+    # historical lookback AND the forecast horizon of the agreement gate — 15
+    # maximized win rate and per-trade P&L on the 2020–2026 grid.
+    entry_gates_enabled: bool = True
+    momentum_lookback_days: int = 15
+    gate_rsi_min: float = 45.0
+    gate_rsi_max: float = 70.0
+    gate_volume_spike_ratio: float = 1.5
+    gate_stop_atr_mult: float = 2.0
+    # Cost-adjusted RR floor. 1.5 was calibrated for the old sell-at-target
+    # world; with hold-and-trail the upside is no longer capped at the stated
+    # target, so 1.0 (reject only inverted geometry) is the 2026-07-20 default —
+    # the 1.5 bar blocked 50/76 BUY intents incl. all of 2021 (6/8 profitable).
+    gate_min_eff_rr: float = 1.0
+    gate_roundtrip_cost_pct: float = 0.009
+    gate_max_chase_pct: float = 0.03
+    # Judicious negative-forecast override (default: never fires — every
+    # historical slice of it lost money; raise via env only deliberately).
+    gate_neg_fc_override_min_confidence: float = 1.01
+    gate_neg_fc_override_min_momentum: float = 0.06
+    # Time-diversification: at most this many NEW positions may be opened per
+    # rebalance cycle (0 = unlimited). Overflow BUYs (ranked by cost-adjusted
+    # RR, then confidence) are deferred and re-qualify at the next cycle with
+    # fresh forecasts — 5 of the 6 2022 entries landed in one 5-day window and
+    # fell together (−₹585k); staggering caps that single-week concentration.
+    max_new_positions_per_cycle: int = 3
+
+    # ── Hold-and-trail exits (findings D/E) ─────────────────────────────────
+    # On target touch, do NOT auto-sell: ratchet the stop to
+    # max(prev stop, close − trail_atr_mult*ATR14, entry) and keep the position
+    # until the stop is hit, the LLM verdict changes, or max_holding_days ages
+    # it out. The 16–30 day bucket was the only profitable one (61% win rate).
+    trail_on_target: bool = True
+    trail_atr_mult: float = 2.0
+    # Age-based exit DISABLED (0) per user decision 2026-07-20: exits are driven
+    # by the stop, the trail, and LLM verdict changes only — a position with an
+    # intact thesis is not closed merely for being old.
+    max_holding_days: int = 0                # calendar days; 0 disables the age exit
+    # Profit cushion a position must clear before its stop may be tightened to
+    # break-even or above. Prevents the "raised to entry after +0.9% then wicked
+    # out flat" whipsaw (ULTRACEMCO 2021-02). Arm level =
+    # entry + max(trail_arm_atr_mult*ATR14, trail_arm_profit_pct*entry).
+    trail_arm_profit_pct: float = 0.02
+    trail_arm_atr_mult: float = 1.0
 
     # Execution frictions.
     cost_bps_roundtrip: float = 40.0         # NSE brokerage+STT+txn+GST+stamp (bps, split/leg)
@@ -210,9 +264,11 @@ class BacktestSettings(BaseModel):
             initial_capital=_float_env("BACKTEST_INITIAL_CAPITAL", 1_00_00_000.0),
             retrain_interval_days=_int_env("BACKTEST_RETRAIN_INTERVAL_DAYS", 15, minimum=1),
             sentiment_interval_days=_int_env("BACKTEST_SENTIMENT_INTERVAL_DAYS", 7, minimum=1),
-            forecast_days=_int_env("BACKTEST_FORECAST_DAYS", 15, minimum=1),
+            review_interval_days=_int_env("BACKTEST_REVIEW_INTERVAL_DAYS", 5, minimum=1),
+            forecast_days=_int_env("BACKTEST_FORECAST_DAYS", 30, minimum=1),
             cash_floor_frac=_float_env("BACKTEST_CASH_FLOOR_FRAC", 0.10),
             per_name_cap_frac=_float_env("BACKTEST_PER_NAME_CAP_FRAC", 0.20),
+            min_weight_frac=_float_env("BACKTEST_MIN_WEIGHT_FRAC", 0.05),
             vol_target_annual=_float_env("BACKTEST_VOL_TARGET_ANNUAL", 0.20),
             llm_confidence_tilt=_float_env("BACKTEST_LLM_CONFIDENCE_TILT", 0.25),
             min_ticket_inr=_float_env("BACKTEST_MIN_TICKET_INR", 10_000.0),
@@ -221,6 +277,23 @@ class BacktestSettings(BaseModel):
             rr_min_deploy=_float_env("BACKTEST_RR_MIN_DEPLOY", 1.0),
             rr_full_deploy=_float_env("BACKTEST_RR_FULL_DEPLOY", 3.0),
             honor_stoploss=_bool_env("BACKTEST_HONOR_STOPLOSS", True),
+            entry_gates_enabled=_bool_env("BACKTEST_ENTRY_GATES_ENABLED", True),
+            momentum_lookback_days=_int_env("BACKTEST_MOMENTUM_LOOKBACK_DAYS", 15, minimum=1),
+            gate_rsi_min=_float_env("BACKTEST_GATE_RSI_MIN", 45.0),
+            gate_rsi_max=_float_env("BACKTEST_GATE_RSI_MAX", 70.0),
+            gate_volume_spike_ratio=_float_env("BACKTEST_GATE_VOLUME_SPIKE_RATIO", 1.5),
+            gate_stop_atr_mult=_float_env("BACKTEST_GATE_STOP_ATR_MULT", 2.0),
+            gate_min_eff_rr=_float_env("BACKTEST_GATE_MIN_EFF_RR", 1.0),
+            gate_roundtrip_cost_pct=_float_env("BACKTEST_GATE_ROUNDTRIP_COST_PCT", 0.009),
+            gate_max_chase_pct=_float_env("BACKTEST_GATE_MAX_CHASE_PCT", 0.03),
+            gate_neg_fc_override_min_confidence=_float_env("BACKTEST_GATE_NEG_FC_OVERRIDE_MIN_CONFIDENCE", 1.01),
+            gate_neg_fc_override_min_momentum=_float_env("BACKTEST_GATE_NEG_FC_OVERRIDE_MIN_MOMENTUM", 0.06),
+            max_new_positions_per_cycle=_int_env("BACKTEST_MAX_NEW_POSITIONS_PER_CYCLE", 3, minimum=0),
+            trail_on_target=_bool_env("BACKTEST_TRAIL_ON_TARGET", True),
+            trail_atr_mult=_float_env("BACKTEST_TRAIL_ATR_MULT", 2.0),
+            max_holding_days=_int_env("BACKTEST_MAX_HOLDING_DAYS", 0, minimum=0),
+            trail_arm_profit_pct=_float_env("BACKTEST_TRAIL_ARM_PROFIT_PCT", 0.02),
+            trail_arm_atr_mult=_float_env("BACKTEST_TRAIL_ARM_ATR_MULT", 1.0),
             cost_bps_roundtrip=_float_env("BACKTEST_COST_BPS_ROUNDTRIP", 40.0),
             slippage_atr_mult=_float_env("BACKTEST_SLIPPAGE_ATR_MULT", 0.10),
             benchmark_symbol=os.getenv("BACKTEST_BENCHMARK_SYMBOL", "^NSEI"),

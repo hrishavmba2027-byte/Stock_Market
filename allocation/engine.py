@@ -20,10 +20,24 @@ Two stages:
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+
+def _whole_shares(qty: float, *, side: str) -> int:
+    """Round a share quantity to a whole number — no fractional shares.
+
+    BUYs floor (you can only buy as many whole shares as the budget affords;
+    rounding up would overspend the funded amount and could overdraw cash).
+    SELLs round up (raise at least the shares needed), and every caller caps the
+    result at the shares actually held, so a round-up can never oversell.
+    """
+    if qty <= 0:
+        return 0
+    return int(math.floor(qty)) if side == "BUY" else int(math.ceil(qty - 1e-9))
 
 # scipy / scikit-learn are declared deps (see the plan), but the engine degrades
 # gracefully to closed-form / sample-covariance fallbacks if either is absent so
@@ -336,6 +350,8 @@ def optimize_weights(
         caps = np.full(len(names), config.per_name_cap_frac)
         w0 = _renormalise(np.minimum(caps, deployable_frac / len(names)), caps, deployable_frac)
         w, deploy_frac, wrr = _apply_conviction(w0, caps, names, risk_reward, deployable_frac, config)
+        w = apply_min_weight_floor(w, getattr(config, "min_weight_frac", 0.0))
+        deploy_frac = float(w.sum())
         return OptimizeResult(
             {t: float(w[i]) for i, t in enumerate(names)},
             {t: float(mu_vec[i]) for i, t in enumerate(names)},
@@ -358,6 +374,8 @@ def optimize_weights(
     rf_daily_15 = float(getattr(config, "risk_free_annual", 0.0)) * (15.0 / float(tdays))
     w0 = max_sharpe_weights(mu_vec, cov_annual, caps, deployable_frac, rf=rf_daily_15)
     weights, deploy_frac, wrr = _apply_conviction(w0, caps, names, risk_reward, deployable_frac, config)
+    weights = apply_min_weight_floor(weights, getattr(config, "min_weight_frac", 0.0))
+    deploy_frac = float(weights.sum())
 
     return OptimizeResult(
         weights={t: float(weights[i]) for i, t in enumerate(names)},
@@ -367,6 +385,22 @@ def optimize_weights(
         deployable_budget=float(deployable_frac),
         deploy_fraction=deploy_frac, weighted_risk_reward=wrr,
     )
+
+
+def apply_min_weight_floor(weights, min_weight_frac: float) -> np.ndarray:
+    """Zero out any allocation below ``min_weight_frac`` of the book.
+
+    Positions the Markowitz solve wants to size below the minimum ticket weight
+    are simply dropped (set to 0) rather than taken — the freed capital stays in
+    cash, it is **not** redistributed across the surviving names. This enforces
+    the "no investment below X% of capital; otherwise make it 0%" rule uniformly
+    for both the backtest and production, since both go through this engine.
+    """
+    w = np.asarray(weights, dtype=np.float64)
+    min_frac = float(min_weight_frac)
+    if min_frac <= 0.0:
+        return w
+    return np.where(w < min_frac, 0.0, w)
 
 
 def _apply_conviction(w0, caps, names, risk_reward, deployable_frac, config):
@@ -517,8 +551,9 @@ def reconcile_orders(
             continue
         cur_notional = remaining.get(ticker, 0.0) * p.price
         if cur_notional - tgt > min_ticket:
-            excess_qty = (cur_notional - tgt) / p.price
-            _sell(ticker, excess_qty, f"trim toward target ₹{tgt:,.0f}")
+            excess_qty = _whole_shares((cur_notional - tgt) / p.price, side="SELL")
+            if excess_qty > 0:
+                _sell(ticker, float(excess_qty), f"trim toward target ₹{tgt:,.0f}")
 
     # 3) Fund BUY adds, best risk-reward first.
     def _buy_rr(ticker: str) -> float:
@@ -538,14 +573,27 @@ def reconcile_orders(
         if need <= min_ticket:
             continue
 
-        # (a) Spend free cash — that which sits above the reserve floor.
+        # (a) Spend free cash — that which sits above the conviction reserve.
         free = max(0.0, available - min_cash)
         spend_from_cash = min(need, free)
         shortfall = need - spend_from_cash
 
-        # (b) Rotate capital out of weaker incumbents to cover the rest. Selling a
-        #     holding credits `available`; spending exactly the raised amount back
-        #     out keeps the reserve intact (asset-to-asset swap).
+        # (a2) Reallocation is a LAST RESORT: before rotating capital out of other
+        #      holdings, use whatever cash is still on hand down to a minimal hard
+        #      floor (``cash_floor_frac`` of equity). The conviction reserve set
+        #      how much to *target*; it should not force a sale of another stock
+        #      while cash sits idle. Only the shortfall that remains after using
+        #      all deployable cash is funded by reallocation.
+        if shortfall > min_ticket:
+            hard_floor = min(min_cash, float(getattr(config, "cash_floor_frac", 0.0)) * equity)
+            reserve_cash = max(0.0, available - spend_from_cash - hard_floor)
+            dip = min(shortfall, reserve_cash)
+            spend_from_cash += dip
+            shortfall -= dip
+
+        # (b) Rotate capital out of weaker incumbents to cover what's still short.
+        #     Selling a holding credits `available`; spending exactly the raised
+        #     amount back out is an asset-to-asset swap.
         raised = 0.0
         if shortfall > min_ticket:
             raised = _raise_via_reallocation(
@@ -560,11 +608,17 @@ def reconcile_orders(
         if spend < min_ticket:
             notes.append(f"{ticker}: BUY skipped — only ₹{spend:,.0f} fundable (< ticket)")
             continue
-        qty = spend / price
+        # Whole shares only: buy as many as `spend` affords (floor), then the
+        # actual cash outlay is exactly qty*price — any remainder stays as cash.
+        qty = _whole_shares(spend / price, side="BUY")
+        if qty < 1:
+            notes.append(f"{ticker}: BUY skipped — ₹{spend:,.0f} buys <1 whole share at ₹{price:,.0f}")
+            continue
+        spend = qty * price
         available -= spend
         funded = sorted({r["from"] for r in reallocations if r["to"] == ticker})  # type: ignore[index]
         reason = "BUY to target" if spend >= need - 1e-6 else "BUY (capped by fundable capital)"
-        orders.append(Order(ticker, "BUY", qty, price, spend, reason, funded_by=funded))
+        orders.append(Order(ticker, "BUY", float(qty), price, spend, reason, funded_by=funded))
 
     available = max(0.0, available)
     return ReconcileResult(orders, reallocations, float(available), notes)
@@ -616,7 +670,12 @@ def _raise_via_reallocation(
             break
         want = shortfall - raised
         p = pos_by_ticker[ticker]
-        sell_qty = min(remaining.get(ticker, 0.0), want / p.price)
+        # Whole shares only: raise at least `want` (round up), never exceeding
+        # the shares held. The remaining book is integer, so this stays integer.
+        held = remaining.get(ticker, 0.0)
+        sell_qty = min(held, float(_whole_shares(want / p.price, side="SELL")))
+        if sell_qty <= 0:
+            continue
         proceeds = sell(ticker, sell_qty, f"reallocate → {buyer} (RR {buyer_rr:.2f} > {incumbent_rr:.2f})")
         if proceeds > 0:
             raised += proceeds

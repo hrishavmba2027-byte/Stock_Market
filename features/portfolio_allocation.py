@@ -98,6 +98,7 @@ class AllocationAdvice:
     current_amount: float         # ₹ currently held
     recommended_order: str        # "BUY ₹x" | "SELL ₹y" | "HOLD" | "EXIT"
     order_amount: float
+    order_shares: int             # whole shares to trade (+buy / −sell); no fractions
     risk_reward: float
     confidence: Optional[float]
     expected_return_15d: Optional[float]
@@ -240,6 +241,9 @@ def _build_advice(suggestions, opt, recon, positions_view, target_notional, pric
         orders = order_by_ticker.get(tu, [])
         buys = sum(o.notional for o in orders if o.side == "BUY")
         sells = sum(o.notional for o in orders if o.side == "SELL")
+        buy_shares = sum(o.qty for o in orders if o.side == "BUY")
+        sell_shares = sum(o.qty for o in orders if o.side == "SELL")
+        net_shares = int(round(buy_shares - sell_shares))   # whole shares, +buy / −sell
         funded = sorted({f for o in orders for f in o.funded_by})
         if buys > 0:
             rec, amt = f"BUY ₹{buys:,.0f}", buys
@@ -256,7 +260,7 @@ def _build_advice(suggestions, opt, recon, positions_view, target_notional, pric
         advice.append(AllocationAdvice(
             ticker=tu, action=action, target_weight=round(weight, 6),
             target_amount=round(target_amount, 2), current_amount=round(current_amount, 2),
-            recommended_order=rec, order_amount=round(amt, 2),
+            recommended_order=rec, order_amount=round(amt, 2), order_shares=net_shares,
             risk_reward=round(float(getattr(meta, "risk_reward", positions_view[tu].risk_reward if tu in positions_view else 1.0)), 3),
             confidence=s.get("confidence"),
             expected_return_15d=round(float(opt.expected_return.get(tu)), 6) if tu in opt.expected_return else None,
@@ -286,7 +290,8 @@ def write_bookkeeping(plan: AllocationPlan, path: Path, *, as_of: Optional[str] 
         "as_of": as_of, "ticker": a.ticker, "action": a.action,
         "target_weight_pct": round(a.target_weight * 100, 3), "target_amount": a.target_amount,
         "current_amount": a.current_amount, "recommended_order": a.recommended_order,
-        "order_amount": a.order_amount, "risk_reward": a.risk_reward, "confidence": a.confidence,
+        "order_amount": a.order_amount, "order_shares": a.order_shares,
+        "risk_reward": a.risk_reward, "confidence": a.confidence,
         "expected_return_15d": a.expected_return_15d, "funded_by": ",".join(a.funded_by),
     } for a in plan.advice]
 

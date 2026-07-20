@@ -937,10 +937,22 @@ def prepare_stock_part(
     engineered_for_sheet = engineered.copy()
 
     engineered_positions = to_numeric_series(engineered[SORT_POSITION_COL]).astype(np.int64).to_numpy()
-    historical_mask = engineered_positions <= first_valid_position
+    # Scaler-fit checkpoint. The first-predicted checkpoint exists for the
+    # historical backfill path; for latest_only runs the anchor row IS the
+    # decision point and every row at or before it is observable history, so
+    # the scalers are fit on the full frame up to the anchor — mirroring how
+    # training fits its scaler on all pre-validation rows. Using the backfill
+    # checkpoint here collapses the fit window to the first seq_len rows on
+    # sheets whose first predicted mark is at/near row 0 (fresh backtest
+    # frames, live sheets processed since inception), which feeds the model
+    # raw-scale features (the erratic-forecast bug).
+    scaler_checkpoint = first_valid_position
+    if latest_only and len(valid_indices) > 0:
+        scaler_checkpoint = int(candidate_positions[valid_indices[-1]])
+    historical_mask = engineered_positions <= scaler_checkpoint
     if not historical_mask.any():
-        raise ValueError("no historical rows remain at or before the first predicted checkpoint")
-    assert int(engineered_positions[historical_mask].max()) <= first_valid_position
+        raise ValueError("no historical rows remain at or before the scaler-fit checkpoint")
+    assert int(engineered_positions[historical_mask].max()) <= scaler_checkpoint
 
     # Scalers are fit only on rows at or before the historical checkpoint.
     target_values = engineered.loc[historical_mask, [TARGET_COL]].to_numpy(dtype=np.float32)

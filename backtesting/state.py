@@ -78,7 +78,7 @@ class BacktestState:
                     # Never overdraw. Skip (should not happen post-reconcile).
                     continue
                 self.cash += f.cash_delta
-                self._add_shares(ticker, qty, price)
+                self._add_shares(ticker, qty, price, bar=bar_str)
                 realized = 0.0
             else:  # SELL
                 self.cash += f.cash_delta
@@ -93,7 +93,7 @@ class BacktestState:
             })
         self.cash = max(0.0, self.cash)
 
-    def _add_shares(self, ticker: str, qty: float, price: float) -> None:
+    def _add_shares(self, ticker: str, qty: float, price: float, *, bar: Any = None) -> None:
         pos = self.positions.setdefault(ticker, {"qty": 0.0, "avg_price": 0.0})
         old_qty = float(pos["qty"])
         new_qty = old_qty + qty
@@ -102,6 +102,10 @@ class BacktestState:
             return
         pos["avg_price"] = (old_qty * float(pos["avg_price"]) + qty * price) / new_qty
         pos["qty"] = new_qty
+        # First lot of a fresh episode stamps the entry bar (drives the age exit
+        # and the position-review payload); top-ups keep the original date.
+        if old_qty <= 1e-9 or not pos.get("entry_bar"):
+            pos["entry_bar"] = bar
 
     def _remove_shares(self, ticker: str, qty: float, price: float) -> float:
         pos = self.positions.get(ticker)
